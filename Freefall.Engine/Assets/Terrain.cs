@@ -10,26 +10,15 @@ using Freefall.Reflection;
 
 namespace Freefall.Assets
 {
-    /// <summary>Power-of-2+1 heightmap resolutions for edge-vertex alignment.</summary>
-    public enum HeightmapResolution
+    /// <summary>
+    /// A terrain density: half, one or two per metre (or metres per one). Powers of two only, since the quadtree halves
+    /// (TERRAIN_PAGES_PLAN.md).
+    /// </summary>
+    public enum TerrainDensity
     {
-        _129  = 129,
-        _257  = 257,
-        _513  = 513,
-        _1025 = 1025,
-        _2049 = 2049,
-        _4097 = 4097,
-    }
-
-    /// <summary>Power-of-2 control map resolutions. Inherit = use heightmap resolution.</summary>
-    public enum ControlMapResolution
-    {
-        Inherit = 0,
-        _256  = 256,
-        _512  = 512,
-        _1024 = 1024,
-        _2048 = 2048,
-        _4096 = 4096,
+        Half,
+        One,
+        Two,
     }
 
     /// <summary>
@@ -221,9 +210,10 @@ namespace Freefall.Assets
         /// How heights and holes become the PhysX height field's samples. A cook saved with another format is not used
         /// (<see cref="SavedCookFormat"/>): it is cooked again, and the next save writes it the new way. 2 (2026-10-24):
         /// a cell's hole flag from the mask at the cell's middle, the samples being at the height map's texel centres
-        /// (PhysicsHelper.IsHoleCell, TerrainCollider).
+        /// (PhysicsHelper.IsHoleCell, TerrainCollider). 3 (2026-11-07): one sample on every vertex, sample i at
+        /// i × VertexSpacing from the corner (TERRAIN_PAGES_PLAN.md stage 1).
         /// </summary>
-        internal const int CookFormat = 2;
+        internal const int CookFormat = 3;
 
         /// <summary>The <see cref="CookFormat"/> of the cook saved with this terrain (its CollisionMeshData); 0 = from before formats.</summary>
         [Browsable(false)]
@@ -248,48 +238,69 @@ namespace Freefall.Assets
             return h;
         }
 
+        // ───── Densities (TERRAIN_PAGES_PLAN.md stage 1, 2026-11-07) ─────
+        // The only resolution settings. Every map's size follows from them and the terrain's size, and so does the
+        // quadtree's depth: the user, "having to chose the texture resolutions also needs to go".
+
         /// <summary>
-        /// Resolution of the baked heightmap (power-of-2+1). Configurable per-terrain.
+        /// Metres between the terrain's vertices, with one height sample on every vertex: sample i lies at i × this from
+        /// the terrain's corner, so the height map holds size / this + 1 samples a side (terrain_grid.hlsli).
         /// </summary>
-        public HeightmapResolution HeightmapResolution = HeightmapResolution._1025;
+        [Category("Density")]
+        [Description("Metres between vertices, one height sample on each: sets the height map's samples and the quadtree's depth")]
+        public TerrainDensity MetresPerVertex = TerrainDensity.One;
 
-        /// <summary>Resolution of the baked layer weights. Inherit = use heightmap resolution.</summary>
-        public ControlMapResolution SplatmapResolution = ControlMapResolution.Inherit;
+        /// <summary>Texels per metre of the layer weights (paint) and of the top-layer map GetLayer reads.</summary>
+        [Description("Texels per metre of the layer weights (paint)")]
+        public TerrainDensity PaintPixelsPerMetre = TerrainDensity.One;
 
-        /// <summary>Resolution of the baked decoration coverage. Inherit = use heightmap resolution.</summary>
-        public ControlMapResolution DecorationMapResolution = ControlMapResolution.Inherit;
+        /// <summary>Quads along a side of the quadtree's patch (33 × 33 vertices): a leaf node spans this many vertices.</summary>
+        public const int PatchQuads = 32;
 
-        /// <summary>Effective heightmap resolution as int.</summary>
-        [Reflection.DontSerialize]
-        [JsonIgnore]
-        public int EffectiveHeightmapResolution => (int)HeightmapResolution;
-
-        /// <summary>Effective splatmap resolution (falls back to heightmap).</summary>
-        [Reflection.DontSerialize]
-        [JsonIgnore]
-        public int EffectiveSplatmapResolution =>
-            SplatmapResolution != ControlMapResolution.Inherit ? (int)SplatmapResolution : (int)HeightmapResolution;
-
-        /// <summary>Effective decoration map resolution (falls back to heightmap).</summary>
-        [Reflection.DontSerialize]
-        [JsonIgnore]
-        public int EffectiveDecorationMapResolution =>
-            DecorationMapResolution != ControlMapResolution.Inherit ? (int)DecorationMapResolution : (int)HeightmapResolution;
-
-        /// <summary>Migrate old power-of-2 heightmap resolution to nearest power-of-2+1.</summary>
-        internal void MigrateResolution()
+        /// <summary>0.5, 1 or 2.</summary>
+        public static float DensityValue(TerrainDensity density) => density switch
         {
-            int raw = (int)HeightmapResolution;
-            if (raw > 1 && !Enum.IsDefined(typeof(HeightmapResolution), HeightmapResolution))
-            {
-                // Snap to next power-of-2+1: e.g. 1024 → 1025, 512 → 513
-                int po2 = 1;
-                while (po2 < raw) po2 <<= 1;
-                var migrated = (HeightmapResolution)(po2 + 1);
-                Debug.Log($"[Terrain] Migrating HeightmapResolution {raw} → {(int)migrated}");
-                HeightmapResolution = migrated;
-            }
-        }
+            TerrainDensity.Half => 0.5f,
+            TerrainDensity.Two => 2f,
+            _ => 1f,
+        };
+
+        /// <summary>Metres between vertices and between height samples (<see cref="MetresPerVertex"/>).</summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public float VertexSpacing => DensityValue(MetresPerVertex);
+
+        /// <summary>Height samples along a side: one on every vertex, the first and the last on the terrain's edges.</summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public int EffectiveHeightmapResolution => Math.Max(2, (int)MathF.Round(TerrainSize.X / VertexSpacing) + 1);
+
+        /// <summary>Layer weight texels along a side, each at the middle of its cell (<see cref="PaintPixelsPerMetre"/>).</summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public int EffectiveSplatmapResolution => Math.Max(1, (int)MathF.Round(TerrainSize.X * DensityValue(PaintPixelsPerMetre)));
+
+        /// <summary>
+        /// Decoration control texels along a side: one a metre, whatever the densities, since a texel is one decoration
+        /// tile and another size would change what grows and what it costs.
+        /// </summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public int EffectiveDecorationMapResolution => Math.Max(1, (int)MathF.Round(TerrainSize.X));
+
+        /// <summary>
+        /// The quadtree's depth: a leaf node spans <see cref="PatchQuads"/> vertices. Exact only when the terrain's size is
+        /// a power of two times PatchQuads × VertexSpacing (<see cref="GridIsExact"/>).
+        /// </summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public int QuadtreeDepth => Math.Max(0, (int)MathF.Round(MathF.Log2(MathF.Max(1f, TerrainSize.X / (PatchQuads * VertexSpacing)))));
+
+        /// <summary>Whether every vertex of the leaves sits on a height sample: a square terrain of PatchQuads × VertexSpacing × 2^depth.</summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public bool GridIsExact =>
+            TerrainSize.X == TerrainSize.Y && MathF.Abs(PatchQuads * VertexSpacing * (1 << QuadtreeDepth) - TerrainSize.X) < 1e-3f;
 
         /// <summary>
         /// GPU-baked heightmap texture (runtime only, regenerated from the height stamps in the scene).

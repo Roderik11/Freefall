@@ -547,9 +547,9 @@ float3 TerrainNormal(DecalFrame f, float2 xz)
     Texture2D<float> heights = ResourceDescriptorHeap[f.TerrainHeightmap];
     uint w, h;
     heights.GetDimensions(w, h);
-    float2 uv = (xz - f.TerrainOrigin.xz) / f.TerrainSize;
+    float2 uv = TerrainHeightUV((xz - f.TerrainOrigin.xz) / f.TerrainSize, float2(w, h));
     float2 du = float2(1.0 / w, 0.0), dv = float2(0.0, 1.0 / h);
-    float2 metres = 2.0 * f.TerrainSize / float2(w, h);
+    float2 metres = 2.0 * TerrainSampleSpacing(f.TerrainSize, float2(w, h));
     float dx = (heights.SampleLevel(LinearClamp, uv + du, 0) - heights.SampleLevel(LinearClamp, uv - du, 0)) * f.TerrainMaxHeight / metres.x;
     float dz = (heights.SampleLevel(LinearClamp, uv + dv, 0) - heights.SampleLevel(LinearClamp, uv - dv, 0)) * f.TerrainMaxHeight / metres.y;
     return normalize(float3(-dx, 1.0, -dz));

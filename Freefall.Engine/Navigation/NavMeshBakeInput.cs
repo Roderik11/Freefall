@@ -68,8 +68,9 @@ namespace Freefall.Navigation
             Holes = holes;
             HoleResolution = holeResolution;
 
-            // 2: samples at texel centres (SampleHeight, 2026-10-24); a terrain hashed the old way is baked again
-            ulong h = NavHash.Mix(NavHash.Mix(2, position), maxHeight);
+            // 2: samples at texel centres (SampleHeight, 2026-10-24); 3: one sample on every vertex (2026-11-07); a terrain
+            // hashed another way is baked again
+            ulong h = NavHash.Mix(NavHash.Mix(3, position), maxHeight);
             Hash = NavHash.Mix(NavHash.Mix(h, size.X), size.Y);
         }
 
@@ -79,13 +80,13 @@ namespace Freefall.Navigation
 
         /// <summary>
         /// World height at a terrain-local position, as the terrain is drawn and collided with: bilinear over the
-        /// samples, sample i at (i + 0.5) · size / N (TerrainRenderer.GetHeight, TerrainCollider), so the navmesh lies
-        /// where characters actually stand. Clamped at the edges like the GPU's sampler.
+        /// samples, sample i at i · size / (N − 1), one on every vertex (TerrainRenderer.GetHeight, TerrainCollider), so
+        /// the navmesh lies where characters actually stand. Clamped at the edges.
         /// </summary>
         public float SampleHeight(float localX, float localZ)
         {
-            float fx = Math.Clamp(localX / Size.X * (_dimX + 1) - 0.5f, 0, _dimX);
-            float fz = Math.Clamp(localZ / Size.Y * (_dimZ + 1) - 0.5f, 0, _dimZ);
+            float fx = Math.Clamp(localX / Size.X * _dimX, 0, _dimX);
+            float fz = Math.Clamp(localZ / Size.Y * _dimZ, 0, _dimZ);
 
             int x0 = (int)fx, z0 = (int)fz;
             int x1 = Math.Min(x0 + 1, _dimX), z1 = Math.Min(z0 + 1, _dimZ);

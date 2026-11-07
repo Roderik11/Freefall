@@ -23,6 +23,7 @@
 #include "decoration_noise.hlsli"   // DecoClusterMask, DecoHeightFactor
 #include "ground_shape.hlsli"       // GroundShape, GroundShapeTint, PackGroundTint
 #include "terrain_holes.hlsli"      // TerrainHoleAt
+#include "terrain_grid.hlsli"       // TerrainHeightUV: where the height map holds a place's height
 #include "weather_cover.hlsli"      // ShelterTexels: how much the cover map keeps the snow off a plant's root
 
 // Push constants (root parameter 0, register b3) — bindless indices only
@@ -429,8 +430,8 @@ void CS_BakeTerrainNormals(uint3 dtid : SV_DispatchThreadID)
     float hD = heightTex.SampleLevel(HeightSampler, uv + float2(0, -texelStep), 0).r;
     float hU = heightTex.SampleLevel(HeightSampler, uv + float2(0,  texelStep), 0).r;
 
-    // Central difference spans two texels (hL-hR, hD-hU)
-    float texelWorldSize = TerrainSize.x * texelStep;
+    // Central difference spans two samples (hL-hR, hD-hU). Normal texel i is height sample i (terrain_grid.hlsli)
+    float texelWorldSize = TerrainSize.x / float(hmW - 1);
     float heightScale = MaxHeight / (2.0 * texelWorldSize);
 
     float3 n = normalize(float3(
@@ -791,7 +792,8 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             if (TerrainHoleAt(HoleTexIdx, ClampSampler, localXZ, TerrainSize)) continue;
 
             // ── Heightmap sample ──
-            float h = heightTex.SampleLevel(HeightSampler, texelUV, 0).r;
+            float2 heightUV = TerrainHeightUV(texelUV, float2(HeightmapSize));     // the height grid (and the normals')
+            float h = heightTex.SampleLevel(HeightSampler, heightUV, 0).r;
             float3 instancePos = float3(wx, TerrainOrigin.z + h * MaxHeight, wz);
 
             // Distance cull (squared — avoids sqrt for rejected instances)
@@ -837,7 +839,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             if (rank >= saturate(thinFacing) * endKeep) continue;      // before the normal: ground at an angle keeps less
 
             // ── Terrain normal (R16G16_SNORM — already [-1,1]) ──
-            float2 nxz = bakedNormals.SampleLevel(ClampSampler, texelUV, 0).rg;
+            float2 nxz = bakedNormals.SampleLevel(ClampSampler, heightUV, 0).rg;
             float ny = sqrt(max(0.0, 1.0 - nxz.x * nxz.x - nxz.y * nxz.y));
             float3 terrainNormal = normalize(float3(nxz.x, ny, nxz.y));
 
@@ -880,7 +882,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             float3 groundTint = 1.0.xxx;
             if (SplatLayerCount > 0 && SplatControlIdx != 0 && LayerPlantTintIdx != 0)
                 groundTint = LayerPlantTint(float2(texelUV.x, 1.0 - texelUV.y));
-            groundTint *= GroundShapeTint(GroundShape(heightTex, ClampSampler, texelUV, 1.0 / float(HeightmapSize.x), MaxHeight),
+            groundTint *= GroundShapeTint(GroundShape(heightTex, ClampSampler, heightUV, 1.0 / float(HeightmapSize.x), MaxHeight),
                                           smoothstep(0.7, 0.9, terrainNormal.y));
             groundTint *= SwardGrain(localXZ);       // the sward's grain, as the ground under it from afar
 

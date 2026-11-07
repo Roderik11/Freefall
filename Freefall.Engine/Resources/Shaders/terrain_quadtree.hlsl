@@ -614,12 +614,13 @@ void CSBuildMinMaxMip(uint3 dtid : SV_DispatchThreadID)
     
     if (buildMip == 0)
     {
-        // Mip 0: the range of every heightmap texel a vertex of this node can interpolate between. The patches sample
-        // the heightmap bilinearly at uv = pos / size, texel (i, j) sitting at ((i + 0.5) / N, (j + 0.5) / N), so the
-        // node's uv square touches texels floor(uvMin N - 0.5) .. ceil(uvMax N - 0.5). Until 2026-10-24 a 4x4 grid of
-        // samples over the ~32x32 texels: a crest between the samples stood outside the node's bounding sphere, which
-        // the frustum, Hi-Z and shadow receiver tests all trust (a sub-pixel shift along long hill shadows with
-        // receiver culling). Built once per height bake, so reading them all costs nothing per frame.
+        // Mip 0: the range of every height sample a vertex of this node can interpolate between. Sample i sits at
+        // i / (N - 1) in terrain UV, one on every vertex (terrain_grid.hlsli), so the node's uv square holds samples
+        // uvMin (N - 1) .. uvMax (N - 1): a leaf's 33 x 33, exactly the samples its patch's vertices read. Until
+        // 2026-11-07 the samples sat at (i + 0.5) / N and this took floor(uvMin N - 0.5) .. ceil(uvMax N - 0.5); until
+        // 2026-10-24 a 4x4 grid of samples over the ~32x32: a crest between them stood outside the node's bounding
+        // sphere, which the frustum, Hi-Z and shadow receiver tests all trust. Built once per height bake, so reading
+        // them all costs nothing per frame.
         Texture2D<float> heightTex = ResourceDescriptorHeap[HeightTexIdx];
         float maxH = MaxHeight;
         uint hmW, hmH;
@@ -627,8 +628,8 @@ void CSBuildMinMaxMip(uint3 dtid : SV_DispatchThreadID)
 
         float2 uvMin = float2(dtid.xy) / float2(outW, outH);
         float2 uvMax = float2(dtid.xy + 1) / float2(outW, outH);
-        int2 lo = clamp(int2(floor(uvMin * float2(hmW, hmH) - 0.5)), int2(0, 0), int2(hmW - 1, hmH - 1));
-        int2 hi = clamp(int2(ceil(uvMax * float2(hmW, hmH) - 0.5)), int2(0, 0), int2(hmW - 1, hmH - 1));
+        int2 lo = clamp(int2(floor(uvMin * float2(hmW - 1, hmH - 1))), int2(0, 0), int2(hmW - 1, hmH - 1));
+        int2 hi = clamp(int2(ceil(uvMax * float2(hmW - 1, hmH - 1))), int2(0, 0), int2(hmW - 1, hmH - 1));
 
         float hMin = 1e30;
         float hMax = -1e30;

@@ -90,6 +90,15 @@ float Blend(float prev, float value, uint mode, float opacity)
     }
 }
 
+#include "terrain_grid.hlsli"
+
+// The terrain UV of height sample (x, y): one sample on every vertex, sample i at i / (N - 1), the first and the last on
+// the terrain's edges (terrain_grid.hlsli). Until 2026-11-07, (i + 0.5) / N, between the vertices.
+float2 SampleTerrainUV(uint2 texel, uint w, uint h)
+{
+    return float2(texel) / float2(w - 1, h - 1);
+}
+
 // ── CS_Clear: Zero the output heightmap ──
 [numthreads(8, 8, 1)]
 void CS_Clear(uint3 dtid : SV_DispatchThreadID)
@@ -102,7 +111,9 @@ void CS_Clear(uint3 dtid : SV_DispatchThreadID)
 }
 
 // ── CS_ImportLayer: Blend a heightmap stretched over the whole terrain ──
-// value = source * Amplitude + BrushTargetHeight (scale and bias, both normalized to MaxHeight)
+// value = source * Amplitude + BrushTargetHeight (scale and bias, both normalized to MaxHeight). The source is read as
+// a height map is: its first and last samples on the terrain's edges (terrain_grid.hlsli), so one of the terrain's own
+// size imports sample for sample.
 [numthreads(8, 8, 1)]
 void CS_ImportLayer(uint3 dtid : SV_DispatchThreadID)
 {
@@ -112,7 +123,9 @@ void CS_ImportLayer(uint3 dtid : SV_DispatchThreadID)
     if (dtid.x >= w || dtid.y >= h) return;
 
     Texture2D<float> Source = ResourceDescriptorHeap[SourceIdx];
-    float2 uv = (float2(dtid.xy) + 0.5) / float2(w, h);
+    uint sw, sh;
+    Source.GetDimensions(sw, sh);
+    float2 uv = TerrainHeightUV(SampleTerrainUV(dtid.xy, w, h), float2(sw, sh));
     float src = Source.SampleLevel(sampLinear, uv, 0) * Amplitude + BrushTargetHeight;
 
     float prev = Output[dtid.xy];
@@ -219,7 +232,7 @@ void CS_NoiseLayer(uint3 dtid : SV_DispatchThreadID)
 
     Texture2D<float2> NoiseLUT = ResourceDescriptorHeap[NoiseLUTIdx];
 
-    float2 uv = (float2(dtid.xy) + 0.5) / float2(w, h);
+    float2 uv = SampleTerrainUV(dtid.xy, w, h);
     float2 p = (uv + float2(OffsetX, OffsetY)) * Frequency;
 
     float noise = fbmNoise(NoiseLUT, p, NoiseType, Octaves, Lacunarity, Persistence, (float)NoiseSeed);
@@ -556,7 +569,7 @@ void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
     StructuredBuffer<HeightStampDescriptor> Stamps = ResourceDescriptorHeap[StampDescBufIdx];
     StructuredBuffer<StampSplinePoint> SplinePoints = ResourceDescriptorHeap[SplineBufIdx];
 
-    float2 uv = (float2(dtid.xy) + 0.5) / float2(w, h);
+    float2 uv = SampleTerrainUV(dtid.xy, w, h);
     float currentHeight = Output[dtid.xy];
     bool modified = false;
 

@@ -3,6 +3,17 @@
 #ifndef OCEAN_SURF_HLSLI
 #define OCEAN_SURF_HLSLI
 
+#include "terrain_grid.hlsli"
+
+// The terrain's height map at a terrain UV, 0..1 of its MaxHeight: read on the height grid (terrain_grid.hlsli), every
+// ocean read of the seabed goes through this
+float OceanTerrainHeight01(Texture2D<float> heightmap, SamplerState s, float2 terrainUV, float lod)
+{
+    uint w, h;
+    heightmap.GetDimensions(w, h);
+    return heightmap.SampleLevel(s, TerrainHeightUV(terrainUV, float2(w, h)), lod);
+}
+
 struct OceanData
 {
     float WaveTime;
@@ -104,7 +115,7 @@ OceanShore ShoreAt(OceanData ocean, float2 worldXZ)
     if (outside < 150.0)
     {
         Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
-        float h = heightmap.SampleLevel(OceanSampler, clampedUV, 0);
+        float h = OceanTerrainHeight01(heightmap, OceanSampler, clampedUV, 0);
         float terrainWorldY = ocean.TerrainBaseY + h * ocean.MaxTerrainHeight;
 
         // Water depth = ocean surface - terrain surface (positive = water exists)
@@ -484,11 +495,11 @@ void LipBed(OceanData ocean, float2 xz, out float depth, out float slope)
     float2 size = float2(ocean.TerrainSizeX, ocean.TerrainSizeZ);
     float2 uv = clamp((xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ)) / size, 0.002, 0.998);
     float2 near = 6.0 / size, far = 12.0 / size;
-    float c = heightmap.SampleLevel(OceanSampler, uv, 0);
-    float e1 = heightmap.SampleLevel(OceanSampler, uv + float2(near.x, 0), 0), w1 = heightmap.SampleLevel(OceanSampler, uv - float2(near.x, 0), 0);
-    float n1 = heightmap.SampleLevel(OceanSampler, uv + float2(0, near.y), 0), s1 = heightmap.SampleLevel(OceanSampler, uv - float2(0, near.y), 0);
-    float e2 = heightmap.SampleLevel(OceanSampler, uv + float2(far.x, 0), 0), w2 = heightmap.SampleLevel(OceanSampler, uv - float2(far.x, 0), 0);
-    float n2 = heightmap.SampleLevel(OceanSampler, uv + float2(0, far.y), 0), s2 = heightmap.SampleLevel(OceanSampler, uv - float2(0, far.y), 0);
+    float c = OceanTerrainHeight01(heightmap, OceanSampler, uv, 0);
+    float e1 = OceanTerrainHeight01(heightmap, OceanSampler, uv + float2(near.x, 0), 0), w1 = OceanTerrainHeight01(heightmap, OceanSampler, uv - float2(near.x, 0), 0);
+    float n1 = OceanTerrainHeight01(heightmap, OceanSampler, uv + float2(0, near.y), 0), s1 = OceanTerrainHeight01(heightmap, OceanSampler, uv - float2(0, near.y), 0);
+    float e2 = OceanTerrainHeight01(heightmap, OceanSampler, uv + float2(far.x, 0), 0), w2 = OceanTerrainHeight01(heightmap, OceanSampler, uv - float2(far.x, 0), 0);
+    float n2 = OceanTerrainHeight01(heightmap, OceanSampler, uv + float2(0, far.y), 0), s2 = OceanTerrainHeight01(heightmap, OceanSampler, uv - float2(0, far.y), 0);
     float h = (2.0 * c + e1 + w1 + n1 + s1) / 6.0;
     depth = max(ocean.OceanPlaneY - (ocean.TerrainBaseY + h * ocean.MaxTerrainHeight), 0.0);
     float2 gradient = 0.5 * (float2(e1 - w1, n1 - s1) / 12.0 + float2(e2 - w2, n2 - s2) / 24.0);

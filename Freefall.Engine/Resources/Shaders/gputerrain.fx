@@ -31,6 +31,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
+#include "terrain_grid.hlsli"
 #include "ground_shape.hlsli"
 #include "decoration_noise.hlsli"     // DecoEdgeWarp: the ground tint keeps the edge the spawn kernel draws
 // @RenderState(RenderTargets=6)
@@ -47,7 +48,7 @@ struct TerrainPatchData
 cbuffer terrain : register(b1)
 {
     float3 CameraPos;
-    float HeightTexel;
+    float HeightTexel;  // 1 / the height map's samples: a sample's step in its UV (terrain_grid.hlsli)
     float MaxHeight;
     float BlendDepth;   // layer transition softness in weight space (Terrain.LayerBlendDepth)
     float2 TerrainSize;
@@ -111,9 +112,10 @@ float3 StitchVertex(float3 pos, float2 rect_xy, float2 rect_size, uint stitchMas
     uv.y = 1.0 - uv.y;
     outHeightUV = rect_xy + uv * rect_size;
 
-    // Sample height
+    // Sample height: outHeightUV is the terrain UV (paint is read there too); the vertex's own sample is at
+    // TerrainHeightUV of it, so every vertex of a leaf patch lands on a sample
     Texture2D HeightTex = ResourceDescriptorHeap[HeightTexIdx];
-    float h = HeightTex.SampleLevel(sampHeightFilter, outHeightUV, 0).r * MaxHeight;
+    float h = HeightTex.SampleLevel(sampHeightFilter, TerrainHeightUV(outHeightUV, 1.0 / HeightTexel), 0).r * MaxHeight;
 
     float3 result;
     result.xz = gridPos - float2(16, 16);
@@ -220,18 +222,20 @@ struct FragmentOutput
 	float2 Displacement	: SV_TARGET5;
 };
 
-float3 GetNormal(float2 uv)
+// The terrain's normal at a terrain UV, from the height samples a step either side
+float3 GetNormal(float2 terrainUV)
 {
 	float4 h;
 	Texture2D HeightTex = ResourceDescriptorHeap[HeightTexIdx];
+    float2 uv = TerrainHeightUV(terrainUV, 1.0 / HeightTexel);
 
     h[0] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(0, -HeightTexel), 0).r;
     h[1] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(-HeightTexel, 0), 0).r;
     h[2] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(HeightTexel, 0), 0).r;
     h[3] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(0, HeightTexel), 0).r;
-	
-    // Central difference spans two texels (h[1]-h[2], h[0]-h[3])
-    float texelWorldSize = TerrainSize.x * HeightTexel;
+
+    // Central difference spans two samples (h[1]-h[2], h[0]-h[3])
+    float texelWorldSize = TerrainSampleSpacing(TerrainSize, 1.0 / HeightTexel).x;
     float heightScale = MaxHeight / (2.0 * texelWorldSize);
     
 	float3 n;
@@ -803,7 +807,8 @@ FragmentOutput PS(VertexOutput input)
 
     // The shape of the land in its colour (ground_shape.hlsli; the grass standing here takes the same tint)
     Texture2D HeightTex = ResourceDescriptorHeap[HeightTexIdx];
-    color.rgb *= GroundShapeTint(GroundShape(HeightTex, sampHeightFilter, input.UV2, HeightTexel, MaxHeight), growing);
+    color.rgb *= GroundShapeTint(GroundShape(HeightTex, sampHeightFilter, TerrainHeightUV(input.UV2, 1.0 / HeightTexel),
+                                             HeightTexel, MaxHeight), growing);
     output.Albedo = float4(color.rgb, 0);
     output.Normals = float4(terrainNormal.xyz, 1);
     output.Data = float4(0.95, 0.0, 1.0, lerp(1.0, 0.5, swardLighting)); // matte, metal 0, ao 1, lit: PBR .. vegetation

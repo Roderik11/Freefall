@@ -441,7 +441,9 @@ bool SurfaceUnderSky(float2 xz, out float height)
         float2 uv = (xz - TerrainOrigin.xz) / TerrainSize;
         if (all(uv >= 0.0) && all(uv <= 1.0))
         {
-            height = TerrainOrigin.y + heights.SampleLevel(LinearClampSampler, uv, 0) * TerrainMaxHeight;
+            uint hmW, hmH;
+            heights.GetDimensions(hmW, hmH);
+            height = TerrainOrigin.y + heights.SampleLevel(LinearClampSampler, TerrainHeightUV(uv, float2(hmW, hmH)), 0) * TerrainMaxHeight;
             found = true;
         }
     }

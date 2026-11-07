@@ -64,9 +64,6 @@ namespace Freefall.Assets.Loaders
 
                 terrain.Name = name;
 
-                // Migrate old power-of-2 resolutions to power-of-2+1
-                terrain.MigrateResolution();
-
                 // Pre-cooked PhysX cache skipped — always cook from CPU HeightField at play time
                 // LoadCookedHeightField(terrain, sourceGuid);
 

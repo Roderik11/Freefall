@@ -7,6 +7,8 @@
 
 #pragma kernel CSReduce
 
+#include "terrain_grid.hlsli"
+
 cbuffer PushConstants : register(b3)
 {
     uint DepthIdx;              // Texture2DArray<float>: the drawn depth (slice 0), standard Z, 1 = nothing
@@ -70,8 +72,11 @@ void CSReduce(uint3 id : SV_DispatchThreadID)
         {
             Texture2D<float> heights = ResourceDescriptorHeap[TerrainHeightmap];
             float2 tuv = (xz - float2(TerrainOriginX, TerrainOriginZ)) / float2(TerrainSizeX, TerrainSizeZ);
+            uint hmW, hmH;
+            heights.GetDimensions(hmW, hmH);
             if (all(tuv >= 0.0) && all(tuv <= 1.0)
-                && y < TerrainOriginY + heights.SampleLevel(LinearClamp, tuv, 0) * TerrainMaxHeight + MinAboveGround)
+                && y < TerrainOriginY + heights.SampleLevel(LinearClamp, TerrainHeightUV(tuv, float2(hmW, hmH)), 0) * TerrainMaxHeight
+                       + MinAboveGround)
                 continue;
         }
         top = max(top, y);

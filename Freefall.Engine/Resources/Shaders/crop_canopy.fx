@@ -43,6 +43,7 @@ cbuffer PushConstants : register(b3)
 #include "common.fx"
 #include "decoration_noise.hlsli"
 #include "ground_shape.hlsli"
+#include "terrain_grid.hlsli"
 // Both sides: a field's far edge slopes away from a low eye, and its tufts make the far edge's ragged silhouette
 // @RenderState(RenderTargets=6, CullMode=None)
 
@@ -270,7 +271,7 @@ Fetched FetchVertex(uint primitiveVertexID, InstanceDescriptor desc)
     return f;
 }
 
-// The ground's slope at a terrain-local point over 'reach' heightmap texels either side (central differences, as
+// The ground's slope at a height map UV over 'reach' height samples either side (central differences, as
 // gputerrain.fx GetNormal takes them over one): metres down per metre along x and z
 float2 GroundSlope(Texture2D heights, float2 uv, float2 texel, float reach, Instance inst)
 {
@@ -279,7 +280,7 @@ float2 GroundSlope(Texture2D heights, float2 uv, float2 texel, float reach, Inst
     float hr = heights.SampleLevel(SamplerClamp, uv + float2(d.x, 0), 0).r;
     float hb = heights.SampleLevel(SamplerClamp, uv - float2(0, d.y), 0).r;
     float hf = heights.SampleLevel(SamplerClamp, uv + float2(0, d.y), 0).r;
-    return float2(hl - hr, hb - hf) * inst.MaxHeight / (2.0 * inst.TerrainSize * d);
+    return float2(hl - hr, hb - hf) * inst.MaxHeight / (2.0 * reach * TerrainSampleSpacing(inst.TerrainSize, 1.0 / texel));
 }
 
 // The ground under the crop: its normal, with the relief of a few metres (ridge and furrow) exaggerated, since the
@@ -291,7 +292,7 @@ float3 GroundUnderCrop(float2 local, Instance inst, out float cavity)
     uint w, h;
     heights.GetDimensions(w, h);
     float2 texel = 1.0 / float2(w, h);
-    float2 uv = local / inst.TerrainSize;
+    float2 uv = TerrainHeightUV(local / inst.TerrainSize, float2(w, h));
     float2 broad = GroundSlope(heights, uv, texel, 4.0, inst);
     float2 fine = GroundSlope(heights, uv, texel, 1.0, inst);
     cavity = GroundCavity(heights, SamplerClamp, uv, texel.x, inst.MaxHeight, 3.0);

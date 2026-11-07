@@ -35,7 +35,10 @@ namespace Freefall.Components
         public Material? DecoratorMaterial = InternalAssets.DecoratorMaterial;
 
         // ───── Rendering Parameters ───────────────────────────────────────
-        public int MaxDepth = 7;
+        // The quadtree's depth: Terrain.QuadtreeDepth, from the terrain's size and MetresPerVertex (EnsureQuadtreeDepth).
+        // Not a setting since 2026-11-07 (TERRAIN_PAGES_PLAN.md stage 1); scenes that still hold one are not read.
+        private int MaxDepth = 7;
+        private bool _gridWarned;
         private int MaxPatches = 32768;
         private const int MinPatches = 32768;
 
@@ -324,9 +327,9 @@ namespace Freefall.Components
         protected override void Awake()
         {
             // GPU resource init — matches TerrainGPU.Awake() exactly.
-            // Called before YAML properties are applied, but MaxDepth defaults to 7
-            // and CreateHeightRangePyramid doesn't read the heightmap —
-            // BuildHeightRangePyramid is deferred to the first DispatchQuadtreeEval.
+            // Called before YAML properties are applied, so the Terrain is not known yet: the quadtree's buffers are made
+            // for depth 7 and made again by EnsureQuadtreeDepth when the terrain asks for another; CreateHeightRangePyramid
+            // doesn't read the heightmap — BuildHeightRangePyramid is deferred to the first DispatchQuadtreeEval.
             _baker = new TerrainBaker();
             _patchMesh = Mesh.CreatePatch(Engine.Device);
             _meshPartId = MeshRegistry.Register(_patchMesh, 0);
@@ -523,6 +526,14 @@ namespace Freefall.Components
             var material = Material;
             if (material == null || material.Effect == null) return;
 
+            EnsureQuadtreeDepth(Terrain.QuadtreeDepth);
+            if (!Terrain.GridIsExact && !_gridWarned)
+            {
+                _gridWarned = true;
+                Debug.LogWarning("[TerrainRenderer]", $"{Terrain.Name}: {Terrain.TerrainSize.X} x {Terrain.TerrainSize.Y} m is not a square of " +
+                                 $"{Assets.Terrain.PatchQuads} x {Terrain.VertexSpacing} m x a power of two: the vertices miss the height samples");
+            }
+
             // While a load wakes the scene its stamps are still arriving: the first bakes wait for the load's terrain
             // step, so they see every stamp. Before, a bake during the wake-up cut the holes of the stamps awake so far
             // (none, often), then again with all of them, and the editor took the half-cut mask for a change to save.
@@ -686,19 +697,19 @@ namespace Freefall.Components
                 _needHeightFieldReadback = false;
                 using var readbackScope = _readbackMarker.Auto();
                 // Only where the stamps changed it since the last readback, when a field of this size is there to
-                // copy (in texels: sample i stands at (i + 0.5) · size / N, see GetHeight; a texel more each side)
+                // copy (in samples: sample i stands at i · size / (N − 1), see GetHeight; a sample more each side)
                 float[,]? heights;
                 var previousField = Terrain.HeightField;
                 if (!_heightChangeAll && previousField != null && Transform != null && _heightChangeMax.X >= _heightChangeMin.X)
                 {
                     var origin = Transform.WorldPosition;
                     var size = Terrain.TerrainSize;
-                    int n = previousField.GetLength(0);
+                    int cells = previousField.GetLength(0) - 1;
                     heights = _baker.ReadbackHeightmap(previousField,
-                        (int)MathF.Floor((_heightChangeMin.X - origin.X) / size.X * n - 0.5f) - 1,
-                        (int)MathF.Floor((_heightChangeMin.Y - origin.Z) / size.Y * n - 0.5f) - 1,
-                        (int)MathF.Ceiling((_heightChangeMax.X - origin.X) / size.X * n - 0.5f) + 2,
-                        (int)MathF.Ceiling((_heightChangeMax.Y - origin.Z) / size.Y * n - 0.5f) + 2);
+                        (int)MathF.Floor((_heightChangeMin.X - origin.X) / size.X * cells) - 1,
+                        (int)MathF.Floor((_heightChangeMin.Y - origin.Z) / size.Y * cells) - 1,
+                        (int)MathF.Ceiling((_heightChangeMax.X - origin.X) / size.X * cells) + 2,
+                        (int)MathF.Ceiling((_heightChangeMax.Y - origin.Z) / size.Y * cells) + 2);
                 }
                 else
                     heights = _baker.ReadbackHeightmap();
@@ -1634,7 +1645,7 @@ namespace Freefall.Components
 
         /// <summary>
         /// Creates the RG32F mip pyramid texture and per-mip descriptors.
-        /// Called once during InitializeCompute.
+        /// Called during InitializeCompute and again by EnsureQuadtreeDepth.
         /// </summary>
         private void CreateHeightRangePyramid(GraphicsDevice device)
         {
@@ -1748,6 +1759,31 @@ namespace Freefall.Components
         }
 
         // ───── Helpers ────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Makes the quadtree's depth-sized resources (the split flags, the height-range pyramid) for this depth when they
+        /// were made for another: Awake makes them before the Terrain is known, and the depth comes from the terrain.
+        /// </summary>
+        private void EnsureQuadtreeDepth(int depth)
+        {
+            if (depth == MaxDepth) return;
+            var device = Engine.Device;
+
+            for (int i = 0; i < FrameCount; i++)
+                device.DeferDispose(_splitFlagsBuffers[i]);
+            device.DeferDispose(_heightRangePyramid);
+            foreach (var idx in _heightRangeMipUAVs) if (idx != 0) device.DeferReleaseBindlessIndex(idx);
+            foreach (var idx in _heightRangeMipSRVs) if (idx != 0) device.DeferReleaseBindlessIndex(idx);
+            if (_heightRangePyramidSRV != 0) device.DeferReleaseBindlessIndex(_heightRangePyramidSRV);
+
+            MaxDepth = depth;
+            _totalNodes = CalculateTotalNodes(depth);
+            for (int i = 0; i < FrameCount; i++)
+                _splitFlagsBuffers[i] = GraphicsBuffer.CreateRaw(_totalNodes, uav: true, clearable: true);
+            CreateHeightRangePyramid(device);
+            _heightRangePyramidBuilt = false;
+            Debug.Log($"[TerrainRenderer] Quadtree depth {depth} ({Terrain?.Name}): {_totalNodes} nodes");
+        }
 
         private static int CalculateTotalNodes(int maxDepth)
         {
@@ -2005,15 +2041,15 @@ namespace Freefall.Components
 
         /// <summary>
         /// The terrain's height at a point, as it is drawn: the height map sampled bilinearly, the way the terrain's
-        /// vertex shader samples it. Texel (i, j) holds the height of the point ((i + 0.5) · size / N, (j + 0.5) · size / N)
-        /// from the terrain's corner: the height bake works at texel centres, and stamps are placed at
-        /// uv = (world − origin) / size. Outside the terrain, its own height.
+        /// vertex shader samples it. Sample (i, j) holds the height of the point (i · s, j · s) from the terrain's corner,
+        /// s = size / (N − 1) = Terrain.VertexSpacing: one sample on every vertex (terrain_grid.hlsli, TERRAIN_PAGES_PLAN.md
+        /// stage 1). Stamps are placed at uv = (world − origin) / size. Outside the terrain, its own height.
         ///
-        /// Until 2026-10-24 this took sample i at i · size / N, half a texel off, and the plane through three corners
-        /// of the cell, which extrapolates in its other half: on bumpy ground tens of centimetres from what is drawn
-        /// (animals stood in the ground). The physics height field (TerrainCollider) and the navmesh bake
-        /// (TerrainSource.SampleHeight) put their samples at the same places; the hole mask keeps a grid of its own
-        /// and is read by place (terrain_system/overview.md).
+        /// Until 2026-10-24 this took sample i at i · size / N and the plane through three corners of the cell, which
+        /// extrapolates in its other half (animals stood in the ground); until 2026-11-07 the bake put sample i at
+        /// (i + 0.5) · size / N, between the vertices. The physics height field (TerrainCollider) and the navmesh bake
+        /// (TerrainSource.SampleHeight) put their samples at the same places; the hole mask is read by place
+        /// (terrain_system/overview.md).
         /// </summary>
         public float GetHeight(Vector3 position)
         {
@@ -2023,14 +2059,14 @@ namespace Freefall.Components
 
             var terrainSize = Terrain!.TerrainSize;
             position -= Transform.Position;
-            if (position.X < 0f || position.X >= terrainSize.X || position.Z < 0f || position.Z >= terrainSize.Y)
+            if (position.X < 0f || position.X > terrainSize.X || position.Z < 0f || position.Z > terrainSize.Y)
                 return Transform.Position.Y;
 
             int nx = heightField.GetLength(0), nz = heightField.GetLength(1);
 
-            // In texels, with the texel centres on whole numbers; clamped at the edges like the GPU's sampler
-            float tx = Math.Clamp(position.X / terrainSize.X * nx - 0.5f, 0f, nx - 1);
-            float tz = Math.Clamp(position.Z / terrainSize.Y * nz - 0.5f, 0f, nz - 1);
+            // In samples: sample i at i · size / (N − 1), the first and the last on the terrain's edges
+            float tx = Math.Clamp(position.X / terrainSize.X * (nx - 1), 0f, nx - 1);
+            float tz = Math.Clamp(position.Z / terrainSize.Y * (nz - 1), 0f, nz - 1);
             int x0 = (int)tx, z0 = (int)tz;
             int x1 = Math.Min(x0 + 1, nx - 1), z1 = Math.Min(z0 + 1, nz - 1);
             float fx = tx - x0, fz = tz - z0;

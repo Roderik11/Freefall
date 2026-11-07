@@ -122,8 +122,9 @@ bool OutsideSea(OceanData ocean, float2 xz)
     Texture2D<float> mask = ResourceDescriptorHeap[ocean.SeaMaskSRV];
     uint w, h;
     mask.GetDimensions(w, h);
-    uv = clamp(uv, 0.5 / float2(w, h), 1.0 - 0.5 / float2(w, h));   // no blending in the far border's texels
-    return mask.SampleLevel(OceanSampler, uv, 0) < 0.5;
+    // Laid out as the heights are, its first and last cells on the terrain's edges (SeaMask.Build takes every step-th
+    // height sample): read on that grid, which also keeps the far border's texels from blending with the clamp
+    return mask.SampleLevel(OceanSampler, TerrainHeightUV(uv, float2(w, h)), 0) < 0.5;
 }
 
 // How far the surf's water must at least face the eye (the cosine of its normal's angle to the view): PS below
@@ -255,7 +256,7 @@ PSOutput PS(DSOutput input)
         if (outside < 150.0)
         {
             Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
-            float h = heightmap.SampleLevel(OceanSampler, clampedUV, 0);
+            float h = OceanTerrainHeight01(heightmap, OceanSampler, clampedUV, 0);
             float terrainY = ocean.TerrainBaseY + h * ocean.MaxTerrainHeight;
             terrainDepth = worldPos.y - terrainY;
             stillDepth = ocean.OceanPlaneY - terrainY;
@@ -357,10 +358,10 @@ PSOutput PS(DSOutput input)
             Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
             float2 slopeStep = 3.0 / terrainSize;
             float2 uphill = float2(
-                heightmap.SampleLevel(OceanSampler, clampedUV + float2(slopeStep.x, 0), 0)
-              - heightmap.SampleLevel(OceanSampler, clampedUV - float2(slopeStep.x, 0), 0),
-                heightmap.SampleLevel(OceanSampler, clampedUV + float2(0, slopeStep.y), 0)
-              - heightmap.SampleLevel(OceanSampler, clampedUV - float2(0, slopeStep.y), 0));
+                OceanTerrainHeight01(heightmap, OceanSampler, clampedUV + float2(slopeStep.x, 0), 0)
+              - OceanTerrainHeight01(heightmap, OceanSampler, clampedUV - float2(slopeStep.x, 0), 0),
+                OceanTerrainHeight01(heightmap, OceanSampler, clampedUV + float2(0, slopeStep.y), 0)
+              - OceanTerrainHeight01(heightmap, OceanSampler, clampedUV - float2(0, slopeStep.y), 0));
             float steepness = length(uphill);
             downhill = -uphill / max(steepness, 1e-6);
             beachSlope = clamp(steepness * ocean.MaxTerrainHeight / 6.0, 0.03, 1.0);

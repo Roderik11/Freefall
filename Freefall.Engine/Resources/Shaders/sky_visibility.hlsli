@@ -4,6 +4,8 @@
 #ifndef SKY_VISIBILITY_HLSLI
 #define SKY_VISIBILITY_HLSLI
 
+#include "terrain_grid.hlsli"
+
 // The terrain's baked heightmap (R16, 0 = no terrain) and where it lies
 struct TerrainCover
 {
@@ -16,7 +18,9 @@ struct TerrainCover
 float TerrainHeightAt(TerrainCover t, SamplerState linearClamp, float2 xz)
 {
     Texture2D<float> heights = ResourceDescriptorHeap[t.Heightmap];
-    return t.Origin.y + heights.SampleLevel(linearClamp, (xz - t.Origin.xz) / t.Size, 0) * t.MaxHeight;
+    uint w, h;
+    heights.GetDimensions(w, h);
+    return t.Origin.y + heights.SampleLevel(linearClamp, TerrainHeightUV((xz - t.Origin.xz) / t.Size, float2(w, h)), 0) * t.MaxHeight;
 }
 
 // How far below the heightmap a surface may be drawn and still be the terrain's surface, not a cave: the terrain is

@@ -6,6 +6,8 @@
 #ifndef WEATHER_COVER_HLSLI
 #define WEATHER_COVER_HLSLI
 
+#include "terrain_grid.hlsli"
+
 struct WeatherCover
 {
     row_major float4x4 ShelterVP;   // world -> the top-down slice's clip space (orthographic, looking down)
@@ -24,8 +26,11 @@ bool WeatherUnderCover(WeatherCover c, SamplerState linearClamp, float3 p, float
     {
         Texture2D<float> heights = ResourceDescriptorHeap[c.TerrainHeightmap];
         float2 uv = (p.xz - c.TerrainOrigin.xz) / c.TerrainSize;
+        uint hmW, hmH;
+        heights.GetDimensions(hmW, hmH);
         if (all(uv >= 0.0) && all(uv <= 1.0)
-            && c.TerrainOrigin.y + heights.SampleLevel(linearClamp, uv, 0) * c.TerrainMaxHeight > p.y + bias)
+            && c.TerrainOrigin.y + heights.SampleLevel(linearClamp, TerrainHeightUV(uv, float2(hmW, hmH)), 0) * c.TerrainMaxHeight
+               > p.y + bias)
             return true;
     }
     if (c.ShelterDepth != 0)
@@ -214,8 +219,11 @@ float WeatherOpenness(WeatherShelter s, SamplerState linearClamp, float3 p, floa
     {
         Texture2D<float> heights = ResourceDescriptorHeap[s.TerrainHeightmap];
         float2 tuv = (p.xz - s.TerrainOrigin.xz) / s.TerrainSize;
+        uint hmW, hmH;
+        heights.GetDimensions(hmW, hmH);
         if (all(tuv >= 0.0) && all(tuv <= 1.0)
-            && s.TerrainOrigin.y + heights.SampleLevel(linearClamp, tuv, 0) * s.TerrainMaxHeight > p.y + bias)
+            && s.TerrainOrigin.y + heights.SampleLevel(linearClamp, TerrainHeightUV(tuv, float2(hmW, hmH)), 0) * s.TerrainMaxHeight
+               > p.y + bias)
             return 0.0;
     }
     uint first, second;

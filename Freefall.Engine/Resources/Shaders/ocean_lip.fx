@@ -502,7 +502,7 @@ LipPSOutput PS_Lip(LipOutput input)
         Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
         float2 uv = clamp((worldPos.xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ))
                           / float2(ocean.TerrainSizeX, ocean.TerrainSizeZ), 0.002, 0.998);
-        bedDepth = worldPos.y - (ocean.TerrainBaseY + heightmap.SampleLevel(OceanSampler, uv, 0) * ocean.MaxTerrainHeight);
+        bedDepth = worldPos.y - (ocean.TerrainBaseY + OceanTerrainHeight01(heightmap, OceanSampler, uv, 0) * ocean.MaxTerrainHeight);
     }
     float shallow = exp(-max(bedDepth, 0.0) / max(0.01, ocean.ShoreFadeDepth)) * saturate(column.pathLen);
     body += ocean.ShallowColor * (sunRadiance * saturate(L.y) + WaterSkyIrradiance(skyAmbient)) * 0.08 * shallow;

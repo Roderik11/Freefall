@@ -540,28 +540,17 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// The samples where the height map's texels are drawn: sample i at (i + 0.5) · size / N from the terrain's corner
-        /// (the height bake works at texel centres; TerrainRenderer.GetHeight). Until 2026-10-24 sample i sat at
-        /// i · size / (N − 1), up to half a texel off what is drawn towards the edges, so on steep ground near them a
-        /// character stood up to a metre off the drawn ground.
+        /// The samples where the terrain's vertices are drawn: sample i at i · size / (N − 1) from the terrain's corner,
+        /// one on every vertex (terrain_grid.hlsli; TerrainRenderer.GetHeight), so the field spans the terrain exactly.
+        /// From 2026-10-24 to 2026-11-07 the bake put sample i at (i + 0.5) · size / N and this field followed, half a
+        /// sample in from the corner; before that it sat on i · size / (N − 1) while the bake did not.
         /// </summary>
         private static HeightFieldGeometry Geometry(Terrain terrain, HeightField field)
         {
             // The field was made from these heights (the cache is per version of them)
-            float fx = terrain.TerrainSize.X / terrain.HeightField.GetLength(0);
-            float fy = terrain.TerrainSize.Y / terrain.HeightField.GetLength(1);
+            float fx = terrain.TerrainSize.X / (terrain.HeightField.GetLength(0) - 1);
+            float fy = terrain.TerrainSize.Y / (terrain.HeightField.GetLength(1) - 1);
             return new HeightFieldGeometry(field, 0, terrain.MaxHeight / short.MaxValue, fx, fy);
-        }
-
-        protected override Vector3 GeometryOffset
-        {
-            get
-            {
-                var terrain = Entity?.GetComponent<TerrainRenderer>()?.Terrain;
-                var heights = terrain?.HeightField;
-                if (heights == null) return Vector3.Zero;
-                return new Vector3(0.5f * terrain!.TerrainSize.X / heights.GetLength(0), 0f, 0.5f * terrain.TerrainSize.Y / heights.GetLength(1));
-            }
         }
     }
 }

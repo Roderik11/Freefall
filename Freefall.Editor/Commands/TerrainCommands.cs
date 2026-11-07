@@ -118,7 +118,12 @@ namespace Freefall.Editor.Commands
                 guid = terrain.Guid,
                 terrainSize = new { x = size.X, z = size.Y },
                 maxHeight = terrain.MaxHeight,
-                heightmapResolution = terrain.HeightmapResolution,
+                metresPerVertex = terrain.VertexSpacing,
+                paintPixelsPerMetre = Freefall.Assets.Terrain.DensityValue(terrain.PaintPixelsPerMetre),
+                heightSamples = terrain.EffectiveHeightmapResolution,
+                paintTexels = terrain.EffectiveSplatmapResolution,
+                decorationTexels = terrain.EffectiveDecorationMapResolution,
+                quadtreeDepth = terrain.QuadtreeDepth,
                 origin = CommandHelpers.Vec3(origin),
                 worldBounds = new
                 {

@@ -7,6 +7,8 @@
 #ifndef TERRAIN_COVERAGE_HLSLI
 #define TERRAIN_COVERAGE_HLSLI
 
+#include "terrain_grid.hlsli"
+
 // A SplatStamp or DecoStamp as the GPU sees it (matches C# CoverageStampGPU, 116 bytes)
 struct CoverageStamp
 {
@@ -106,7 +108,7 @@ float CoverageTerrainFilter(CoverageStamp s, float heightNorm, float slopeDeg, f
 }
 
 // Normalized height and slope in degrees at a terrain UV. The one definition of slope for terrain
-// filters: central differences over two texels, as gputerrain.fx GetNormal.
+// filters: central differences over two height samples, as gputerrain.fx GetNormal.
 void SampleTerrainHeightSlope(Texture2D heightTex, SamplerState samp, float2 terrainUV,
                               float maxHeight, float terrainSizeX,
                               out float heightNorm, out float slopeDeg)
@@ -114,15 +116,16 @@ void SampleTerrainHeightSlope(Texture2D heightTex, SamplerState samp, float2 ter
     uint hmW, hmH;
     heightTex.GetDimensions(hmW, hmH);
     float texel = 1.0 / float(hmW);
+    float2 uv = TerrainHeightUV(terrainUV, float2(hmW, hmH));
 
-    heightNorm = heightTex.SampleLevel(samp, terrainUV, 0).r;
+    heightNorm = heightTex.SampleLevel(samp, uv, 0).r;
 
-    float hS = heightTex.SampleLevel(samp, terrainUV + float2(0, -texel), 0).r;
-    float hW = heightTex.SampleLevel(samp, terrainUV + float2(-texel, 0), 0).r;
-    float hE = heightTex.SampleLevel(samp, terrainUV + float2(texel, 0), 0).r;
-    float hN = heightTex.SampleLevel(samp, terrainUV + float2(0, texel), 0).r;
+    float hS = heightTex.SampleLevel(samp, uv + float2(0, -texel), 0).r;
+    float hW = heightTex.SampleLevel(samp, uv + float2(-texel, 0), 0).r;
+    float hE = heightTex.SampleLevel(samp, uv + float2(texel, 0), 0).r;
+    float hN = heightTex.SampleLevel(samp, uv + float2(0, texel), 0).r;
 
-    float heightScale = maxHeight / (2.0 * terrainSizeX * texel);
+    float heightScale = maxHeight / (2.0 * terrainSizeX / float(hmW - 1));
 
     float3 n = normalize(float3((hW - hE) * heightScale, 1.0, (hS - hN) * heightScale));
     slopeDeg = acos(saturate(n.y)) * (180.0 / 3.14159265);
