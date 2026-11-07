@@ -73,15 +73,15 @@ namespace Freefall.Graphics
         public Band[] Bands => _bands;
 
         /// <summary>
-        /// Bake the warp of each band over the height field (values 0..1 of <paramref name="maxHeight"/> above the terrain's
-        /// base, [x, z]). <paramref name="mask"/>: the sea mask (where the sea is, beaches included); null = wherever the
-        /// ground is below sea level. Any thread.
+        /// Bake the warp of each band over the terrain's heights (the CPU store: values 0..1 of <paramref name="maxHeight"/>
+        /// above the terrain's base). <paramref name="mask"/>: the sea mask (where the sea is, beaches included); null =
+        /// wherever the ground is below sea level. Any thread: a store is never changed.
         /// </summary>
-        public static Result Build(float[,] heights, SeaMask.Result? mask, float seaLevel01, float maxHeight,
+        public static Result Build(Assets.TerrainPages heights, SeaMask.Result? mask, float seaLevel01, float maxHeight,
                                    Vector2 terrainSize, Vector2 origin, Band[] bands)
         {
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
-            int res = Math.Min(heights.GetLength(0), heights.GetLength(1));
+            int res = heights.Resolution;
             int step = 1;
             while ((res - 1) / step + 1 > MaxSize) step *= 2;
             int n = (res - 1) / step + 1;
@@ -95,7 +95,7 @@ namespace Freefall.Graphics
             for (int x = 0; x < n; x++)
             {
                 int i = z * n + x;
-                depth[i] = (seaLevel01 - heights[x * step, z * step]) * maxHeight;
+                depth[i] = (seaLevel01 - heights.Sample01(x * step, z * step)) * maxHeight;
                 if (mask != null && mask.Size > 1)
                 {
                     int mx = (int)MathF.Round(x * (mask.Size - 1) / (float)(n - 1));

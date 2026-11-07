@@ -258,7 +258,7 @@ namespace Freefall.Navigation
                 // Holes: a quad whose centre lies in one is left out. Only quads that are holes go into the hash,
                 // so tiles away from every hole keep their hashes.
                 int holeStart = -1;
-                if (terrain.Holes != null)
+                if (terrain.HasHoles)
                 {
                     holeStart = _quadHoleCount;
                     int quads = (rowWidth - 1) * (rows - 1);

@@ -148,8 +148,9 @@ namespace Freefall.Editor.Commands
                 holes = new
                 {
                     stamps = TerrainBaker.CollectStamps<HoleStamp>(terrainRenderer).Count(s => !s.IsGlobal),
-                    resolution = terrain.HoleResolution,
-                    openSamples = terrain.Holes?.Count(b => b >= 128) ?? 0,
+                    resolution = terrain.HasHoles ? terrain.Pages!.Resolution : 0,
+                    pages = terrain.Pages?.HolePages ?? 0,
+                    openSamples = terrain.Pages?.OpenHoleSamples() ?? 0,
                 },
                 warnings = terrainRenderer.PaletteWarnings,
             });

@@ -43,7 +43,8 @@ namespace Freefall.Navigation
     /// <summary>A terrain's height data as the bake sees it.</summary>
     internal sealed class TerrainSource
     {
-        public readonly float[,] Heights;
+        /// <summary>The terrain's heights and holes as they were when the bake took them (a store is never changed).</summary>
+        public readonly Freefall.Assets.TerrainPages Pages;
         public readonly Vector3 Position;
         public readonly Vector2 Size;
         public readonly float MaxHeight;
@@ -52,21 +53,17 @@ namespace Freefall.Navigation
         private readonly int _dimX;
         private readonly int _dimZ;
 
-        /// <summary>A copy of the terrain's hole mask (Terrain.Holes), null = no holes.</summary>
-        public readonly byte[]? Holes;
-        public readonly int HoleResolution;
+        /// <summary>A hole stamp cuts the terrain somewhere.</summary>
+        public bool HasHoles => Pages.HasHoles;
 
-        public TerrainSource(float[,] heights, Vector3 position, Vector2 size, float maxHeight,
-            byte[]? holes = null, int holeResolution = 0)
+        public TerrainSource(Freefall.Assets.TerrainPages pages, Vector3 position, Vector2 size, float maxHeight)
         {
-            Heights = heights;
+            Pages = pages;
             Position = position;
             Size = size;
             MaxHeight = maxHeight;
-            _dimX = heights.GetLength(0) - 1;
-            _dimZ = heights.GetLength(1) - 1;
-            Holes = holes;
-            HoleResolution = holeResolution;
+            _dimX = pages.Resolution - 1;
+            _dimZ = pages.Resolution - 1;
 
             // 2: samples at texel centres (SampleHeight, 2026-10-24); 3: one sample on every vertex (2026-11-07); a terrain
             // hashed another way is baked again
@@ -75,8 +72,7 @@ namespace Freefall.Navigation
         }
 
         /// <summary>True where a HoleStamp opens the terrain (terrain-local position): no navmesh there.</summary>
-        public bool IsHole(float localX, float localZ)
-            => Holes != null && Freefall.Assets.Terrain.HoleWeight(Holes, HoleResolution, Size, localX, localZ) >= 0.5f;
+        public bool IsHole(float localX, float localZ) => Pages.IsHole(Size, localX, localZ);
 
         /// <summary>
         /// World height at a terrain-local position, as the terrain is drawn and collided with: bilinear over the
@@ -87,15 +83,7 @@ namespace Freefall.Navigation
         {
             float fx = Math.Clamp(localX / Size.X * _dimX, 0, _dimX);
             float fz = Math.Clamp(localZ / Size.Y * _dimZ, 0, _dimZ);
-
-            int x0 = (int)fx, z0 = (int)fz;
-            int x1 = Math.Min(x0 + 1, _dimX), z1 = Math.Min(z0 + 1, _dimZ);
-            float tx = fx - x0, tz = fz - z0;
-
-            float h0 = Heights[x0, z0] + (Heights[x1, z0] - Heights[x0, z0]) * tx;
-            float h1 = Heights[x0, z1] + (Heights[x1, z1] - Heights[x0, z1]) * tx;
-
-            return Position.Y + (h0 + (h1 - h0) * tz) * MaxHeight;
+            return Position.Y + Pages.Height01(fx, fz) * MaxHeight;
         }
     }
 
@@ -368,13 +356,11 @@ namespace Freefall.Navigation
             foreach (var renderer in ComponentCache<TerrainRenderer>.All)
             {
                 var terrain = renderer.Terrain;
-                if (terrain?.HeightField == null || renderer.Transform == null) continue;
-                if (terrain.HeightField.GetLength(0) < 2 || terrain.HeightField.GetLength(1) < 2) continue;
+                var pages = terrain?.Pages;
+                if (pages is not { HasHeights: true } || pages.Resolution < 2 || renderer.Transform == null) continue;
 
-                // The holes are copied: the bake runs on worker threads and a hole stamp may be moved meanwhile
-                input.Terrains.Add(new TerrainSource(
-                    terrain.HeightField, renderer.Transform.Position, terrain.TerrainSize, terrain.MaxHeight,
-                    (byte[]?)terrain.Holes?.Clone(), terrain.HoleResolution));
+                // The store as it is now: a hole stamp moved meanwhile makes a new one, the bake keeps this
+                input.Terrains.Add(new TerrainSource(pages, renderer.Transform.Position, terrain!.TerrainSize, terrain.MaxHeight));
             }
 
             // Mesh -> index into Geometries, or -1 for a mesh with nothing to bake

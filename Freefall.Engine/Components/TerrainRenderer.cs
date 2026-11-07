@@ -39,6 +39,7 @@ namespace Freefall.Components
         // Not a setting since 2026-11-07 (TERRAIN_PAGES_PLAN.md stage 1); scenes that still hold one are not read.
         private int MaxDepth = 7;
         private bool _gridWarned;
+        private bool _poolWarned;
         // The walk packs a node as (depth << 28) | its index in the level (≤ 14), and the split flags take 4 bytes a node of
         // the whole tree: 22 MB a frame at depth 11 (32 km at 0.5 m), 4 times that a level deeper
         private const int MaxQuadtreeDepth = 12;
@@ -347,7 +348,7 @@ namespace Freefall.Components
         private volatile bool _topLayersStale;     // a bake has run since the CPU copy was fetched
 
         // ───── Holes (HoleStamp) ───────────────────────────────────────────
-        // The mask itself is Terrain.Holes, baked on the CPU (TerrainBaker.BakeHoles) because the PhysX height
+        // The mask itself is in Terrain.Pages, baked on the CPU (TerrainBaker.BakeHoles) because the PhysX height
         // field, the navmesh and PCG need it there; this is its copy for the shaders (terrain_holes.hlsli).
         private ID3D12Resource? _holeTex;          // R8_UNorm, one texel per height sample
         private uint _holeSRV;
@@ -564,6 +565,20 @@ namespace Freefall.Components
             if (material == null || material.Effect == null) return;
 
             EnsureQuadtreeDepth(Math.Min(Terrain.QuadtreeDepth, MaxQuadtreeDepth));
+            // Every page is loaded until pages stream (TERRAIN_PAGES_PLAN.md stage 5): a pool past D3D12's array cap cannot
+            // be made (16 km at 0.5 m per vertex needs 4,096 slices), so nothing is drawn rather than the device failing
+            if (Graphics.HeightPool.SlicesFor(Terrain.EffectiveHeightmapResolution) is var slices && slices > Graphics.HeightPool.MaxSlices)
+            {
+                if (!_poolWarned)
+                {
+                    _poolWarned = true;
+                    Debug.LogError("[TerrainRenderer]", $"{Terrain.Name}: {Terrain.TerrainSize.X} m at {Terrain.VertexSpacing} m per vertex needs " +
+                                   $"{slices} slices of height pages, past D3D12's {Graphics.HeightPool.MaxSlices}: not drawn. " +
+                                   "Use a coarser MetresPerVertex until pages stream.");
+                }
+                return;
+            }
+
             if (!Terrain.GridIsExact && !_gridWarned)
             {
                 _gridWarned = true;
@@ -728,7 +743,7 @@ namespace Freefall.Components
                     terrain.HeightmapStampsHash = plan.Hash;
                     _heightRangePyramidBuilt = false; // force rebuild with new heights
                     terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake); // re-bake albedo with new terrain shape
-                    _needHeightFieldReadback = true; // trigger CPU-side heightfield rebuild next frame
+                    _needHeightFieldReadback = true; // read the heights back into the CPU store next frame
                     renderer._bakedNormalsDirty = true; // normals depend on height
                     PixMarker.Begin(list, "Terrain normals bake");
                     renderer.BakeTerrainNormals(list);
@@ -736,34 +751,38 @@ namespace Freefall.Components
                 });
             }
 
-            // Debounced CPU heightfield readback — only when baking has settled (not while a stamp is dragged)
+            // Debounced readback into the CPU store (Terrain.Pages) — only when baking has settled (not while a stamp is dragged)
             if (_needHeightFieldReadback && !Terrain.NeedsUpdate(TerrainDirtyFlags.HeightBake))
             {
                 _needHeightFieldReadback = false;
                 using var readbackScope = _readbackMarker.Auto();
-                // Only where the stamps changed it since the last readback, when a field of this size is there to
-                // copy (in samples: sample i stands at i · size / (N − 1), see GetHeight; a sample more each side)
-                float[,]? heights;
+                // Only the pages where the stamps changed it since the last readback, when a store of this size holds
+                // heights to compare with (in samples: sample i stands at i · size / (N − 1), see GetHeight; a sample
+                // more each side). A page that comes back the same stays the one the store had.
                 (int x0, int z0, int x1, int z1)? changed;
-                var previousField = Terrain.HeightField;
-                bool regional = !_heightChangeAll && previousField != null && Transform != null && _heightChangeMax.X >= _heightChangeMin.X;
+                var previousPages = Terrain.Pages;
+                bool regional = !_heightChangeAll && previousPages is { HasHeights: true } && Transform != null && _heightChangeMax.X >= _heightChangeMin.X;
+                TerrainPages? heights;
                 if (regional)
                 {
                     var origin = Transform!.WorldPosition;
                     var size = Terrain.TerrainSize;
-                    int cells = previousField!.GetLength(0) - 1;
-                    heights = _baker.ReadbackHeightmap(out changed, previousField,
+                    int cells = previousPages!.Resolution - 1;
+                    heights = _baker.ReadbackPages(previousPages, false, out changed,
                         (int)MathF.Floor((_heightChangeMin.X - origin.X) / size.X * cells) - 1,
                         (int)MathF.Floor((_heightChangeMin.Y - origin.Z) / size.Y * cells) - 1,
                         (int)MathF.Ceiling((_heightChangeMax.X - origin.X) / size.X * cells) + 2,
                         (int)MathF.Ceiling((_heightChangeMax.Y - origin.Z) / size.Y * cells) + 2);
                 }
                 else
-                    heights = _baker.ReadbackHeightmap(out changed);
+                    heights = _baker.ReadbackPages(previousPages, true, out changed);
                 if (heights != null && Terrain != null)
                 {
-                    Terrain.SetHeightField(heights);
-                    Terrain.HeightFieldStampsHash = Terrain.HeightmapStampsHash;   // read back from the map as it is now
+                    Terrain.SetPages(heights);
+                    Terrain.PagesStampsHash = Terrain.HeightmapStampsHash;   // read back from the map as it is now
+                    // Holes cut at another size do not go over to a store of this one: the stamps cut them again
+                    if (previousPages is { HasHoles: true } && previousPages.Resolution != heights.Resolution)
+                        Terrain.MarkForUpdate(TerrainDirtyFlags.HoleBake);
                     Terrain.CheckMapsAgainstSaved();    // on Save Changed Assets when the bake no longer equals the saved heightmap
                     _heightsReadBack = true;
                     // Surface-snapped geometry (RuntimeMesh) and projected PCG output sampled the old heights —
@@ -772,7 +791,7 @@ namespace Freefall.Components
                     // heights (Opacity 1 → 1 on Eldermoor's rolling ground: 196 pages) regenerated every PCG component
                     // over its region before, 2.7 s.
                     var change = regional
-                        ? ChangedSamplesRegion(changed, heights.GetLength(0) - 1, heights.GetLength(1) - 1)
+                        ? ChangedSamplesRegion(changed, heights.Resolution - 1, heights.Resolution - 1)
                         : new TerrainHeightsChange(Terrain, _heightChangeAll, _heightChangeMin, _heightChangeMax);
                     Debug.Log($"[Terrain] Heights read back (tick {Engine.TickCount}): " +
                               (change == null ? "unchanged" : change.All ? "all" : $"x {change.Min.X:0}..{change.Max.X:0}, z {change.Min.Y:0}..{change.Max.Y:0}") +
@@ -1994,28 +2013,40 @@ namespace Freefall.Components
         // ───── Holes ───────────────────────────────────────────────────────
 
         /// <summary>
-        /// Re-cut the hole stamps into Terrain.Holes and bring the shaders' copy up to date. Only the samples the
-        /// stamps reach now or reached at the last bake are touched, so dragging a hole stamp costs its own area,
-        /// not the terrain's. Main thread.
+        /// Re-cut the hole stamps into the terrain's CPU store (Terrain.Pages: a new store with the hole pages they reach
+        /// made anew) and bring the shaders' copy up to date. Only the samples the stamps reach now or reached at the
+        /// last bake are touched, so dragging a hole stamp costs its own area, not the terrain's. Main thread.
         /// </summary>
         private void RebakeHoles()
         {
             var terrain = Terrain!;
             var plan = TerrainBaker.PrepareHoles(terrain, this);
             int res = plan.Resolution;
-            var mask = terrain.Holes;
-            bool sameMask = mask != null && terrain.HoleResolution == res;
-            // Where stamps cut at the last bake; null = not known (first bake: the mask came from the cache or
-            // another scene). No mask after a bake of this renderer = nothing was cut.
+            var pages = terrain.Pages;
+
+            // Heights of another size are still to be replaced by a bake at this one (the density changed): the holes
+            // are cut into the store that bake's readback makes
+            if (pages is { HasHeights: true } && pages.Resolution != res && HeightsPending)
+            {
+                terrain.MarkForUpdate(TerrainDirtyFlags.HoleBake);
+                return;
+            }
+
+            bool samePages = pages != null && pages.Resolution == res;
+            bool hadHoles = samePages && pages!.HasHoles;
+            // Where stamps cut at the last bake; null = not known (first bake: the holes came from the cache or
+            // another scene). No holes after a bake of this renderer = nothing was cut.
             var cutBefore = _holeRects == null ? null
-                : mask == null ? new List<TerrainBaker.HoleRect>()
-                : sameMask ? _holeRects : null;
+                : pages is not { HasHoles: true } ? new List<TerrainBaker.HoleRect>()
+                : samePages ? _holeRects : null;
 
             if (!plan.HasHoles)
             {
-                if (mask != null)
+                if (pages is { HasHoles: true })
                 {
-                    terrain.SetHoles(null, 0);
+                    var none = pages.Edit();
+                    none.SetHolesFlat(default);
+                    terrain.SetPages(none.Done());
                     terrain.CheckMapsAgainstSaved();
                     if (cutBefore != null) _holeChanges.AddRange(cutBefore);
                 }
@@ -2024,26 +2055,28 @@ namespace Freefall.Components
             }
 
             var cutNow = plan.Rects.ToList();
-            if (!sameMask)
+            TerrainPages baked;
+            if (!hadHoles)
             {
-                mask = new byte[res * res];
-                TerrainBaker.BakeHoles(plan, mask, Array.Empty<TerrainBaker.HoleRect>());
+                // Nothing cut at this size yet (a store of another size has no heights here: the readback brings them)
+                var basis = samePages ? pages! : TerrainPages.Empty(res);
+                baked = TerrainBaker.BakeHoles(plan, basis, Array.Empty<TerrainBaker.HoleRect>());
             }
             else
             {
-                // A mask of unknown origin (the saved one, or another scene's) is cleared whole once
-                TerrainBaker.BakeHoles(plan, mask!, cutBefore ?? [new TerrainBaker.HoleRect(0, 0, res - 1, res - 1)]);
+                // Holes of unknown origin (the saved ones, or another scene's) are cleared whole once
+                baked = TerrainBaker.BakeHoles(plan, pages!, cutBefore ?? [new TerrainBaker.HoleRect(0, 0, res - 1, res - 1)]);
             }
-            terrain.SetHoles(mask, res);
+            terrain.SetPages(baked);
             terrain.CheckMapsAgainstSaved();
             _holeRects = cutNow;
 
             // What changed: where stamps cut before and where they cut now (all of it when that is not known)
             var changed = cutBefore != null ? cutBefore.Concat(cutNow).Distinct().ToList() : null;
             // The texture holds only what was uploaded since it was made, and nothing that was cut while no
-            // mask existed: all of it then
+            // holes were: all of it then
             bool created = EnsureHoleTexture(res);
-            UploadHoles(mask!, res, created || !sameMask ? null : changed);
+            UploadHoles(baked, res, created || !hadHoles ? null : changed);
             if (changed != null)
                 foreach (var rect in changed)
                     if (!_holeChanges.Contains(rect)) _holeChanges.Add(rect);
@@ -2077,10 +2110,10 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Copy rects of the mask into the hole texture (null = all of it). The rows are copied into upload
-        /// buffers here, so the render callback never reads the mask while the next bake changes it.
+        /// Copy rects of the store's holes into the hole texture (null = all of it), one flat R8 map until the GPU holds
+        /// hole pages. The rows are copied into upload buffers here.
         /// </summary>
-        private unsafe void UploadHoles(byte[] mask, int res, List<TerrainBaker.HoleRect>? rects)
+        private unsafe void UploadHoles(TerrainPages pages, int res, List<TerrainBaker.HoleRect>? rects)
         {
             var device = Engine.Device;
             var tex = _holeTex!;
@@ -2096,9 +2129,7 @@ namespace Freefall.Components
 
                 void* data;
                 upload.Map(0, null, &data);
-                fixed (byte* src = mask)
-                    for (int z = 0; z < h; z++)
-                        Buffer.MemoryCopy(src + (long)(r.Z0 + z) * res + r.X0, (byte*)data + (long)z * rowPitch, w, w);
+                pages.CopyHoles(r.X0, r.Z0, w, h, new Span<byte>(data, rowPitch * h), rowPitch);
                 upload.Unmap(0);
 
                 var footprint = new PlacedSubresourceFootPrint
@@ -2164,8 +2195,8 @@ namespace Freefall.Components
         /// </summary>
         public float GetHeight(Vector3 position)
         {
-            var heightField = Terrain?.HeightField;
-            if (heightField == null) return Transform?.Position.Y ?? 0;
+            var pages = Terrain?.Pages;
+            if (pages is not { HasHeights: true }) return Transform?.Position.Y ?? 0;
             if (Transform == null) return 0;
 
             var terrainSize = Terrain!.TerrainSize;
@@ -2173,18 +2204,12 @@ namespace Freefall.Components
             if (position.X < 0f || position.X > terrainSize.X || position.Z < 0f || position.Z > terrainSize.Y)
                 return Transform.Position.Y;
 
-            int nx = heightField.GetLength(0), nz = heightField.GetLength(1);
-
-            // In samples: sample i at i · size / (N − 1), the first and the last on the terrain's edges
-            float tx = Math.Clamp(position.X / terrainSize.X * (nx - 1), 0f, nx - 1);
-            float tz = Math.Clamp(position.Z / terrainSize.Y * (nz - 1), 0f, nz - 1);
-            int x0 = (int)tx, z0 = (int)tz;
-            int x1 = Math.Min(x0 + 1, nx - 1), z1 = Math.Min(z0 + 1, nz - 1);
-            float fx = tx - x0, fz = tz - z0;
-
-            float near = heightField[x0, z0] + (heightField[x1, z0] - heightField[x0, z0]) * fx;
-            float far = heightField[x0, z1] + (heightField[x1, z1] - heightField[x0, z1]) * fx;
-            return Transform.Position.Y + (near + (far - near) * fz) * Terrain.MaxHeight;
+            // In samples: sample i at i · size / (N − 1), the first and the last on the terrain's edges; the four round
+            // it always lie on one page (TerrainPages)
+            int last = pages.Resolution - 1;
+            float tx = Math.Clamp(position.X / terrainSize.X * last, 0f, last);
+            float tz = Math.Clamp(position.Z / terrainSize.Y * last, 0f, last);
+            return Transform.Position.Y + pages.Height01(tx, tz) * Terrain.MaxHeight;
         }
 
         /// <summary>
@@ -3108,7 +3133,7 @@ namespace Freefall.Components
 
         /// <summary>
         /// The world XZ region a regional readback changed: the box of samples that differ from the field before
-        /// (<see cref="TerrainBaker.ReadbackHeightmap"/>), widened by how far from a sample its height is read. A height
+        /// (<see cref="TerrainBaker.ReadbackPages"/>), widened by how far from a sample its height is read. A height
         /// between samples comes from the samples either side (<see cref="GetHeight"/>), so a sample reaches a spacing
         /// each way, and normals are taken from heights up to half a metre apart (TerrainProjection): a metre more.
         /// Null when no sample differs.
@@ -3126,7 +3151,7 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// The CPU height field is missing or about to be replaced: a height bake or its readback is still
+        /// The CPU heights (Terrain.Pages) are missing or about to be replaced: a height bake or its readback is still
         /// outstanding. Whatever samples heights now (PCG graphs) gets flat ground or values that change in
         /// a frame or two; TerrainHeightsChanged follows once they are in. Not at a load that keeps the saved heights
         /// (<see cref="KeepHeights"/>: nothing changed): there the load's <see cref="SceneLoad.HeightsIn"/> says so.
@@ -3134,7 +3159,7 @@ namespace Freefall.Components
         [System.ComponentModel.Browsable(false)]
         public bool HeightsPending
             => Enabled && Terrain != null
-            && (Terrain.HeightField == null || !_heightsReadBack || _needHeightFieldReadback
+            && (Terrain.Pages is not { HasHeights: true } || !_heightsReadBack || _needHeightFieldReadback
                 || System.Threading.Volatile.Read(ref _heightBakesPending) > 0
                 || Terrain.NeedsUpdate(TerrainDirtyFlags.HeightBake));
 
@@ -3146,15 +3171,16 @@ namespace Freefall.Components
         private bool _initialHeightCheck;
 
         /// <summary>
-        /// The GPU heightmap and the CPU height field both hold what this plan would bake (the saved map at a cold load,
+        /// The GPU pool and the CPU store both hold what this plan would bake (the saved map at a cold load,
         /// the last bake at a reload): equal <see cref="TerrainBaker.HeightPlan.Hash"/>es bake equal maps.
         /// </summary>
         private bool KeepsHeights(TerrainBaker.HeightPlan plan)
         {
-            if (_baker?.Pool is not { Filled: true } || _baker.Pool.Resolution != plan.Resolution || Terrain.HeightField == null)
+            if (_baker?.Pool is not { Filled: true } || _baker.Pool.Resolution != plan.Resolution
+                || Terrain.Pages is not { HasHeights: true } pages || pages.Resolution != plan.Resolution)
                 return false;
             ulong hash = plan.Hash;
-            return hash == Terrain.HeightmapStampsHash && hash == Terrain.HeightFieldStampsHash;
+            return hash == Terrain.HeightmapStampsHash && hash == Terrain.PagesStampsHash;
         }
 
         /// <summary>

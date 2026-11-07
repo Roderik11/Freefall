@@ -51,15 +51,15 @@ namespace Freefall.Graphics
         public uint Srv => _srv;
 
         /// <summary>
-        /// Flood the height field (values 0..1 of the terrain's MaxHeight, [x, z]) from its border across every sample
-        /// below <paramref name="seaLevel01"/>, then let the sea reach up the land (<see cref="BeachReach"/>,
+        /// Flood the terrain's heights (the CPU store: values 0..1 of the terrain's MaxHeight) from its border across every
+        /// sample below <paramref name="seaLevel01"/>, then let the sea reach up the land (<see cref="BeachReach"/>,
         /// <see cref="BeachReachHeight"/>). <paramref name="sampleSpacing"/> is the distance between two height samples
-        /// (m). Any thread.
+        /// (m). Any thread: a store is never changed.
         /// </summary>
-        public static Result Build(float[,] heights, float seaLevel01, float sampleSpacing, float seaLevel, float maxHeight)
+        public static Result Build(Assets.TerrainPages heights, float seaLevel01, float sampleSpacing, float seaLevel, float maxHeight)
         {
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
-            int res = Math.Min(heights.GetLength(0), heights.GetLength(1));
+            int res = heights.Resolution;
             int step = 1;
             while ((res - 1) / step + 1 > MaxSize) step *= 2;
             int size = (res - 1) / step + 1;
@@ -68,7 +68,7 @@ namespace Freefall.Graphics
             var below = new bool[count];
             for (int z = 0; z < size; z++)
             for (int x = 0; x < size; x++)
-                below[z * size + x] = heights[x * step, z * step] < seaLevel01;
+                below[z * size + x] = heights.Sample01(x * step, z * step) < seaLevel01;
 
             var cells = new byte[count];
             var queue = new int[count];
@@ -127,7 +127,7 @@ namespace Freefall.Graphics
                     int nx = x + dx, nz = z + dz;
                     if ((dx | dz) == 0 || nx < 0 || nz < 0 || nx >= size || nz >= size) continue;
                     int n = nz * size + nx;
-                    if (cells[n] != 0 || below[n] || heights[nx * step, nz * step] > reachTop01) continue;
+                    if (cells[n] != 0 || below[n] || heights.Sample01(nx * step, nz * step) > reachTop01) continue;
                     cells[n] = 255;
                     distance[n] = (byte)(d + 1);
                     queue[tail++] = n;

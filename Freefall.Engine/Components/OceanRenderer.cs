@@ -284,7 +284,7 @@ namespace Freefall.Components
         private ShoreWarp.Band[] _warpRequested = Array.Empty<ShoreWarp.Band>();
         private int _warpRequest;
         private int _warpRunning;
-        private float[,]? _warpHeights;       // what the last sea mask was flooded from, for a bake of the warp alone
+        private Assets.TerrainPages? _warpHeights;   // what the last sea mask was flooded from, for a bake of the warp alone
         private SeaMask.Result? _warpMask;
 
         // Where the lips stand round the camera, decided once per frame for the ocean's PS and the lip pass alike
@@ -417,13 +417,13 @@ namespace Freefall.Components
         private void RequestSeaMask()
         {
             var terrain = _terrain?.Terrain;
-            var heights = terrain?.HeightField;
-            if (terrain == null || heights == null || heights.GetLength(0) < 2) return;
+            var heights = terrain?.Pages;
+            if (terrain == null || heights is not { HasHeights: true } || heights.Resolution < 2) return;
 
             float seaLevel = Transform.WorldPosition.Y;
             float baseY = _terrain!.Transform?.WorldPosition.Y ?? 0f;
             float seaLevel01 = (seaLevel - baseY) / MathF.Max(terrain.MaxHeight, 0.001f);
-            float spacing = terrain.TerrainSize.X / (heights.GetLength(0) - 1);
+            float spacing = terrain.TerrainSize.X / (heights.Resolution - 1);
             _seaMaskLevel = seaLevel;
 
             int request = Interlocked.Increment(ref _seaMaskRequest);
@@ -469,7 +469,7 @@ namespace Freefall.Components
         }
 
         // On a worker. The warp's own heights and mask are kept for the next bake of the warp alone
-        private void BakeShoreWarp(ShoreWarpJob job, float[,] heights, SeaMask.Result mask)
+        private void BakeShoreWarp(ShoreWarpJob job, Assets.TerrainPages heights, SeaMask.Result mask)
         {
             if (Volatile.Read(ref _warpRequest) != job.Request) return;
             var warp = ShoreWarp.Build(heights, mask, job.SeaLevel01, job.MaxHeight, job.TerrainSize, job.Origin, job.Bands);

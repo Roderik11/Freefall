@@ -199,9 +199,9 @@ namespace Freefall.Assets
 
             // The bake equals the saved maps, but the stamps it came from are not what the asset says (a terrain saved
             // before the hash existed): now they are known. Saved once, a load can keep the map without baking.
-            if (HeightFieldStampsHash != 0 && BakedStampsHash != HeightFieldStampsHash)
+            if (PagesStampsHash != 0 && BakedStampsHash != PagesStampsHash)
             {
-                BakedStampsHash = HeightFieldStampsHash;
+                BakedStampsHash = PagesStampsHash;
                 base.MarkDirty();
             }
         }
@@ -219,24 +219,8 @@ namespace Freefall.Assets
         [Browsable(false)]
         public int SavedCookFormat;
 
-        // FNV-1a over the bits of the CPU height field and the hole mask (~10 ms for 4097²)
-        private ulong MapsHash()
-        {
-            ulong h = 14695981039346656037UL;
-            void Mix(ReadOnlySpan<byte> bytes)
-            {
-                var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes);
-                foreach (var w in words) h = (h ^ w) * 1099511628211UL;
-                for (int i = words.Length * 8; i < bytes.Length; i++) h = (h ^ bytes[i]) * 1099511628211UL;
-                h = (h ^ (ulong)bytes.Length) * 1099511628211UL;
-            }
-            if (HeightField is { } heights)
-                Mix(System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
-                    ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(heights), heights.Length * sizeof(float)));
-            if (Holes is { } holes)
-                Mix(holes);
-            return h;
-        }
+        // FNV-1a over the CPU store's heights and holes, page by page (TerrainPages.Hash)
+        private ulong MapsHash() => Pages?.Hash() ?? 14695981039346656037UL;
 
         // ───── Densities (TERRAIN_PAGES_PLAN.md stage 1, 2026-11-07) ─────
         // The only resolution settings. Every map's size follows from them and the terrain's size, and so does the
@@ -338,10 +322,10 @@ namespace Freefall.Assets
         [JsonIgnore]
         internal ulong HeightmapStampsHash;
 
-        /// <summary>What the CPU <see cref="HeightField"/> holds: set when the heightmap is read back, or by the loader from the saved map. 0 = not known.</summary>
+        /// <summary>What the heights of <see cref="Pages"/> were baked from: set when the heights are read back, or by the loader from the saved map. 0 = not known.</summary>
         [Reflection.DontSerialize]
         [JsonIgnore]
-        internal ulong HeightFieldStampsHash;
+        internal ulong PagesStampsHash;
 
         /// <summary>
         /// Pending baked heightmap bytes loaded from cache, awaiting GPU upload.
@@ -384,9 +368,21 @@ namespace Freefall.Assets
 
         public bool DrawDetail = true;
 
-        // ── HeightField — built internally from Heightmap ──
+        // ── The heights and holes on the CPU ──
+
+        /// <summary>
+        /// The heights and holes on the CPU, in pages (<see cref="TerrainPages"/>, TERRAIN_PAGES_PLAN.md 4b): what
+        /// GetHeight, IsHole, the physics cook, the navmesh and the sea mask read. Set from the saved maps at load, then
+        /// replaced (never changed) by every height readback and hole bake, so a reader that took one keeps a consistent
+        /// terrain. Null before anything is known. Until 2026-11-07 the heights were HeightField, a float[,] of the whole
+        /// map, and the holes a flat byte mask.
+        /// </summary>
+        [Reflection.DontSerialize]
         [JsonIgnore]
-        public float[,] HeightField { get; private set; }
+        public TerrainPages? Pages { get; private set; }
+
+        /// <summary>Replaces the CPU store (a readback, a hole bake, the loader).</summary>
+        internal void SetPages(TerrainPages? pages) => Pages = pages;
 
         /// <summary>
         /// The PhysX height field of the heights and holes as they were when it was made (TerrainCollider's geometry).
@@ -424,8 +420,8 @@ namespace Freefall.Assets
         /// </summary>
         internal Task<PhysX.HeightField?> CookedHeightFieldAsync()
         {
-            var heights = HeightField;
-            if (heights == null)
+            var pages = Pages;
+            if (pages is not { HasHeights: true })
                 return Task.FromResult<PhysX.HeightField?>(null);
 
             ulong maps = MapsHash();
@@ -441,9 +437,7 @@ namespace Freefall.Assets
                 return Task.FromResult<PhysX.HeightField?>(saved);
             }
 
-            // The heights array is replaced, never written, but the hole mask is re-cut in place: the worker gets a copy
-            var holes = Holes?.ToArray();
-            int holeResolution = HoleResolution;
+            // The store is never changed once made: the worker reads it as it is now
             var cooking = PhysicsWorld.Physics.CreateCooking();
             var done = new TaskCompletionSource<PhysX.HeightField?>(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -451,9 +445,9 @@ namespace Freefall.Assets
             {
                 var desc = new PhysX.HeightFieldDesc
                 {
-                    NumberOfRows = heights.GetLength(0),
-                    NumberOfColumns = heights.GetLength(1),
-                    Samples = heights.ToSamples(holes, holeResolution),
+                    NumberOfRows = pages.Resolution,
+                    NumberOfColumns = pages.Resolution,
+                    Samples = pages.ToSamples(),
                 };
                 var stream = new System.IO.MemoryStream();
                 cooking.CookHeightField(desc, stream);
@@ -482,12 +476,6 @@ namespace Freefall.Assets
             return _cooking;
         }
 
-        /// <summary>
-        /// Sets the CPU-side height field directly from readback data.
-        /// Called by TerrainRenderer after GPU heightmap readback.
-        /// </summary>
-        internal void SetHeightField(float[,] heights) => HeightField = heights;
-
         // ── Holes (HoleStamp) ──
 
         /// <summary>
@@ -497,65 +485,22 @@ namespace Freefall.Assets
         [Browsable(false)]
         public Texture BakedHolesRef;
 
-        /// <summary>
-        /// Where the hole stamps cut the terrain, one byte per height sample: row by row along +Z, X along a row,
-        /// sample (x, z) at terrain-local (x, z) * TerrainSize / (HoleResolution - 1), the PhysX height field's
-        /// mapping. 0 = ground, 255 = fully cut; the edge of a hole is where it crosses 128. Null = no holes.
-        /// Baked on the CPU (TerrainBaker.BakeHoles) because physics, the navmesh and PCG need it here.
-        /// </summary>
-        [Reflection.DontSerialize]
-        [JsonIgnore]
-        public byte[] Holes { get; private set; }
-
-        [Reflection.DontSerialize]
-        [JsonIgnore]
-        public int HoleResolution { get; private set; }
+        // Where the hole stamps cut the terrain is in Pages: one byte per height sample, 0 = ground, 255 = fully cut, the
+        // edge of a hole where it crosses 128; a page no hole cuts holds none. Baked on the CPU (TerrainBaker.BakeHoles)
+        // because physics, the navmesh and PCG need it here. Until 2026-11-07 a flat mask, Holes / HoleResolution.
 
         /// <summary>True if any hole stamp cuts this terrain.</summary>
         [Reflection.DontSerialize]
         [JsonIgnore]
-        public bool HasHoles => Holes != null;
-
-        /// <summary>Replaces the hole mask (null = no holes). Called by TerrainRenderer after a hole bake, TerrainLoader on load.</summary>
-        internal void SetHoles(byte[] holes, int resolution)
-        {
-            Holes = holes;
-            HoleResolution = holes != null ? resolution : 0;
-        }
+        public bool HasHoles => Pages is { HasHoles: true };
 
         /// <summary>
         /// How far the holes cut at a terrain-local position (0..1, bilinear between the samples, as the terrain
         /// shader reads it). The ground is open where this is 0.5 or more.
         /// </summary>
-        public float HoleWeight(float localX, float localZ) => HoleWeight(Holes, HoleResolution, TerrainSize, localX, localZ);
-
-        /// <summary>HoleWeight on a copy of a mask (the navmesh bake takes one, so it never reads one being re-cut).</summary>
-        public static float HoleWeight(byte[] holes, int resolution, Vector2 terrainSize, float localX, float localZ)
-        {
-            if (holes == null) return 0f;
-
-            int last = resolution - 1;
-            float fx = localX / terrainSize.X * last;
-            float fz = localZ / terrainSize.Y * last;
-            if (!(fx >= 0f && fz >= 0f && fx <= last && fz <= last)) return 0f;
-
-            int x0 = Math.Min((int)fx, last - 1), z0 = Math.Min((int)fz, last - 1);
-            float tx = fx - x0, tz = fz - z0;
-            int i = z0 * resolution + x0;
-            float h0 = holes[i] + (holes[i + 1] - holes[i]) * tx;
-            float h1 = holes[i + resolution] + (holes[i + resolution + 1] - holes[i + resolution]) * tx;
-            return (h0 + (h1 - h0) * tz) * (1f / 255f);
-        }
+        public float HoleWeight(float localX, float localZ) => Pages?.HoleWeight(TerrainSize, localX, localZ) ?? 0f;
 
         /// <summary>True where the ground is open at a terrain-local position.</summary>
         public bool IsHole(float localX, float localZ) => HoleWeight(localX, localZ) >= 0.5f;
-
-        /// <summary>
-        /// True if the PhysX height field's cell between samples (x, z) and (x + 1, z + 1) is open: its middle lies in
-        /// a hole (PhysicsHelper.IsHoleCell, which the cook uses).
-        /// </summary>
-        public bool IsHoleCell(int x, int z) =>
-            Holes is { } holes && HeightField is { } heights
-            && PhysicsHelper.IsHoleCell(holes, HoleResolution, heights.GetLength(0), heights.GetLength(1), x, z);
     }
 }

@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using Freefall.Assets.Packers;
 using Freefall.Base;
@@ -76,7 +77,7 @@ namespace Freefall.Assets.Loaders
                 // What the bakes are compared with: a bake that comes out different puts the terrain on Save Changed Assets
                 terrain.MarkMapsSaved();
 
-                Debug.Log($"[TerrainLoader] '{name}' loaded: HeightField={terrain.HeightField != null}, " +
+                Debug.Log($"[TerrainLoader] '{name}' loaded: heights={terrain.Pages is { HasHeights: true }}, holes={terrain.HasHoles}, " +
                           $"CookedHeightField={terrain.CookedHeightField != null}");
 
                 MessageDispatcher.Send("TerrainLoaded", terrain);
@@ -128,11 +129,12 @@ namespace Freefall.Assets.Loaders
         }
 
         /// <summary>
-        /// Loads the saved baked heightmap DDS into PendingBakedHeightmapBytes for GPU upload.
-        /// Also builds the CPU-side HeightField immediately so GetHeight() works before first render.
+        /// Loads the saved baked heightmap DDS into PendingBakedHeightmapBytes for GPU upload, and cuts it into the CPU
+        /// store's pages (Terrain.Pages) at once, so GetHeight() works before the first render.
         /// </summary>
         private void LoadBakedHeightmap(Terrain terrain)
         {
+            terrain.SetPages(null);
             if (terrain.BakedHeightmapRef == null || string.IsNullOrEmpty(terrain.BakedHeightmapRef.Guid))
                 return;
 
@@ -141,36 +143,27 @@ namespace Freefall.Assets.Loaders
 
             terrain.PendingBakedHeightmapBytes = bytes;
 
-            // Build CPU HeightField from R16_UNorm bytes so GetHeight() works immediately
             int pixelDataLen = bytes.Length;
             int resolution = (int)Math.Sqrt(pixelDataLen / 2);
             if (resolution * resolution * 2 == pixelDataLen)
             {
-                var heights = new float[resolution, resolution];
-                for (int y = 0; y < resolution; y++)
-                    for (int x = 0; x < resolution; x++)
-                    {
-                        int idx = (y * resolution + x) * 2;
-                        ushort raw = BitConverter.ToUInt16(bytes, idx);
-                        heights[x, y] = raw / 65535.0f;
-                    }
-                terrain.SetHeightField(heights);
-                terrain.HeightFieldStampsHash = terrain.BakedStampsHash;   // the saved map's heights, from the saved map's stamps
-                Debug.Log($"[TerrainLoader] Baked heightmap loaded + CPU HeightField built: {resolution}x{resolution}");
+                terrain.SetPages(TerrainPages.FromFlat(MemoryMarshal.Cast<byte, ushort>(bytes), resolution));
+                terrain.PagesStampsHash = terrain.BakedStampsHash;   // the saved map's heights, from the saved map's stamps
+                Debug.Log($"[TerrainLoader] Baked heightmap loaded into {terrain.Pages!.PagesAcross}² pages: {resolution}x{resolution}");
             }
             else
             {
-                Debug.Log($"[TerrainLoader] Baked heightmap loaded: {bytes.Length} bytes (CPU HeightField deferred)");
+                Debug.Log($"[TerrainLoader] Baked heightmap loaded: {bytes.Length} bytes, not a square R16 map (no CPU heights until a readback)");
             }
         }
 
         /// <summary>
-        /// Loads the saved hole mask (one byte per height sample, see Terrain.Holes). The renderer rebakes it from
-        /// the hole stamps once it draws; until then (and in a process that never draws) this is what holds.
+        /// Loads the saved hole mask (one byte per height sample, row by row along +Z) into the CPU store's pages. The
+        /// renderer rebakes it from the hole stamps once it draws; until then (and in a process that never draws) this is
+        /// what holds. A mask of another size than the heights is left out: the stamps cut it again.
         /// </summary>
         private void LoadBakedHoles(Terrain terrain)
         {
-            terrain.SetHoles(null, 0);
             if (terrain.BakedHolesRef == null || string.IsNullOrEmpty(terrain.BakedHolesRef.Guid))
                 return;
 
@@ -183,9 +176,16 @@ namespace Freefall.Assets.Loaders
                 Debug.LogWarning("TerrainLoader", $"Hole mask of '{terrain.Name}' is {bytes.Length} bytes, not a square R8 image; ignored");
                 return;
             }
+            if (terrain.Pages is { } pages && pages.Resolution != resolution)
+            {
+                Debug.LogWarning("TerrainLoader", $"Hole mask of '{terrain.Name}' is {resolution}², its heights {pages.Resolution}²; left for the stamps to cut again");
+                return;
+            }
 
-            terrain.SetHoles(bytes, resolution);
-            Debug.Log($"[TerrainLoader] Hole mask loaded: {resolution}x{resolution}");
+            var edit = (terrain.Pages ?? TerrainPages.Empty(resolution)).Edit();
+            edit.SetHolesFlat(bytes);
+            terrain.SetPages(edit.Done());
+            Debug.Log($"[TerrainLoader] Hole mask loaded: {resolution}x{resolution}, {terrain.Pages!.HolePages} page(s) with holes");
         }
 
         /// <summary>
@@ -272,7 +272,7 @@ namespace Freefall.Assets.Loaders
             {
                 // Not baked since the load: the maps are the saved ones. Their cook is saved again only when it was
                 // made another way (Terrain.CookFormat), from the CPU heights and holes loaded from those same maps.
-                if (terrain.SavedCookFormat != Terrain.CookFormat && terrain.HeightField != null)
+                if (terrain.SavedCookFormat != Terrain.CookFormat && terrain.Pages is { HasHeights: true })
                     SaveCook(terrain);
                 return;
             }
@@ -291,14 +291,14 @@ namespace Freefall.Assets.Loaders
             Debug.Log($"[TerrainLoader] Baked heightmap saved: {bytes.Length} bytes, res={resolution}");
 
             // The hole mask next to it (CPU data, nothing to read back). No holes = no reference, so a load finds none.
-            if (terrain.HasHoles)
+            if (terrain.Pages is { HasHoles: true } holePages)
             {
                 if (terrain.BakedHolesRef == null)
                     terrain.BakedHolesRef = new Texture();
                 if (string.IsNullOrEmpty(terrain.BakedHolesRef.Guid))
                     terrain.BakedHolesRef.Guid = System.Guid.NewGuid().ToString("N");
-                SaveDdsSubasset(terrain.BakedHolesRef.Guid, terrain.Holes);
-                Debug.Log($"[TerrainLoader] Hole mask saved: {terrain.HoleResolution}x{terrain.HoleResolution}");
+                SaveDdsSubasset(terrain.BakedHolesRef.Guid, holePages.FlatHoles()!);   // one flat mask until the pages file (4c)
+                Debug.Log($"[TerrainLoader] Hole mask saved: {holePages.Resolution}x{holePages.Resolution}");
             }
             else
             {
@@ -316,28 +316,33 @@ namespace Freefall.Assets.Loaders
         {
             try
             {
-                var heightMap = terrain.HeightField;
-                if (heightMap == null)
+                var pages = terrain.Pages;
+                if (pages is not { HasHeights: true })
                 {
-                    Debug.LogWarning("TerrainLoader", "No CPU HeightField available for PhysX cooking");
+                    Debug.LogWarning("TerrainLoader", "No CPU heights available for PhysX cooking");
                     return;
                 }
 
-                int rows = heightMap.GetLength(0);
-                int cols = heightMap.GetLength(1);
+                int rows = pages.Resolution;
+                int cols = pages.Resolution;
 
-                // Diagnostic: check height range
-                float hMin = float.MaxValue, hMax = float.MinValue;
-                for (int i = 0; i < rows; i++)
-                    for (int j = 0; j < cols; j++)
+                // Diagnostic: the range of the heights
+                int hMin = ushort.MaxValue, hMax = 0;
+                for (int pz = 0; pz < pages.PagesAcross; pz++)
+                    for (int px = 0; px < pages.PagesAcross; px++)
                     {
-                        float h = heightMap[i, j];
-                        if (h < hMin) hMin = h;
-                        if (h > hMax) hMax = h;
+                        var (_, _, w, h) = pages.PageExtent(px, pz);
+                        var page = pages.HeightPage(px, pz);
+                        for (int z = 0; z < h; z++)
+                            foreach (ushort v in page.Slice(z * TerrainPages.PageSamples, w))
+                            {
+                                if (v < hMin) hMin = v;
+                                if (v > hMax) hMax = v;
+                            }
                     }
-                Debug.Log($"[TerrainLoader] HeightField at save: {rows}x{cols}, range=[{hMin:F6}..{hMax:F6}]");
+                Debug.Log($"[TerrainLoader] Heights at save: {rows}x{cols}, range=[{hMin / 65535f:F6}..{hMax / 65535f:F6}]");
 
-                var samples = heightMap.ToSamples(terrain);
+                var samples = pages.ToSamples();
                 var hfDesc = new HeightFieldDesc
                 {
                     NumberOfRows = rows,

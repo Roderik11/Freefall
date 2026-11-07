@@ -111,18 +111,10 @@ namespace Freefall.Assets.Importers
                 return null;
             }
 
-            var heightField = new float[resolution, resolution];
-            for (int y = 0; y < resolution; y++)
-            {
-                for (int x = 0; x < resolution; x++)
-                {
-                    int idx = offset + (y * resolution + x) * 2;
-                    heightField[x, y] = BitConverter.ToUInt16(rawBytes, idx) / 65535f;
-                }
-            }
+            var pages = TerrainPages.FromFlat(
+                System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ushort>(rawBytes.AsSpan(offset, pixelDataLen)), resolution);
 
             // The hole mask saved with it (HoleStamp), if any
-            Terrain holes = null;
             var holesGuid = ExtractGuid(yaml, "BakedHolesRef");
             var holesPath = holesGuid != null ? AssetDatabase.ResolveCachePathByGuid(holesGuid) : null;
             if (holesPath == null && holesGuid != null && AssetDatabase.Project?.CacheDirectory != null)
@@ -132,13 +124,14 @@ namespace Freefall.Assets.Importers
                 var holeBytes = ReadDdsPixels(holesPath, out int holeOffset);
                 if (holeBytes != null && holeBytes.Length - holeOffset == resolution * resolution)
                 {
-                    holes = new Terrain();
-                    holes.SetHoles(holeBytes.AsSpan(holeOffset).ToArray(), resolution);
+                    var edit = pages.Edit();
+                    edit.SetHolesFlat(holeBytes.AsSpan(holeOffset));
+                    pages = edit.Done();
                 }
             }
 
             // Cook PhysX HeightField
-            var samples = heightField.ToSamples(holes);
+            var samples = pages.ToSamples();
             var heightFieldDesc = new HeightFieldDesc()
             {
                 NumberOfRows = resolution,

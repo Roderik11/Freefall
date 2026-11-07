@@ -1106,13 +1106,14 @@ namespace Freefall.Assets
 
         /// <summary>
         /// The height at a million places read through terrain_pages.hlsli against the same bilinear in float on the CPU
-        /// from Terrain.HeightField (TerrainRenderer.GetHeight's sum), on the terrain and 3 m round it, every second place
-        /// on a sample (CS_CompareReads). Returns the largest difference in metres on samples and between them. The CPU
-        /// field must hold the pool's heights (read back after the last bake). Blocks. Main thread.
+        /// from the CPU store (TerrainPages.Height01: TerrainRenderer.GetHeight's sum), on the terrain and 3 m round it,
+        /// every second place on a sample (CS_CompareReads). Returns the largest difference in metres on samples and
+        /// between them. The store must hold the pool's heights (read back after the last bake). Blocks. Main thread.
         /// </summary>
         public unsafe (float atSamples, float between) CompareReads(Terrain terrain, Vector3 origin)
         {
-            if (_pool.Texture == null || terrain.HeightField == null) return default;
+            var pages = terrain.Pages;
+            if (_pool.Texture == null || pages is not { HasHeights: true }) return default;
             EnsureInitialized();
             const int count = 1 << 20;
             var device = Engine.Device;
@@ -1139,19 +1140,14 @@ namespace Freefall.Assets
 
                 float atSamples = 0, between = 0;
                 var r = readback.ReadPtr<Vector4>();
-                var field = terrain.HeightField;
-                int n = field.GetLength(0);
+                int n = pages.Resolution;
                 float spacing = terrain.TerrainSize.X / Math.Max(1, n - 1);
                 for (int i = 0; i < count; i++)
                 {
                     // The same place in float on the CPU, from the samples read back
-                    float tx = Math.Clamp((r[i].Z - origin.X) / spacing, 0f, n - 1);
-                    float tz = Math.Clamp((r[i].W - origin.Z) / spacing, 0f, n - 1);
-                    int x0 = Math.Min((int)tx, n - 2), z0 = Math.Min((int)tz, n - 2);
-                    float fx = tx - x0, fz = tz - z0;
-                    float near = field[x0, z0] + (field[x0 + 1, z0] - field[x0, z0]) * fx;
-                    float far = field[x0, z0 + 1] + (field[x0 + 1, z0 + 1] - field[x0, z0 + 1]) * fx;
-                    float d = MathF.Abs(r[i].X - (near + (far - near) * fz)) * terrain.MaxHeight;
+                    float tx = (r[i].Z - origin.X) / spacing;
+                    float tz = (r[i].W - origin.Z) / spacing;
+                    float d = MathF.Abs(r[i].X - pages.Height01(tx, tz)) * terrain.MaxHeight;
                     if ((i & 1) != 0) atSamples = MathF.Max(atSamples, d);
                     else between = MathF.Max(between, d);
                 }
@@ -1484,104 +1480,169 @@ namespace Freefall.Assets
         private static readonly ProfilerMarker _copyMarker = ProfilerMarker.Get("Terrain height copy and compare");
 
         /// <summary>
-        /// Reads back the baked heights (the pool) into a CPU float[,] array ([x, z], sample rows along +Z).
-        /// Values are normalized [0..1] — caller multiplies by MaxHeight.
-        /// Returns null if no heights have been baked.
+        /// Reads the baked heights (the pool) back into the CPU store (<see cref="TerrainPages"/>, TERRAIN_PAGES_PLAN.md
+        /// 4b) and returns the store that replaces <paramref name="previous"/>, which is left as it is: workers may still
+        /// read it. Null if no heights have been baked.
         ///
-        /// With <paramref name="previous"/> (the field read back last, at this resolution) and a sample box (x0, z0
-        /// inclusive, x1, z1 exclusive), only the box is fetched: the result is a copy of 'previous' with the box
-        /// replaced. 'previous' itself is left as it is, since workers may still read it. On Eldermoor's 4097² map a
-        /// whole readback took ~190 ms of the frame it ran in, after every height stamp edit (2026-10-26).
+        /// Page by page, each page's 257 samples straight out of its slot. Only the pages holding a sample of the box
+        /// (x0, z0 inclusive, x1, z1 exclusive) are read, unless <paramref name="whole"/> or <paramref name="previous"/> has
+        /// no heights of this size. A page whose samples all equal the one before is kept as that one, so a store shares
+        /// what did not change; the holes go over to the new store as they are. On Eldermoor's 4097² map a whole readback
+        /// took ~190 ms of the frame it ran in, after every height stamp edit (2026-10-26).
         ///
-        /// <paramref name="changed"/> is the box of the samples (x0, z0 inclusive, x1, z1 exclusive) whose value is not
-        /// the one 'previous' held, compared as they are copied, or null when every sample read back is as it was. A
-        /// stamp edit that bakes the same heights (an Opacity set to what it was) then changes nothing on the CPU.
-        /// Without a field of this size to compare with, it is the whole map.
+        /// <paramref name="changed"/> is the box of the samples (x0, z0 inclusive, x1, z1 exclusive) whose value is not the
+        /// one 'previous' held, compared as they are copied, or null when every sample read back is as it was. A stamp edit
+        /// that bakes the same heights (an Opacity set to what it was) then changes nothing on the CPU. Without heights of
+        /// this size to compare with, it is the whole map.
         /// </summary>
-        public float[,] ReadbackHeightmap(out (int x0, int z0, int x1, int z1)? changed,
-            float[,] previous = null, int x0 = 0, int z0 = 0, int x1 = int.MaxValue, int z1 = int.MaxValue)
+        public TerrainPages? ReadbackPages(TerrainPages? previous, bool whole, out (int x0, int z0, int x1, int z1)? changed,
+            int x0 = 0, int z0 = 0, int x1 = int.MaxValue, int z1 = int.MaxValue)
         {
             changed = null;
             if (_pool.Texture == null)
                 return null;
 
-            var device = Engine.Device;
             int res = _pool.Resolution;
-            if (previous == null || previous.GetLength(0) != res || previous.GetLength(1) != res)
+            bool compare = previous is { HasHeights: true } && previous.Resolution == res;
+            var basis = previous != null && previous.Resolution == res ? previous : TerrainPages.Empty(res);
+            if (whole || !compare)
             {
-                previous = null;
                 x0 = 0; z0 = 0; x1 = res; z1 = res;
             }
             x0 = Math.Clamp(x0, 0, res); x1 = Math.Clamp(x1, 0, res);
             z0 = Math.Clamp(z0, 0, res); z1 = Math.Clamp(z1, 0, res);
-            if (previous != null && (x1 <= x0 || z1 <= z0))
+            if (compare && (x1 <= x0 || z1 <= z0))
                 return previous;
-            int width = x1 - x0, height = z1 - z0;
-            int bytesPerPixel = 2; // R16_UNorm
-            int rowPitch = (width * bytesPerPixel + 255) & ~255; // 256-byte aligned
-            int totalBytes = rowPitch * height;
 
+            var (px0, pz0, px1, pz1) = basis.PagesOf(x0, z0, x1, z1);
+            var pageList = new List<(int px, int pz)>((px1 - px0) * (pz1 - pz0));
+            for (int pz = pz0; pz < pz1; pz++)
+                for (int px = px0; px < px1; px++)
+                    pageList.Add((px, pz));
+
+            // A page's rows 256-byte aligned, each page at a 512-byte boundary (the placed footprint's alignment); a
+            // batch of pages per copy, so a large terrain needs no readback buffer the size of its map
+            const int rowPitch = (TerrainPages.PageSamples * sizeof(ushort) + 255) & ~255;
+            const int pageBytes = (rowPitch * TerrainPages.PageSamples + 511) & ~511;
+            const int batch = 64;
+
+            var device = Engine.Device;
+            var edit = basis.Edit();
+            int cx0 = int.MaxValue, cx1 = int.MinValue, cz0 = int.MaxValue, cz1 = int.MinValue;
+            int replaced = 0;
             var readbackResource = device.NativeDevice.CreateCommittedResource(
                 new HeapProperties(HeapType.Readback),
                 HeapFlags.None,
-                ResourceDescription.Buffer((ulong)totalBytes),
+                ResourceDescription.Buffer((ulong)(pageBytes * Math.Min(batch, pageList.Count))),
                 ResourceStates.CopyDest,
                 null);
 
             try
             {
-                ReadPoolBox(readbackResource, rowPitch, x0, z0, x1, z1);
-
-                var heights = previous != null ? (float[,])previous.Clone() : new float[res, res];
-                int cx0 = int.MaxValue, cx1 = int.MinValue, cz0 = int.MaxValue, cz1 = int.MinValue;
-                unsafe
+                for (int first = 0; first < pageList.Count; first += batch)
                 {
-                    void* pData;
-                    readbackResource.Map(0, null, &pData);
+                    int count = Math.Min(batch, pageList.Count - first);
+                    ReadPoolPages(readbackResource, pageList, first, count, rowPitch, pageBytes, basis);
 
-                    // Each sample is written only where it differs from what the copy of 'previous' holds there (a
-                    // fresh field holds zeros, which a zero sample leaves as they are), and the row's first and last
-                    // such sample widen the box
-                    using (_copyMarker.Auto())
+                    unsafe
                     {
-                        var srcPtr = (byte*)pData;
-                        for (int z = 0; z < height; z++)
+                        void* pData;
+                        readbackResource.Map(0, null, &pData);
+                        using (_copyMarker.Auto())
                         {
-                            var row = (ushort*)(srcPtr + z * rowPitch);
-                            int hz = z0 + z, first = -1, last = -1;
-                            for (int x = 0; x < width; x++)
+                            for (int k = 0; k < count; k++)
                             {
-                                float value = row[x] / 65535.0f;
-                                ref float sample = ref heights[x0 + x, hz];
-                                if (sample != value)
+                                var (px, pz) = pageList[first + k];
+                                var (sx, sz, w, h) = basis.PageExtent(px, pz);
+                                var before = compare ? basis.HeightPage(px, pz) : default;
+                                var src = (byte*)pData + (long)k * pageBytes;
+
+                                // Compared row by row with the page before; a page that differs anywhere is made anew,
+                                // and the rows that differ widen the box
+                                ushort[]? page = null;
+                                for (int z = 0; z < h; z++)
                                 {
-                                    sample = value;
-                                    if (first < 0) first = x;
-                                    last = x;
+                                    var row = new ReadOnlySpan<ushort>(src + (long)z * rowPitch, w);
+                                    if (!before.IsEmpty)
+                                    {
+                                        var old = before.Slice(z * TerrainPages.PageSamples, w);
+                                        int firstDiff = row.CommonPrefixLength(old);
+                                        if (firstDiff == w) continue;
+                                        int lastDiff = w - 1;
+                                        while (lastDiff > firstDiff && row[lastDiff] == old[lastDiff]) lastDiff--;
+                                        cx0 = Math.Min(cx0, sx + firstDiff);
+                                        cx1 = Math.Max(cx1, sx + lastDiff + 1);
+                                        cz0 = Math.Min(cz0, sz + z);
+                                        cz1 = Math.Max(cz1, sz + z + 1);
+                                        if (page == null)
+                                        {
+                                            page = new ushort[TerrainPages.PageLength];
+                                            before.CopyTo(page);
+                                        }
+                                    }
+                                    else page ??= new ushort[TerrainPages.PageLength];
+                                    row.CopyTo(page.AsSpan(z * TerrainPages.PageSamples, w));
+                                }
+                                if (page != null)
+                                {
+                                    edit.SetHeights(px, pz, page);
+                                    replaced++;
                                 }
                             }
-                            if (last >= 0)
-                            {
-                                cx0 = Math.Min(cx0, x0 + first);
-                                cx1 = Math.Max(cx1, x0 + last + 1);
-                                cz0 = Math.Min(cz0, hz);
-                                cz1 = hz + 1;
-                            }
                         }
+                        readbackResource.Unmap(0);
                     }
-
-                    readbackResource.Unmap(0);
                 }
 
-                if (previous == null) changed = (0, 0, res, res);
+                var pages = edit.Done(hasHeights: true);
+                if (!compare) changed = (0, 0, res, res);
                 else if (cx1 > cx0) changed = (cx0, cz0, cx1, cz1);
-                Debug.Log($"[TerrainBaker] HeightField readback: {width}x{height} of {res}x{res}, " +
+                Debug.Log($"[TerrainBaker] Heights read back: {pageList.Count} of {pages.PagesAcross * pages.PagesAcross} pages, " +
+                          $"{replaced} new, " +
                           (changed is { } box ? $"changed x {box.x0}..{box.x1}, z {box.z0}..{box.z1}" : "nothing changed"));
-                return heights;
+                return pages;
             }
             finally
             {
                 readbackResource.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Copy whole pages of the pool (each its own samples, no border) into a readback buffer, page k at k × pageBytes,
+        /// rows of <paramref name="rowPitch"/> bytes. Its own command list; blocks until the GPU is done.
+        /// </summary>
+        private void ReadPoolPages(ID3D12Resource readback, List<(int px, int pz)> pages, int first, int count,
+            int rowPitch, int pageBytes, TerrainPages layout)
+        {
+            var device = Engine.Device;
+            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
+            var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
+            try
+            {
+                cmdList.ResourceBarrierTransition(_pool.Texture, ResourceStates.Common, ResourceStates.CopySource);
+                for (int k = 0; k < count; k++)
+                {
+                    var (px, pz) = pages[first + k];
+                    var (_, _, w, h) = layout.PageExtent(px, pz);
+                    var (slice, cx, cy) = _pool.PageCorner(px, pz);
+                    int tx = cx + HeightPool.Border, tz = cy + HeightPool.Border;
+                    var dst = new TextureCopyLocation(readback, new PlacedSubresourceFootPrint
+                    {
+                        Offset = (ulong)((long)k * pageBytes),
+                        Footprint = new SubresourceFootPrint(Format.R16_UNorm, (uint)w, (uint)h, 1, (uint)rowPitch)
+                    });
+                    cmdList.CopyTextureRegion(dst, 0, 0, 0, new TextureCopyLocation(_pool.Texture, (uint)slice),
+                        new Vortice.Mathematics.Box(tx, tz, 0, tx + w, tz + h, 1));
+                }
+                cmdList.ResourceBarrierTransition(_pool.Texture, ResourceStates.CopySource, ResourceStates.Common);
+                cmdList.Close();
+                device.SubmitAndWait(cmdList);
+            }
+            finally
+            {
+                cmdList.Dispose();
+                allocator.Dispose();
             }
         }
 
@@ -2181,33 +2242,71 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Clear the given rects of the mask, then cut every stamp of the plan into it (the union of the stamps, by
-        /// the largest weight). Rects a stamp covered at the last bake must be among 'clear', or it stays cut there.
+        /// The store with its holes cut again: the given rects cleared, then every stamp of the plan cut in (the union
+        /// of the stamps, by the largest weight). Rects a stamp covered at the last bake must be among 'clear', or it
+        /// stays cut there. Page by page (TerrainPages): only the pages the rects and the stamps reach are made anew, a
+        /// sample on a shared edge is cut on both its pages alike, and a page left without a hole holds none. The store
+        /// passed in is left as it is; it must be of the plan's resolution.
         /// </summary>
-        public static void BakeHoles(HolePlan plan, byte[] mask, IEnumerable<HoleRect> clear)
+        public static TerrainPages BakeHoles(HolePlan plan, TerrainPages pages, IEnumerable<HoleRect> clear)
         {
             int res = plan.Resolution;
-            foreach (var r in clear)
-                for (int z = r.Z0; z <= r.Z1; z++)
-                    Array.Clear(mask, z * res + r.X0, r.X1 - r.X0 + 1);
+            if (pages.Resolution != res)
+                throw new ArgumentException($"holes of {res}² into a store of {pages.Resolution}²");
+            var clears = clear as IList<HoleRect> ?? clear.ToList();
+
+            // The pages to make anew: those any rect to clear or any stamp reaches
+            int across = pages.PagesAcross;
+            var touched = new SortedSet<int>();
+            void Touch(HoleRect r)
+            {
+                var (px0, pz0, px1, pz1) = pages.PagesOf(r.X0, r.Z0, r.X1 + 1, r.Z1 + 1);
+                for (int pz = pz0; pz < pz1; pz++)
+                    for (int px = px0; px < px1; px++)
+                        touched.Add(pz * across + px);
+            }
+            foreach (var r in clears) Touch(r);
+            foreach (var shape in plan.Shapes) Touch(shape.Rect);
 
             float inv = 1f / (res - 1);
             var points = CollectionsMarshal.AsSpan(plan.Points);
-            foreach (var shape in plan.Shapes)
+            var edit = pages.Edit();
+            foreach (int index in touched)
             {
-                var r = shape.Rect;
-                for (int z = r.Z0; z <= r.Z1; z++)
+                int px = index % across, pz = index / across;
+                var (sx, sz, w, h) = pages.PageExtent(px, pz);
+                var pageRect = new HoleRect(sx, sz, sx + w - 1, sz + h - 1);
+                var page = edit.Holes(px, pz) is { } old ? (byte[])old.Clone() : new byte[TerrainPages.PageLength];
+
+                foreach (var r in clears)
                 {
-                    int row = z * res;
-                    for (int x = r.X0; x <= r.X1; x++)
+                    if (!r.Overlaps(pageRect)) continue;
+                    int ax = Math.Max(r.X0, sx), bx = Math.Min(r.X1, pageRect.X1);
+                    for (int z = Math.Max(r.Z0, sz); z <= Math.Min(r.Z1, pageRect.Z1); z++)
+                        Array.Clear(page, (z - sz) * TerrainPages.PageSamples + ax - sx, bx - ax + 1);
+                }
+
+                foreach (var shape in plan.Shapes)
+                {
+                    var r = shape.Rect;
+                    if (!r.Overlaps(pageRect)) continue;
+                    int ax = Math.Max(r.X0, sx), bx = Math.Min(r.X1, pageRect.X1);
+                    for (int z = Math.Max(r.Z0, sz); z <= Math.Min(r.Z1, pageRect.Z1); z++)
                     {
-                        float w = HoleWeight(shape, points, new Vector2(x * inv, z * inv));
-                        if (w <= 0f) continue;
-                        byte b = (byte)MathF.Round(w * 255f);
-                        if (b > mask[row + x]) mask[row + x] = b;
+                        int row = (z - sz) * TerrainPages.PageSamples - sx;
+                        for (int x = ax; x <= bx; x++)
+                        {
+                            float weight = HoleWeight(shape, points, new Vector2(x * inv, z * inv));
+                            if (weight <= 0f) continue;
+                            byte b = (byte)MathF.Round(weight * 255f);
+                            if (b > page[row + x]) page[row + x] = b;
+                        }
                     }
                 }
+
+                edit.SetHoles(px, pz, page.AsSpan().IndexOfAnyExcept((byte)0) >= 0 ? page : null);
             }
+            return edit.Done();
         }
 
         /// <summary>EvaluateStampWeight (terrain_stamp_common.hlsli) on the CPU.</summary>

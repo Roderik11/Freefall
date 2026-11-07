@@ -518,9 +518,9 @@ namespace Freefall.Components
                 return null;
             }
 
-            if (terrain.HeightField == null)
+            if (terrain.Pages is not { HasHeights: true })
             {
-                Debug.Log("[RigidBody] No Terrain HeightField found");
+                Debug.Log("[RigidBody] No terrain heights yet");
                 return null;
             }
 
@@ -548,8 +548,9 @@ namespace Freefall.Components
         private static HeightFieldGeometry Geometry(Terrain terrain, HeightField field)
         {
             // The field was made from these heights (the cache is per version of them)
-            float fx = terrain.TerrainSize.X / (terrain.HeightField.GetLength(0) - 1);
-            float fy = terrain.TerrainSize.Y / (terrain.HeightField.GetLength(1) - 1);
+            int samples = terrain.Pages!.Resolution;
+            float fx = terrain.TerrainSize.X / (samples - 1);
+            float fy = terrain.TerrainSize.Y / (samples - 1);
             return new HeightFieldGeometry(field, 0, terrain.MaxHeight / short.MaxValue, fx, fy);
         }
     }

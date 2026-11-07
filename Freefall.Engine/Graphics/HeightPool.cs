@@ -73,6 +73,16 @@ namespace Freefall.Graphics
         /// The pool for a terrain of this many samples a side: made (and its page table written, on this list) when there is
         /// none of that size. True when it was made just now, so nothing is in it yet.
         /// </summary>
+        /// <summary>D3D12's cap on a texture array's slices (D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION).</summary>
+        public const int MaxSlices = 2048;
+
+        /// <summary>Array slices a pool of every page takes for a terrain of this many samples a side (four pages a slice).</summary>
+        public static int SlicesFor(int resolution)
+        {
+            int across = Math.Max(1, (Math.Max(1, resolution - 1) + Assets.Terrain.PageCells - 1) / Assets.Terrain.PageCells);
+            return (across * across + 3) / 4;
+        }
+
         public bool Ensure(int resolution, ID3D12GraphicsCommandList cmd)
         {
             if (Texture != null && Resolution == resolution) return false;
@@ -84,6 +94,9 @@ namespace Freefall.Graphics
             PagesAcross = Math.Max(1, (cells + Assets.Terrain.PageCells - 1) / Assets.Terrain.PageCells);
             int pages = PagesAcross * PagesAcross;
             Slices = (pages + 3) / 4;
+            if (Slices > MaxSlices)
+                throw new InvalidOperationException($"A terrain of {resolution}² samples needs {pages} height pages, {Slices} array " +
+                                                    $"slices: D3D12 allows {MaxSlices}");
 
             Texture = device.CreateTexture2D(Format.R16_UNorm, SliceTexels, SliceTexels, Slices, 1,
                 ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
