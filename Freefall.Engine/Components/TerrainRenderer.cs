@@ -1894,6 +1894,14 @@ namespace Freefall.Components
             device.NativeDevice.CreateShaderResourceView(
                 _heightRangePyramid, fullSrvDesc, device.GetCpuHandle(_heightRangePyramidSRV));
 
+            // A new pyramid holds nothing. While the pages stream it is filled from the CPU store, so every node's ranges
+            // are owed. FillPoolFromCpu asked for them only when it filled the pool, and the pool is the terrain asset's:
+            // a renderer made over a pool already filled (Play loading the scene the editor had open) never filled it and
+            // kept a pyramid of zeros, every node judged at height 0, so the walk chose coarse patches everywhere and a
+            // summit was cut off below the player standing on it.
+            _cpuRangesAll = true;
+            _cpuRangesPending = true;
+
            // Debug.Log($"[TerrainRenderer] Height range pyramid: {pyramidSize}x{pyramidSize}, {_heightRangeMipCount} mips, SRV={_heightRangePyramidSRV}");
         }
 
@@ -2136,8 +2144,6 @@ namespace Freefall.Components
             CreateHeightRangePyramid(device);
             _heightRangePyramidBuilt = false;
             _pyramidState = ResourceStates.Common;
-            _cpuRangesAll = true;
-            _cpuRangesPending = true;
             Debug.Log($"[TerrainRenderer] Quadtree depth {depth} ({Terrain?.Name}): {_totalNodes} nodes");
         }
 
