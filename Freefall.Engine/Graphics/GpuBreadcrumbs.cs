@@ -16,12 +16,30 @@ namespace Freefall.Graphics
     /// it, up to the next barrier, so the first one is the one to look at).
     ///
     /// Costs two writes and two QueryInterface calls a region, allocations included, so it stays a switch for hunting.
+    ///
+    /// MARKER_OUT waits for the GPU to finish everything before it, so stamping every region's end serialises the frame,
+    /// which can hide a hang (it did TestWorld's). FREEFALL_BREADCRUMBS=in stamps the ends MARKER_IN as well: "finished"
+    /// then means only that the region's commands started. FREEFALL_BREADCRUMBS_OUT=a,b keeps MARKER_OUT on the regions
+    /// named (a full drain after them, so a region still open after one of those is the one that hung), and
+    /// FREEFALL_BREADCRUMBS_ONLY=a,b stamps only the regions named (both match names by substring).
     /// </summary>
     internal static class GpuBreadcrumbs
     {
         private const int Slots = 1 << 15;           // regions remembered; a stamp's slot is stamp % Slots
 
-        public static readonly bool Enabled = Environment.GetEnvironmentVariable("FREEFALL_BREADCRUMBS") == "1";
+        public static readonly bool Enabled = Environment.GetEnvironmentVariable("FREEFALL_BREADCRUMBS") is "1" or "in";
+
+        // FREEFALL_BREADCRUMBS=in: a region's end is stamped MARKER_IN too (everything before it has started), which does
+        // not wait for the GPU to finish what came before, as MARKER_OUT does
+        private static readonly bool _endIn = Environment.GetEnvironmentVariable("FREEFALL_BREADCRUMBS") == "in";
+
+        // FREEFALL_BREADCRUMBS_ONLY=a,b: only regions whose names contain one of these are stamped
+        private static readonly string[]? _only = Environment.GetEnvironmentVariable("FREEFALL_BREADCRUMBS_ONLY")
+            ?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        // FREEFALL_BREADCRUMBS_OUT=a,b: with =in, these regions' ends are stamped MARKER_OUT all the same
+        private static readonly string[]? _out = Environment.GetEnvironmentVariable("FREEFALL_BREADCRUMBS_OUT")
+            ?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
         private static readonly object _lock = new();
         private static GraphicsBuffer? _buffer;
@@ -59,7 +77,9 @@ namespace Freefall.Graphics
                 _lists = new IntPtr[Slots];
                 _ticks = new int[Slots];
                 _words = _buffer.ReadPtr<uint>();
-                Console.WriteLine("[Breadcrumbs] GPU breadcrumbs on (FREEFALL_BREADCRUMBS=1)");
+                Console.WriteLine($"[Breadcrumbs] GPU breadcrumbs on (ends {(_endIn ? "MARKER_IN" : "MARKER_OUT")}" +
+                                  $"{(_endIn && _out != null ? ", MARKER_OUT after " + string.Join(",", _out) : "")}" +
+                                  $"{(_only != null ? ", only " + string.Join(",", _only) : "")})");
                 return true;
             }
             catch (Exception ex)
@@ -79,10 +99,15 @@ namespace Freefall.Graphics
                 if (!EnsureResources()) return;
                 var type = list.CommandListType;
                 if (type != CommandListType.Direct && type != CommandListType.Compute) return;
-                if (++_stamp == 0) _stamp = 1;
-                int slot = (int)(_stamp % Slots);
                 if (!_open.TryGetValue(list.NativePointer, out var stack))
                     _open[list.NativePointer] = stack = new Stack<int>();
+                if (_only != null && Array.FindIndex(_only, s => name.Contains(s, StringComparison.Ordinal)) < 0)
+                {
+                    stack.Push(-1);     // not stamped; its End pops it
+                    return;
+                }
+                if (++_stamp == 0) _stamp = 1;
+                int slot = (int)(_stamp % Slots);
                 _names[slot] = name;
                 _stamps[slot] = _stamp;
                 _depths[slot] = stack.Count;
@@ -101,7 +126,9 @@ namespace Freefall.Graphics
             {
                 if (_names.Length == 0 || !_open.TryGetValue(list.NativePointer, out var stack) || stack.Count == 0) return;
                 int slot = stack.Pop();
-                Write(list, slot * 2 + 1, _stamps[slot], WriteBufferImmediateMode.MarkerOut);
+                if (slot < 0) return;
+                bool outEnd = !_endIn || (_out != null && Array.FindIndex(_out, s => _names[slot]!.Contains(s, StringComparison.Ordinal)) >= 0);
+                Write(list, slot * 2 + 1, _stamps[slot], outEnd ? WriteBufferImmediateMode.MarkerOut : WriteBufferImmediateMode.MarkerIn);
             }
         }
 

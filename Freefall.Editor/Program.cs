@@ -159,6 +159,11 @@ namespace Freefall.Editor
             RenderLoop.Run(form, Engine.Tick, true);
 
             commandServer?.Dispose();
+            // The frames still in flight draw the editor's UI with the renderer's sprite batch and fonts: the GPU finishes
+            // them before those are released. Released under them, the GPU can fault (reported as a hang): the likely
+            // cause of the TDRs left at shutdown on TestWorld, whose last frames still bake paint pages for 100 ms and
+            // more (2026-11-08, stability/testworld_play_hang.md)
+            RenderView.Primary?.WaitForGpu();
             squidRenderer.Dispose();
             EditorPreferences.Save();
             Engine.Shutdown();

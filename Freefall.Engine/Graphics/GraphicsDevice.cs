@@ -318,7 +318,24 @@ namespace Freefall.Graphics
                 Flags = DescriptorHeapFlags.ShaderVisible
             });
             _srvDescriptorSize = (int)_device.GetDescriptorHandleIncrementSize(DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
-            
+
+            // Slot 0 means "none" everywhere: shaders test an index against 0 before they use it, and releases skip it. So
+            // it holds a null descriptor for good (reads through it return 0) and is never handed out. Until 2026-11-08 the
+            // first resource made took it: the transform buffer's first upload buffer, which StreamingBuffer.Grow replaced
+            // while a scene loaded, freeing the buffer but not the slot (0 is never released). Descriptor 0 then pointed at
+            // freed memory, and a load through it that the GPU's compiler issues ahead of the shader's own test of the index
+            // (the decoration spawn's hole lookup, HoleTexIdx 0 on a terrain without holes) faulted whenever that memory was
+            // not in use again. This NVIDIA driver reports such a fault as DXGI_ERROR_DEVICE_HUNG (TDR), no page fault:
+            // TestWorld's play load at Riverside 5 times in 6 (stability/testworld_play_hang.md).
+            _device.CreateShaderResourceView(null, new ShaderResourceViewDescription
+            {
+                Format = Format.R32_Typeless,
+                ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Buffer,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Buffer = new BufferShaderResourceView { FirstElement = 0, NumElements = 1, Flags = BufferShaderResourceViewFlags.Raw },
+            }, _srvHeap.GetCPUDescriptorHandleForHeapStart());
+            _nextBindlessIndex = 1;
+
             Debug.Log("GraphicsDevice", $"Bindless SRV Heap initialized with {MaxBindlessDescriptors} slots.");
 
             // Initialize RTV Descriptor Heap (Non-Shader Visible)
@@ -666,6 +683,7 @@ namespace Freefall.Graphics
         /// </summary>
         public void ReleaseBindlessIndex(uint index)
         {
+            if (index == 0) return;               // the null descriptor's slot, never handed out (Initialize)
             if (SuppressBindlessRelease) return; // Intentional leak during batch eviction
 
             lock (_bindlessLock)
