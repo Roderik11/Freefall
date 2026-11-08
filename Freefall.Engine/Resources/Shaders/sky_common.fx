@@ -137,21 +137,18 @@ float TerrainLightShadow(float3 worldPos, float3 toLight)
     if (AtmosphereIdx == 0)
         return 1.0;
     AtmosphereParams A = LoadAtmosphere();
-    uint map = 0;
-    if (dot(toLight, A.SunDirection) > 0.999)
-        map = A.TerrainSunShadow;
-    else if (dot(toLight, A.MoonDirection) > 0.999)
-        map = A.TerrainMoonShadow;
+    bool sun = dot(toLight, A.SunDirection) > 0.999;
+    bool moon = !sun && dot(toLight, A.MoonDirection) > 0.999;
     float across = length(toLight.xz);
-    if (map == 0 || across < 1e-4)          // no map, or the light overhead: no shadow across the ground
+    if ((!sun && !moon) || across < 1e-4)   // another light, or the light overhead: no shadow across the ground
         return 1.0;
     float2 d = toLight.xz / across;
     float tanE = toLight.y / across;
-    float2 uv = (worldPos.xz + d * TERRAIN_SHADOW_SKIP - A.TerrainShadowOrigin) / A.TerrainShadowSize;
-    if (any(uv < 0.0) || any(uv > 1.0))
+    // The window round the camera where it reaches, else the whole map (atmosphere_common.hlsli AtmTerrainShadowTop)
+    float top, texel;
+    if (!AtmTerrainShadowTop(A, worldPos.xz + d * TERRAIN_SHADOW_SKIP, moon, top, texel))
         return 1.0;
-    Texture2D<float> shadowTop = ResourceDescriptorHeap[map];
-    float top = shadowTop.SampleLevel(AtmosphereLinearClamp, uv, 0) - TERRAIN_SHADOW_SKIP * tanE;
+    top -= TERRAIN_SHADOW_SKIP * tanE;
 
     float y = worldPos.y;
     float bias = 2.0;
@@ -166,9 +163,7 @@ float TerrainLightShadow(float3 worldPos, float3 toLight)
         // The map's four samples per texel sit a quarter texel either way: on a slope the highest gains that much
         float2 slope = abs(float2(TerrainHeightAt(t, AtmosphereLinearClamp, worldPos.xz + float2(4, 0)),
                                   TerrainHeightAt(t, AtmosphereLinearClamp, worldPos.xz + float2(0, 4))) - h) / 4.0;
-        float texelsX, texelsY;
-        shadowTop.GetDimensions(texelsX, texelsY);
-        bias += (slope.x + slope.y) * A.TerrainShadowSize / texelsX * 0.5;
+        bias += (slope.x + slope.y) * texel * 0.5;
     }
     return smoothstep(top - 3.0, top + 3.0, y + bias);
 }

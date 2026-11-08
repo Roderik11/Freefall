@@ -83,12 +83,13 @@ namespace Freefall.Graphics
         }
 
         /// <summary>The map changed over these level 0 texels (x0, z0 inclusive, x1, z1 exclusive; terrain UV × texels): the
-        /// resident pages over them, at every level from <paramref name="minLevel"/>, bake again.</summary>
-        public void MarkDirty(int x0, int z0, int x1, int z1, int minLevel = 0)
+        /// resident pages over them, at every level from <paramref name="minLevel"/> to <paramref name="maxLevel"/>, bake
+        /// again.</summary>
+        public void MarkDirty(int x0, int z0, int x1, int z1, int minLevel = 0, int maxLevel = int.MaxValue)
         {
             var slots = _pool.Slots;
             if (_pool.Resource == null) return;
-            for (int l = minLevel; l < slots.Levels; l++)
+            for (int l = minLevel; l < slots.Levels && l <= maxLevel; l++)
             {
                 int n = slots.PagesAcrossAt(l), span = PageTexels << l, border = _pool.Border << l;
                 int px0 = Math.Clamp((x0 - border) / span, 0, n - 1), px1 = Math.Clamp((x1 + border) / span, 0, n - 1);

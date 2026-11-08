@@ -712,10 +712,12 @@ namespace Freefall
          /// </summary>
          [Category("Terrain")]
          [ValueRange(0f, 16384f)]
+         [System.ComponentModel.Description("Metres round the camera where the terrain's heights are at full detail; twice and four times that the next two levels, coarser beyond. 0 = every height page stays loaded.")]
          public float TerrainDetailRadius { get; set; } = 4096f;
 
          /// <summary>Height pages uploaded into the pool in a frame while a terrain streams (TerrainDetailRadius above 0).</summary>
          [ValueRange(1, 256)]
+         [System.ComponentModel.Description("Height pages uploaded to the GPU per frame while the heights stream round the camera (TerrainDetailRadius above 0).")]
          public int TerrainPageUploadsPerFrame { get; set; } = 16;
 
          /// <summary>
@@ -724,11 +726,13 @@ namespace Freefall
          /// from the stamps as pages arrive. 0 = every level 0 page in the pool, the whole map at full paint as before 5b.
          /// </summary>
          [ValueRange(0, 32)]
+         [System.ComponentModel.Description("Paint pages (the layers' blend weights, 256 texels each) a side round the camera at every level, coarser further out. 0 = every page of the whole map at full detail.")]
          public int TerrainPaintPages { get; set; } = 5;
 
          /// <summary>Paint pages baked in a frame as they arrive or change away from the camera's own window (the level 0
          /// pages an edit touches near the camera bake at once).</summary>
          [ValueRange(1, 64)]
+         [System.ComponentModel.Description("Paint pages baked per frame as they come into range or after an edit away from the camera (near pages an edit touches bake at once).")]
          public int TerrainPaintBakesPerFrame { get; set; } = 4;
 
          /// <summary>
@@ -737,10 +741,12 @@ namespace Freefall
          /// sward's colour on the far ground. 0 = every level 0 page, the whole map as before 5c.
          /// </summary>
          [ValueRange(0, 32)]
+         [System.ComponentModel.Description("Decoration pages (which plants grow where, one texel a metre, 256 each) a side round the camera at every level, coarser further out. 0 = every page of the whole map at full detail.")]
          public int TerrainDecoPages { get; set; } = 5;
 
          /// <summary>Decoration control pages baked in a frame as they arrive or change away from the camera's own window.</summary>
          [ValueRange(1, 64)]
+         [System.ComponentModel.Description("Decoration pages baked per frame as they come into range or after an edit away from the camera.")]
          public int TerrainDecoBakesPerFrame { get; set; } = 4;
 
          /// <summary>
@@ -749,6 +755,7 @@ namespace Freefall
          /// 0 = every page, as before 5c.
          /// </summary>
          [ValueRange(0f, 16384f)]
+         [System.ComponentModel.Description("Metres round each viewer (the player, else the camera) within which the terrain has collision; pages are cooked as they come in range and dropped a quarter further out. 0 = collision everywhere.")]
          public float TerrainCollisionRadius { get; set; } = 1024f;
 
          /// <summary>

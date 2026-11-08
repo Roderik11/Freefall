@@ -193,7 +193,7 @@ namespace Freefall.Graphics
             });
             device.DeferDispose(upload);   // until the frames that copy from it are done
 
-            Debug.Log($"[SeaMask] {size}² cells at sea level {mask.SeaLevel:0.##} m: {mask.SeaShare:P1} sea (beaches included), flooded in {mask.Milliseconds:0} ms");
+            Debug.LogAlways($"[SeaMask] {size}² cells at sea level {mask.SeaLevel:0.##} m: {mask.SeaShare:P1} sea (beaches included), flooded in {mask.Milliseconds:0} ms");
         }
 
         public void Dispose()

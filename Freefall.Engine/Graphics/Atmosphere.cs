@@ -247,6 +247,8 @@ namespace Freefall.Graphics
             public float SkyCaptureBounce; public uint SkyProbeCube, SkyProbeSH; public float SkyProbeMips;
             public uint TerrainSunShadow, TerrainMoonShadow; public Vector2 TerrainShadowOrigin;
             public float TerrainShadowSize;
+            public uint TerrainSunWindow, TerrainMoonWindow; public Vector2 TerrainWindowOrigin;
+            public float TerrainWindowSize;
 
             /// <summary>The part the transmittance and multiple scattering LUTs depend on</summary>
             // Within half a percent of the medium the tables were made for: a change of weather turns these for many
@@ -408,7 +410,8 @@ namespace Freefall.Graphics
             // The terrain's shadow in the air toward the sun and the moon (TerrainLightShadow, made in Render when due):
             // the haze and the near fog in front of a mountain the light stands behind; the directional light's body from
             // its held shadow direction, so the map steps with the cascades (DirectionalLight.ShadowStep)
-            (_frame.TerrainSunShadow, _frame.TerrainMoonShadow, _frame.TerrainShadowOrigin, _frame.TerrainShadowSize) =
+            (_frame.TerrainSunShadow, _frame.TerrainMoonShadow, _frame.TerrainShadowOrigin, _frame.TerrainShadowSize,
+             _frame.TerrainSunWindow, _frame.TerrainMoonWindow, _frame.TerrainWindowOrigin, _frame.TerrainWindowSize) =
                 TerrainLightShadow.Prepare(TerrainCover, Components.DirectionalLight.ShadowTowards(_frame.SunDirection),
                     Components.DirectionalLight.ShadowTowards(_frame.MoonDirection), s.MoonIlluminance != Vector3.Zero);
             unsafe { *_params[slot]!.WritePtr<GpuParams>() = _frame; }

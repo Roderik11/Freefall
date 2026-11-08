@@ -97,9 +97,55 @@ namespace Freefall.Assets
         /// </summary>
         public void MarkForUpdate(TerrainDirtyFlags flags)
         {
-            if ((flags & TerrainDirtyFlags.SplatPack) != 0)
-                lock (_splatRegionLock) _splatEverywhere = true;
+            if ((flags & (TerrainDirtyFlags.SplatPack | TerrainDirtyFlags.DecoPrepass)) != 0)
+                lock (_splatRegionLock)
+                {
+                    if ((flags & TerrainDirtyFlags.SplatPack) != 0) _splatEverywhere = true;
+                    if ((flags & TerrainDirtyFlags.DecoPrepass) != 0) _decoEverywhere = true;
+                }
             System.Threading.Interlocked.Or(ref _dirtyFlags, (int)flags);
+        }
+
+        // The decoration pages' region, as the splat's (TERRAIN_PAGES_PLAN.md 5c): a DecoPrepass asked for with
+        // MarkForUpdate redoes every page, MarkDecoRegion one place. Until 2026-11-08 every local stamp edit, height,
+        // paint or decoration, re-baked every decoration page round the camera.
+        [Reflection.DontSerialize]
+        [System.Text.Json.Serialization.JsonIgnore]
+        private bool _decoEverywhere = true;
+        [Reflection.DontSerialize]
+        [System.Text.Json.Serialization.JsonIgnore]
+        private System.Numerics.Vector2 _decoRegionMin = new(float.MaxValue), _decoRegionMax = new(float.MinValue);
+
+        /// <summary>
+        /// A decoration rebake of one place (world XZ, min and max): a local stamp's edit, where it was and where it is
+        /// now. Regions asked for before the bake add up.
+        /// </summary>
+        public void MarkDecoRegion(System.Numerics.Vector2 min, System.Numerics.Vector2 max)
+        {
+            lock (_splatRegionLock)
+            {
+                _decoRegionMin = System.Numerics.Vector2.Min(_decoRegionMin, min);
+                _decoRegionMax = System.Numerics.Vector2.Max(_decoRegionMax, max);
+            }
+            System.Threading.Interlocked.Or(ref _dirtyFlags, (int)TerrainDirtyFlags.DecoPrepass);
+        }
+
+        /// <summary>
+        /// Takes where the decoration pages bake again (world XZ; empty when nothing gave a region) and starts the next one
+        /// empty. False: everywhere. Call it together with consuming DecoPrepass.
+        /// </summary>
+        public bool TakeDecoRegion(out System.Numerics.Vector2 min, out System.Numerics.Vector2 max)
+        {
+            lock (_splatRegionLock)
+            {
+                bool local = !_decoEverywhere;
+                min = _decoRegionMin;
+                max = _decoRegionMax;
+                _decoEverywhere = false;
+                _decoRegionMin = new System.Numerics.Vector2(float.MaxValue);
+                _decoRegionMax = new System.Numerics.Vector2(float.MinValue);
+                return local;
+            }
         }
 
         /// <summary>

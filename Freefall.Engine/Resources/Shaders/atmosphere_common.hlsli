@@ -48,6 +48,8 @@ struct AtmosphereParams
     uint SkyProbeCube;          uint SkyProbeSH;           float SkyProbeMips;     // sky probe (sky_probe_cs.hlsl): TextureCube, 9 × float4 SH, mip count (0 = none)
     uint TerrainSunShadow;      uint TerrainMoonShadow;    float2 TerrainShadowOrigin;   // the terrain's shadow in the air per light (terrain_light_shadow_cs.hlsl; 0 = none); the maps' corner (world xz)
     float TerrainShadowSize;                               // metres the maps span each way
+    uint TerrainSunWindow;      uint TerrainMoonWindow;    float2 TerrainWindowOrigin;   // the same round the camera, finer (TerrainLightShadow's window; 0 = none); its corner
+    float TerrainWindowSize;                               // metres the window spans each way
 };
 
 // The global root signature's linear clamp sampler (s2)
@@ -174,20 +176,54 @@ float3 AtmTransmittanceToLight(AtmosphereParams A, float3 posKm, float3 lightDir
     return AtmTransmittance(A, r, mu);
 }
 
-// How far a place lies above the top of the terrain's shadow toward a light, in metres (negative inside the shadow), from
-// the shadow height maps of terrain_light_shadow_cs.hlsl, one per light. 1e4 without the maps, outside them, and for a
-// light at or below the horizon (no map then: the earth's shadow takes over). moon: the brightest moon's map instead of
-// the sun's. worldPos is absolute.
+// The top of the terrain's shadow toward a light at a place (world xz), in metres, from the shadow height maps of
+// terrain_light_shadow_cs.hlsl: the window round the camera where it reaches, fading to the whole terrain's map over its
+// outer sixteenth, else the whole map (TerrainLightShadow.cs: on a large terrain the whole map is 20 m a texel, the window
+// 8 m). texel: metres a texel of what was read spans. False without a map there (none, or the light at or below the
+// horizon: the earth's shadow takes over). moon: the brightest moon's maps instead of the sun's.
+bool AtmTerrainShadowTop(AtmosphereParams A, float2 xz, bool moon, out float top, out float texel)
+{
+    top = 0.0;
+    texel = 0.0;
+    uint whole = moon ? A.TerrainMoonShadow : A.TerrainSunShadow;
+    if (whole == 0)
+        return false;
+    Texture2D<float> wholeMap = ResourceDescriptorHeap[whole];
+    float resolution, unused;
+    wholeMap.GetDimensions(resolution, unused);
+    float2 uv = (xz - A.TerrainShadowOrigin) / A.TerrainShadowSize;
+    bool inWhole = all(uv >= 0.0) && all(uv <= 1.0);
+    float wholeTop = inWhole ? wholeMap.SampleLevel(AtmosphereLinearClamp, uv, 0) : 0.0;
+
+    uint window = moon ? A.TerrainMoonWindow : A.TerrainSunWindow;
+    if (window != 0)
+    {
+        float2 wuv = (xz - A.TerrainWindowOrigin) / A.TerrainWindowSize;
+        float edge = min(min(wuv.x, wuv.y), min(1.0 - wuv.x, 1.0 - wuv.y));   // 0 at its border, 0.5 in its middle
+        if (edge > 0.0)
+        {
+            Texture2D<float> windowMap = ResourceDescriptorHeap[window];
+            float windowTop = windowMap.SampleLevel(AtmosphereLinearClamp, wuv, 0);
+            float k = inWhole ? saturate(edge * 16.0) : 1.0;
+            top = lerp(wholeTop, windowTop, k);
+            texel = lerp(A.TerrainShadowSize, A.TerrainWindowSize, k) / resolution;
+            return true;
+        }
+    }
+    top = wholeTop;
+    texel = A.TerrainShadowSize / resolution;
+    return inWhole;
+}
+
+// How far a place lies above the top of the terrain's shadow toward a light, in metres (negative inside the shadow)
+// (AtmTerrainShadowTop). 1e4 without the maps, outside them, and for a light at or below the horizon. worldPos is
+// absolute.
 float AtmTerrainLightMargin(AtmosphereParams A, float3 worldPos, bool moon)
 {
-    uint map = moon ? A.TerrainMoonShadow : A.TerrainSunShadow;
-    if (map == 0)
+    float top, texel;
+    if (!AtmTerrainShadowTop(A, worldPos.xz, moon, top, texel))
         return 1e4;
-    float2 uv = (worldPos.xz - A.TerrainShadowOrigin) / A.TerrainShadowSize;
-    if (any(uv < 0.0) || any(uv > 1.0))
-        return 1e4;
-    Texture2D<float> shadowTop = ResourceDescriptorHeap[map];
-    return worldPos.y - shadowTop.SampleLevel(AtmosphereLinearClamp, uv, 0);
+    return worldPos.y - top;
 }
 
 // How much of a light reaches a place in the air past the terrain: 0 in the terrain's shadow toward it, soft over 4 m

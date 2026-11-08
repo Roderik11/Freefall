@@ -667,7 +667,7 @@ namespace Freefall.Graphics
             device.DeferDispose(jacUpload);
             _bands = warp.Bands;
 
-            Debug.Log($"[ShoreWarp] {n}² cells, {warp.Bands.Length} band(s), baked in {warp.Milliseconds:0} ms");
+            Debug.LogAlways($"[ShoreWarp] {n}² cells, {warp.Bands.Length} band(s), baked in {warp.Milliseconds:0} ms");
         }
 
         // An upload buffer holding every slice, rows padded to the copy pitch

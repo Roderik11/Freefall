@@ -714,6 +714,9 @@ namespace Freefall.Components
             bool splatDirty = splatAsked || hasHeightWork;
             bool decoAsked = Terrain.ConsumeFlags(TerrainDirtyFlags.DecoPrepass);
             bool decoDirty = decoAsked || splatDirty;
+            // Where the decoration pages bake again: the regions local stamps' edits gave (Terrain.MarkDecoRegion), or
+            // everywhere
+            bool decoLocal = Terrain.TakeDecoRegion(out var decoRegionMin, out var decoRegionMax) && decoAsked;
             // Where the splat bake composites again: the regions local stamps' edits gave, or everywhere. New heights
             // that no stamp asked for (terrain settings) may have moved any stamp's height or slope filter.
             bool splatLocal = Terrain.TakeSplatRegion(out var splatRegionMin, out var splatRegionMax) && splatAsked;
@@ -729,7 +732,8 @@ namespace Freefall.Components
                 RefreshDecoratorPalette();
                 // The decoration pages bake again everywhere for a deco edit, new heights or other layers or decorators;
                 // a splat edit alone reaches them through the paint pages it bakes (UpdatePaintPages)
-                decoEverywhere = decoAsked || hasHeightWork || _layerPalette != paletteBefore || _decoratorPalette != decoPaletteBefore;
+                decoEverywhere = (decoAsked && !decoLocal) || (hasHeightWork && !splatLocal) ||
+                                 _layerPalette != paletteBefore || _decoratorPalette != decoPaletteBefore;
             }
 
             if (Terrain.ConsumeFlags(TerrainDirtyFlags.TextureArrays) || !_textureArraysInitialized)
@@ -826,6 +830,13 @@ namespace Freefall.Components
                     using (_decoPlanMarker.Auto())
                         _decoPlan = _baker.PrepareDeco(Terrain, this, _decoEntries, _decoratorPalette, _layerPalette);
                     if (decoEverywhere) DecoResidency.MarkAllDirty();
+                    else if (decoLocal && decoRegionMax.X >= decoRegionMin.X)
+                    {
+                        var origin = Transform?.WorldPosition ?? Vector3.Zero;
+                        var size = Terrain.TerrainSize;
+                        MarkDecoOver(new Vector2((decoRegionMin.X - origin.X) / size.X, (decoRegionMin.Y - origin.Z) / size.Y),
+                                     new Vector2((decoRegionMax.X - origin.X) / size.X, (decoRegionMax.Y - origin.Z) / size.Y), 0);
+                    }
                 }
                 else
                     _decoPlan = null;
@@ -1107,16 +1118,19 @@ namespace Freefall.Components
                 pages[i] = b;
                 _paintSlotSerial[b.slot] = ++_paintSerial;
                 _paintSlotPalette[b.slot] = _layerPalette;
-                // The decoration pages over its ground bake again from the paint now in place (their layer filters read it):
-                // a level 0 paint page at every level, a coarse one only the coarse decoration pages (the near ones read
-                // level 0 paint)
-                if (_decoPlan != null)
+                // A level 0 paint page that arrives: the level 0 decoration pages over its ground bake again from it (their
+                // layer filters read the paint, the coarse paint before). An edit marks its own
+                // decoration region at every level (Terrain.MarkDecoRegion); marking the decoration pages under every paint
+                // page an edit re-baked, coarse ones included (the top one covers the terrain), re-baked every coarse
+                // decoration page per edit: 196 decoration pages for 4 moves of a 7.5 m stamp (2026-11-08)
+                if (_decoPlan != null && b.level == 0 && !_paintPool.Slots.Written(b.slot))   // arrived: nothing wrote the slot yet
                 {
-                    float m = (Graphics.PaintPool.PageTexels << b.level) / (float)texels;
-                    MarkDecoOver(new Vector2(b.px * m, b.py * m), new Vector2((b.px + 1) * m, (b.py + 1) * m), b.level == 0 ? 0 : 1);
+                    float m = Graphics.PaintPool.PageTexels / (float)texels;
+                    MarkDecoOver(new Vector2(b.px * m, b.py * m), new Vector2((b.px + 1) * m, (b.py + 1) * m), 0, 0);
                 }
             }
             SplatBakeTexels = (long)pages.Length * Graphics.PaintPool.SlotTexels * Graphics.PaintPool.SlotTexels;
+            PaintPagesBaked += pages.Length;
 
             var plan = _splatPlan!;
             var pool = _paintPool;
@@ -1175,6 +1189,7 @@ namespace Freefall.Components
             for (int i = 0; i < pages.Length; i++) pages[i] = bakes[i];
             if (pages.Length > 0)
                 DecoBakeTexels = (long)pages.Length * Graphics.DecoPool.SlotTexels * Graphics.DecoPool.SlotTexels;
+            DecoPagesBaked += pages.Length;
 
             var plan = _decoPlan!;
             var pool = _decoPool;
@@ -1191,8 +1206,8 @@ namespace Freefall.Components
             });
         }
 
-        // The decoration pages over this ground (terrain UV) bake again, at every level from minLevel
-        private void MarkDecoOver(Vector2 uvMin, Vector2 uvMax, int minLevel)
+        // The decoration pages over this ground (terrain UV) bake again, at the levels from minLevel to maxLevel
+        private void MarkDecoOver(Vector2 uvMin, Vector2 uvMax, int minLevel, int maxLevel = int.MaxValue)
         {
             if (_decoPool.Control == null) return;
             int texels = _decoPool.Texels;
@@ -1200,7 +1215,7 @@ namespace Freefall.Components
             int x1 = Math.Clamp((int)MathF.Ceiling(uvMax.X * texels) + 1, 0, texels);
             int z0 = Math.Clamp((int)MathF.Floor(uvMin.Y * texels) - 1, 0, texels);
             int z1 = Math.Clamp((int)MathF.Ceiling(uvMax.Y * texels) + 1, 0, texels);
-            DecoResidency.MarkDirty(x0, z0, x1, z1, minLevel);
+            DecoResidency.MarkDirty(x0, z0, x1, z1, minLevel, maxLevel);
         }
 
         // The camera in level 0 texels of a map of this many texels a side (terrain UV × texels)
@@ -3210,6 +3225,12 @@ namespace Freefall.Components
         [Reflection.DontSerialize]
         public long SplatBakeTexels { get; private set; }
 
+        /// <summary>Diagnostics: paint pages and decoration pages baked since this renderer began (arrivals and edits).</summary>
+        [Reflection.DontSerialize]
+        public long PaintPagesBaked { get; private set; }
+        [Reflection.DontSerialize]
+        public long DecoPagesBaked { get; private set; }
+
         /// <summary>Diagnostics: decoration control texels the last deco bake composited (its pages', border included).</summary>
         [Reflection.DontSerialize]
         public long DecoBakeTexels { get; private set; }
@@ -3533,12 +3554,14 @@ namespace Freefall.Components
             {
                 GrowHeightChange(old.min, old.max);
                 Terrain?.MarkSplatRegion(old.min, old.max);
+                Terrain?.MarkDecoRegion(old.min, old.max);
             }
 
             if (TryGetStampRegion(stamp, out var min, out var max))
             {
                 GrowHeightChange(min, max);
                 Terrain?.MarkSplatRegion(min, max);
+                Terrain?.MarkDecoRegion(min, max);
                 _stampRegions[stamp] = (min, max);
             }
             else if (stamp.IsDestroyed && _stampRegions.Remove(stamp))
@@ -3549,7 +3572,7 @@ namespace Freefall.Components
             {
                 _heightChangeAll = true;
                 _heightBakeAll = true;
-                Terrain?.MarkForUpdate(TerrainDirtyFlags.SplatPack);
+                Terrain?.MarkForUpdate(TerrainDirtyFlags.SplatPack | TerrainDirtyFlags.DecoPrepass);
             }
         }
 
@@ -3601,9 +3624,10 @@ namespace Freefall.Components
                 return;
             }
 
+            // A decoration stamp: its decoration pages where it was and is (it changes nothing else)
             if (stamp is DecoStamp)
             {
-                Terrain?.MarkForUpdate(TerrainDirtyFlags.DecoPrepass);
+                MarkDecoStampRegion(stamp);
                 return;
             }
 
@@ -3611,16 +3635,19 @@ namespace Freefall.Components
             if (stamp is SplatStamp or BiomeStamp)
             {
                 var change = MarkPaintRegion(stamp);
-                Terrain?.MarkForUpdate(TerrainDirtyFlags.AlbedoBake | TerrainDirtyFlags.DecoPrepass);
+                Terrain?.MarkForUpdate(TerrainDirtyFlags.AlbedoBake);
+                // The decoration pages there (a biome's ground cover rules; a splat stamp reaches them through the paint
+                // pages it bakes as well)
+                if (change.All) Terrain?.MarkForUpdate(TerrainDirtyFlags.DecoPrepass);
+                else Terrain?.MarkDecoRegion(change.Min, change.Max);
                 MessageDispatcher.Send(EngineMsg.TerrainPaintChanged, change);
                 return;
             }
 
-            MarkStampRegion(stamp);     // the splat rebake, of the stamp's region
+            MarkStampRegion(stamp);     // the splat and decoration rebakes, of the stamp's region
             Terrain?.MarkForUpdate(
                 TerrainDirtyFlags.HeightBake |
-                TerrainDirtyFlags.AlbedoBake |
-                TerrainDirtyFlags.DecoPrepass);
+                TerrainDirtyFlags.AlbedoBake);
         }
 
         /// <summary>
@@ -3656,6 +3683,32 @@ namespace Freefall.Components
             _stampRegions.Remove(stamp);
             Terrain?.MarkForUpdate(TerrainDirtyFlags.SplatPack);
             return new TerrainHeightsChange(Terrain, true, min, max);
+        }
+
+        /// <summary>Where a changed local deco stamp was and is: the decoration pages that bake again (all of them when it
+        /// has no region).</summary>
+        private void MarkDecoStampRegion(TerrainStamp stamp)
+        {
+            var min = new Vector2(float.MaxValue);
+            var max = new Vector2(float.MinValue);
+            if (_stampRegions.TryGetValue(stamp, out var old))
+            {
+                min = Vector2.Min(min, old.min);
+                max = Vector2.Max(max, old.max);
+            }
+            if (TryGetStampRegion(stamp, out var newMin, out var newMax))
+            {
+                _stampRegions[stamp] = (newMin, newMax);
+                Terrain?.MarkDecoRegion(Vector2.Min(min, newMin), Vector2.Max(max, newMax));
+                return;
+            }
+            if (stamp.IsDestroyed && _stampRegions.Remove(stamp))
+            {
+                Terrain?.MarkDecoRegion(min, max);   // removed: where it was
+                return;
+            }
+            _stampRegions.Remove(stamp);
+            Terrain?.MarkForUpdate(TerrainDirtyFlags.DecoPrepass);
         }
 
         private void OnStampChanged(Message msg)
