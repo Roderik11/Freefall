@@ -1845,6 +1845,326 @@ namespace Freefall.Assets
             public int LayerCount;
 
             public int StampCount => Stamps.Count;
+
+            // The spline stamps' segments as the page bakes cull them (BuildPageShapes), made on the first page bake
+            internal PlanSegments? Segments;
+        }
+
+        /// <summary>GPU struct matching HLSL PageShape (terrain_coverage.hlsli): one stamp's segments for one page. 32 bytes.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct PageShapeGPU
+        {
+            public uint SegOffset;           // into the bake's uint list
+            public uint SegCount;            // PageShapeWhole: the whole spline
+            public uint ParityOffset;        // closed: the row parities' first uint in the list
+            public float XR;                 // closed: terrain U right of every sample of the page
+            public float FarHalfWidth;       // the width and fade where the list has no segment near
+            public float FarFade;
+            public uint Pad0, Pad1;
+        }
+
+        private const uint PageShapeWhole = 0xFFFFFFFFu;
+
+        // Where a stamp's width or fade changes along it, a page takes the segments within this many times its reach: those
+        // left out are at least this many times farther than the nearest from any sample the stamp touches, and weigh
+        // (1/16)^6 each in the blend (StampWalk), summed along a whole spline still well under a millionth
+        private const float BlendReachFactor = 16f;
+
+        // Samples a side of a coarse page's texel (CS_SplatBakePage, CSBuildDecoPage: S)
+        private const int CoarseSamples = 4;
+
+        /// <summary>A plan's spline stamps as the page bakes cull them: each segment's box, each stamp's reach.</summary>
+        internal sealed class PlanSegments
+        {
+            public int[] First = Array.Empty<int>();      // per stamp: its first segment's box, -1 = walked whole
+            public int[] Count = Array.Empty<int>();      // per stamp: its segments
+            public float[] Boxes = Array.Empty<float>();  // per segment: min u, min v, max u, max v
+            public float[] Reach = Array.Empty<float>();  // per stamp: how far (terrain UV) from a page a segment still counts
+            public bool[] Uniform = Array.Empty<bool>();  // per stamp: one width (and, open, one fade) all along
+        }
+
+        private static PlanSegments SegmentsOf(CoveragePlan plan)
+        {
+            if (plan.Segments != null) return plan.Segments;
+            int n = plan.Stamps.Count;
+            var seg = new PlanSegments { First = new int[n], Count = new int[n], Reach = new float[n], Uniform = new bool[n] };
+            var boxes = new List<float>();
+            var points = plan.SplinePoints;
+            for (int i = 0; i < n; i++)
+            {
+                var s = plan.Stamps[i];
+                seg.First[i] = -1;
+                int count = (int)(s.SplinePointCount & 0x7FFFFFFFu);
+                bool closed = (s.SplinePointCount & 0x80000000u) != 0;
+                // Global stamps cover all, circles are one distance, and a rule that reuses the shape before it never walks
+                if ((s.Flags & (CoverageGlobal | CoverageSameShape)) != 0 || s.SplinePointOffset == 0xFFFFFFFFu || count < 2) continue;
+
+                int off = (int)s.SplinePointOffset, segments = closed ? count : count - 1;
+                seg.First[i] = boxes.Count / 4;
+                seg.Count[i] = segments;
+                float maxHalf = 0f;
+                bool uniform = true;
+                var first = points[off];
+                for (int k = 0; k < count; k++)
+                {
+                    var p = points[off + k];
+                    maxHalf = MathF.Max(maxHalf, p.HalfWidth);
+                    if (p.HalfWidth != first.HalfWidth || (!closed && p.Fade != first.Fade)) uniform = false;
+                }
+                for (int k = 0; k < segments; k++)
+                {
+                    var a = points[off + k].UV;
+                    var b = points[off + (k + 1) % count].UV;
+                    boxes.Add(MathF.Min(a.X, b.X)); boxes.Add(MathF.Min(a.Y, b.Y));
+                    boxes.Add(MathF.Max(a.X, b.X)); boxes.Add(MathF.Max(a.Y, b.Y));
+                }
+                // As StampWeightAt reaches: the width there, the falloff scaled with it, the edge noise
+                float falloff = s.Radius > 1e-7f ? s.Falloff * maxHalf / s.Radius : s.Falloff;
+                float reach = maxHalf + falloff + (s.NoiseFreq > 0f ? s.NoiseAmp : 0f) + 1e-6f;
+                seg.Reach[i] = uniform ? reach : reach * BlendReachFactor;
+                seg.Uniform[i] = uniform;
+            }
+            seg.Boxes = boxes.ToArray();
+            return plan.Segments = seg;
+        }
+
+        // Per-bake scratch for BuildPageShapes (main thread)
+        private readonly List<PageShapeGPU> _pageShapes = new();
+        private readonly List<uint> _pageList = new();
+        private readonly List<(uint offset, uint count)> _pageStamps = new();   // per page: its stamps in _pageList
+        private float[] _pageRows = Array.Empty<float>();
+        private byte[] _pageFlips = Array.Empty<byte>();
+
+        /// <summary>
+        /// Per page and stamp, what the page bake walks (terrain_coverage.hlsli CoverageShapeWeightPage): every spline
+        /// stamp's segments that can reach the page's samples, and for a closed one the parity of each sample row's ray
+        /// beyond XR, a U right of all the page's samples, from every segment. <paramref name="shapes"/> gets one entry per
+        /// stamp per page, page after page; <paramref name="list"/> the segment indices and parity words they point into.
+        /// </summary>
+        private static readonly ProfilerMarker _pageShapesMarker = ProfilerMarker.Get("Terrain page segments");
+
+        private void BuildPageShapes(CoveragePlan plan, IReadOnlyList<Graphics.PageBake> pages,
+            int texels, int border, List<PageShapeGPU> shapes, List<uint> list)
+        {
+            using var scope = _pageShapesMarker.Auto();
+            shapes.Clear();
+            list.Clear();
+            _pageStamps.Clear();
+            var seg = SegmentsOf(plan);
+            var points = plan.SplinePoints;
+            int stampCount = plan.Stamps.Count;
+            float inv = 1f / texels;   // as the kernels' invTexels
+            int pageTexels = Graphics.TerrainMapResidency.PageTexels;
+            int slotTexels = pageTexels + 2 * border;
+
+            foreach (var (level, px, py, _, _, _, _) in pages)
+            {
+                float span = 1 << level;
+                int per = level == 0 ? 1 : CoarseSamples;
+                int rows = slotTexels * per;
+                // The page's samples lie inside u0..u1, v0..v1 (terrain UV of the slot's texel corners)
+                float u0 = (px * pageTexels - border) * span * inv, u1 = ((px + 1) * pageTexels + border) * span * inv;
+                float v0 = (py * pageTexels - border) * span * inv, v1 = ((py + 1) * pageTexels + border) * span * inv;
+                float step = span * inv;   // a texel of this level, terrain UV
+
+                // Each sample row's V, computed as the kernels compute it, so the CPU and the GPU take the same segments
+                // as crossing a row
+                if (_pageRows.Length < rows) _pageRows = new float[rows];
+                for (int t = 0; t < slotTexels; t++)
+                {
+                    float j = py * pageTexels + t - border;
+                    if (level == 0) _pageRows[t] = (j + 0.5f) * inv;
+                    else
+                        for (int b = 0; b < CoarseSamples; b++)
+                            _pageRows[t * CoarseSamples + b] = (j + (b + 0.5f) / CoarseSamples) * span * inv;
+                }
+
+                // The stamps whose box reaches the page, in order: every other weighs 0 at all its samples. A rule that reuses
+                // the shape before it (COVERAGE_SAME_SHAPE) goes with that stamp, its shape's weight being that one's
+                uint stampOffset = (uint)list.Count;
+                bool sourceIn = false;
+                for (int i = 0; i < stampCount; i++)
+                {
+                    var s = plan.Stamps[i];
+                    bool inPage;
+                    if ((s.Flags & CoverageSameShape) != 0) inPage = sourceIn;
+                    else
+                    {
+                        inPage = (s.Flags & CoverageGlobal) != 0
+                                 || !(s.Bounds.X > u1 || s.Bounds.Z < u0 || s.Bounds.Y > v1 || s.Bounds.W < v0);
+                        sourceIn = inPage;
+                    }
+                    if (inPage) list.Add((uint)i);
+                }
+                _pageStamps.Add((stampOffset, (uint)list.Count - stampOffset));
+
+                for (int i = 0; i < stampCount; i++)
+                {
+                    var s = plan.Stamps[i];
+                    if (seg.First[i] < 0)
+                    {
+                        shapes.Add(new PageShapeGPU { SegCount = PageShapeWhole });
+                        continue;
+                    }
+                    var entry = new PageShapeGPU { SegOffset = (uint)list.Count, FarFade = 1f };
+                    // Off the stamp's box: every sample gives 0 before the list is read
+                    if (s.Bounds.X > u1 || s.Bounds.Z < u0 || s.Bounds.Y > v1 || s.Bounds.W < v0)
+                    {
+                        shapes.Add(entry);
+                        continue;
+                    }
+
+                    bool closed = (s.SplinePointCount & 0x80000000u) != 0;
+                    int count = (int)(s.SplinePointCount & 0x7FFFFFFFu);
+                    int off = (int)s.SplinePointOffset;
+                    int first = seg.First[i], segments = seg.Count[i];
+                    float reach = seg.Reach[i];
+
+                    // A closed stamp: the row parities beyond XR (into _pageFlips), from the first XR no crossing comes near
+                    float xr = 0f;
+                    if (closed)
+                    {
+                        bool found = false;
+                        for (int c = 0; c < 8 && !found; c++)
+                        {
+                            xr = u1 + (0.31f + 0.53f * c) * step;
+                            found = RowParities(points, off, count, segments, rows, xr, step * 0.05f);
+                        }
+                        if (!found)
+                        {
+                            // Every XR had a crossing at a hair's breadth: this stamp walks whole on this page
+                            shapes.Add(new PageShapeGPU { SegCount = PageShapeWhole });
+                            continue;
+                        }
+                    }
+
+                    // The segments that can reach a sample, or cross a sample row before XR
+                    float lx0 = u0 - reach, ly0 = v0 - reach, lx1 = (closed ? xr : u1) + reach, ly1 = v1 + reach;
+                    var boxes = seg.Boxes;
+                    for (int k = 0; k < segments; k++)
+                    {
+                        int bi = (first + k) * 4;
+                        if (boxes[bi] > lx1 || boxes[bi + 2] < lx0 || boxes[bi + 1] > ly1 || boxes[bi + 3] < ly0) continue;
+                        list.Add((uint)k);
+                    }
+                    entry.SegCount = (uint)(list.Count - (int)entry.SegOffset);
+
+                    if (closed)
+                    {
+                        // The parities after the segments: bit r of the page's words, row r's ray beyond XR
+                        entry.XR = xr;
+                        int parityOffset = list.Count;
+                        int words = (rows + 31) / 32;
+                        for (int w = 0; w < words; w++) list.Add(0u);
+                        byte parity = 0;
+                        for (int r = 0; r < rows; r++)
+                        {
+                            parity ^= _pageFlips[r];
+                            if (parity != 0) list[parityOffset + (r >> 5)] |= 1u << (r & 31);
+                        }
+                        entry.ParityOffset = (uint)parityOffset;
+                    }
+
+                    // Width and fade where no listed segment is near: the stamp's own when one all along, else the blend at
+                    // the page's middle over every segment (a few texels of a far corner may differ by the blend's spread)
+                    var p0 = points[off];
+                    if (seg.Uniform[i])
+                    {
+                        entry.FarHalfWidth = p0.HalfWidth;
+                        entry.FarFade = closed ? 1f : p0.Fade;
+                    }
+                    else
+                    {
+                        (entry.FarHalfWidth, entry.FarFade) = BlendAt(points, off, count, segments,
+                            new Vector2((u0 + u1) * 0.5f, (v0 + v1) * 0.5f), s.Radius);
+                        if (closed) entry.FarFade = 1f;
+                    }
+                    shapes.Add(entry);
+                }
+            }
+        }
+
+        /// <summary>
+        /// The parity of each sample row's ray from XR to +U over a closed spline's segments, into _pageFlips as flips (row r
+        /// flips the parity from row r on: a prefix XOR gives it). False when a crossing lies within <paramref name="margin"/>
+        /// of XR on some row, where the CPU and the GPU might see it on different sides.
+        /// </summary>
+        private bool RowParities(List<StampSplinePointGPU> points, int off, int count, int segments, int rows, float xr, float margin)
+        {
+            if (_pageFlips.Length < rows + 1) _pageFlips = new byte[rows + 1];
+            Array.Clear(_pageFlips, 0, rows + 1);
+            var ys = _pageRows;
+            for (int k = 0; k < segments; k++)
+            {
+                var a = points[off + k].UV;
+                var b = points[off + (k + 1) % count].UV;
+                if (a.Y == b.Y) continue;   // never crosses a row (StampRowCrossing)
+                float lo = MathF.Min(a.Y, b.Y), hi = MathF.Max(a.Y, b.Y);
+                if (MathF.Max(a.X, b.X) < xr - margin) continue;   // wholly left of XR: none of its crossings is beyond it
+                // The rows it crosses: lo <= y < hi, the half-open test of StampRowCrossing
+                int r0 = LowerBound(ys, rows, lo), r1 = LowerBound(ys, rows, hi);
+                if (r0 >= r1) continue;
+                if (MathF.Min(a.X, b.X) > xr + margin)
+                {
+                    _pageFlips[r0] ^= 1;   // wholly right of XR: every row it crosses counts it
+                    _pageFlips[r1] ^= 1;
+                    continue;
+                }
+                for (int r = r0; r < r1; r++)
+                {
+                    float t = (ys[r] - a.Y) / (b.Y - a.Y);
+                    float x = a.X + t * (b.X - a.X);
+                    if (MathF.Abs(x - xr) <= margin) return false;
+                    if (x > xr)
+                    {
+                        _pageFlips[r] ^= 1;
+                        _pageFlips[r + 1] ^= 1;
+                    }
+                }
+            }
+            return true;
+        }
+
+        // The first of the first n values (ascending) that is >= v
+        private static int LowerBound(float[] values, int n, float v)
+        {
+            int lo = 0, hi = n;
+            while (lo < hi)
+            {
+                int mid = (lo + hi) >> 1;
+                if (values[mid] < v) lo = mid + 1; else hi = mid;
+            }
+            return lo;
+        }
+
+        // A spline's width and fade at a place, blended over every segment as StampWalk blends them
+        private static (float halfWidth, float fade) BlendAt(List<StampSplinePointGPU> points, int off, int count, int segments,
+            Vector2 uv, float radius)
+        {
+            const double eps = 1e-7;
+            double best = double.MaxValue, accW = 0, accHalfW = 0, accFade = 0;
+            for (int k = 0; k < segments; k++)
+            {
+                var p0 = points[off + k];
+                var p1 = points[off + (k + 1) % count];
+                var ab = p1.UV - p0.UV;
+                float lenSq = Vector2.Dot(ab, ab);
+                float t = lenSq < 1e-10f ? 0f : Math.Clamp(Vector2.Dot(uv - p0.UV, ab) / lenSq, 0f, 1f);
+                double d = Vector2.Distance(uv, p0.UV + t * ab);
+                if (d < best)
+                {
+                    double r = (d + eps) / (best == double.MaxValue ? d + eps : best + eps);
+                    double rescale = Math.Pow(r, 6);
+                    accW *= rescale; accHalfW *= rescale; accFade *= rescale;
+                    best = d;
+                }
+                double q = (best + eps) / (d + eps);
+                double w = Math.Pow(q, 6);
+                accW += w;
+                accHalfW += w * (p0.HalfWidth + (p1.HalfWidth - p0.HalfWidth) * t);
+                accFade += w * (p0.Fade + (p1.Fade - p0.Fade) * t);
+            }
+            return accW > 0 ? ((float)(accHalfW / accW), (float)(accFade / accW)) : (radius, 1f);
         }
 
         /// <summary>
@@ -2128,7 +2448,7 @@ namespace Freefall.Assets
         /// list after the heights; the slots count as written by this frame.
         /// </summary>
         public void BakeSplatPages(CoveragePlan plan, ID3D12GraphicsCommandList cmd, Terrain terrain, uint terrainPagesIdx,
-            Graphics.PaintPool pool, IReadOnlyList<(int level, int px, int py, int slot)> pages)
+            Graphics.PaintPool pool, IReadOnlyList<Graphics.PageBake> pages)
         {
             if (pages.Count == 0 || pool.Weights == null) return;
             EnsureCoverageInitialized();
@@ -2157,10 +2477,26 @@ namespace Freefall.Assets
             _splatCS.SetParam(k, "MaxHeight", terrain.MaxHeight);
             _splatCS.SetParam(k, "TerrainSizeX", terrain.TerrainSize.X);
             _splatCS.SetPushConstant(k, "TopLayer", pool.TopUav);
+
+            // Each page walks only the spline segments near it (terrain_coverage.hlsli PageShape)
+            BuildPageShapes(plan, pages, pool.Texels, Graphics.PaintPool.Border, _pageShapes, _pageList);
+            EnsureUpload<PageShapeGPU>(ref _splatPageShapeBuffer, ref _splatPageShapeCapacity, _pageShapes.Count, 16);
+            EnsureUpload<uint>(ref _splatPageListBuffer, ref _splatPageListCapacity, _pageList.Count, 64);
+            Upload(_splatPageShapeBuffer, _pageShapes);
+            Upload(_splatPageListBuffer, _pageList);
+            _splatCS.SetBuffer(k, "PageShape", _splatPageShapeBuffer);
+            _splatCS.SetBuffer(k, "PageList", _splatPageListBuffer);
+
             uint groups = (uint)((Graphics.PaintPool.SlotTexels + 7) / 8);
-            foreach (var (level, px, py, slot) in pages)
+            int pageIndex = 0;
+            foreach (var (level, px, py, slot, row0, rows, last) in pages)
             {
                 var (x, y, weightSlice, topSlice) = pool.SlotPlace(slot);
+                _splatCS.SetPushConstant(k, "RowStart", (uint)row0);
+                _splatCS.SetPushConstant(k, "RowCount", (uint)rows);
+                _splatCS.SetPushConstant(k, "PageStampOffset", _pageStamps[pageIndex].offset);
+                _splatCS.SetPushConstant(k, "PageStampCount", _pageStamps[pageIndex].count);
+                _splatCS.SetPushConstant(k, "PageShapeBase", (uint)(pageIndex++ * plan.StampCount));
                 _splatCS.SetPushConstant(k, "PageX", unchecked((uint)px));
                 _splatCS.SetPushConstant(k, "PageY", unchecked((uint)py));
                 _splatCS.SetPushConstant(k, "Level", (uint)level);
@@ -2168,8 +2504,8 @@ namespace Freefall.Assets
                 _splatCS.SetPushConstant(k, "OutY", (uint)y);
                 _splatCS.SetPushConstant(k, "OutSlice", (uint)weightSlice);
                 _splatCS.SetPushConstant(k, "OutTopSlice", (uint)topSlice);
-                _splatCS.Dispatch(k, cmd, groups, groups);
-                pool.Slots.MarkWritten(slot);
+                _splatCS.Dispatch(k, cmd, groups, (uint)((rows + 7) / 8));
+                if (last) pool.Slots.MarkWritten(slot);
             }
 
             cmd.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(pool.Weights)));
@@ -2179,6 +2515,10 @@ namespace Freefall.Assets
 
         // The splat plan whose stamps are in the upload buffers
         private CoveragePlan? _uploadedSplatPlan;
+
+        // The last page bakes' segment lists (a new pair each bake, the old one kept for its frames: EnsureUpload)
+        private GraphicsBuffer _splatPageShapeBuffer, _splatPageListBuffer, _decoPageShapeBuffer, _decoPageListBuffer;
+        private int _splatPageShapeCapacity, _splatPageListCapacity, _decoPageShapeCapacity, _decoPageListCapacity;
 
         /// <summary>
         /// A paint page's top layer (the channel that shows most per texel, 255 = none) read back from its slot: 256 × 256
@@ -2365,7 +2705,7 @@ namespace Freefall.Assets
         /// Render callback, on the frame's list after the paint; the slots count as written by this frame.
         /// </summary>
         public void BakeDecoPages(CoveragePlan plan, ID3D12GraphicsCommandList cmd, Terrain terrain, uint terrainPagesIdx,
-            Graphics.DecoPool pool, IReadOnlyList<(int level, int px, int py, int slot)> pages)
+            Graphics.DecoPool pool, IReadOnlyList<Graphics.PageBake> pages)
         {
             if (pages.Count == 0 || pool.Control == null) return;
             UploadDecoPlan(plan);
@@ -2377,18 +2717,34 @@ namespace Freefall.Assets
 
             var k = _kernelDecoPage;
             SetDecoConstants(k, plan, terrain, terrainPagesIdx, pool.ControlUav, pool.Texels);
+
+            // Each page walks only the spline segments near it (terrain_coverage.hlsli PageShape)
+            BuildPageShapes(plan, pages, pool.Texels, Graphics.DecoPool.Border, _pageShapes, _pageList);
+            EnsureUpload<PageShapeGPU>(ref _decoPageShapeBuffer, ref _decoPageShapeCapacity, _pageShapes.Count, 16);
+            EnsureUpload<uint>(ref _decoPageListBuffer, ref _decoPageListCapacity, _pageList.Count, 64);
+            Upload(_decoPageShapeBuffer, _pageShapes);
+            Upload(_decoPageListBuffer, _pageList);
+            _decoCS.SetBuffer(k, "PageShape", _decoPageShapeBuffer);
+            _decoCS.SetBuffer(k, "PageList", _decoPageListBuffer);
+
             uint groups = (uint)((Graphics.DecoPool.SlotTexels + 7) / 8);
-            foreach (var (level, px, py, slot) in pages)
+            int pageIndex = 0;
+            foreach (var (level, px, py, slot, row0, rows, last) in pages)
             {
                 var (x, y, slice) = pool.SlotPlace(slot);
+                _decoCS.SetPushConstant(k, "RowStart", (uint)row0);
+                _decoCS.SetPushConstant(k, "RowCount", (uint)rows);
+                _decoCS.SetPushConstant(k, "PageStampOffset", _pageStamps[pageIndex].offset);
+                _decoCS.SetPushConstant(k, "PageStampCount", _pageStamps[pageIndex].count);
+                _decoCS.SetPushConstant(k, "PageShapeBase", (uint)(pageIndex++ * plan.StampCount));
                 _decoCS.SetPushConstant(k, "PageX", unchecked((uint)px));
                 _decoCS.SetPushConstant(k, "PageY", unchecked((uint)py));
                 _decoCS.SetPushConstant(k, "Level", (uint)level);
                 _decoCS.SetPushConstant(k, "OutX", (uint)x);
                 _decoCS.SetPushConstant(k, "OutY", (uint)y);
                 _decoCS.SetPushConstant(k, "OutSlice", (uint)slice);
-                _decoCS.Dispatch(k, cmd, groups, groups);
-                pool.Slots.MarkWritten(slot);
+                _decoCS.Dispatch(k, cmd, groups, (uint)((rows + 7) / 8));
+                if (last) pool.Slots.MarkWritten(slot);
             }
 
             cmd.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(pool.Control)));

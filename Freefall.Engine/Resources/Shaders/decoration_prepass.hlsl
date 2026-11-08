@@ -46,6 +46,13 @@ cbuffer PushConstants : register(b3)
     uint  OutX;             // slot 18 — page: its slot's quarter corner in the slice (texels)
     uint  OutY;             // slot 19
     uint  OutSlice;         // slot 20 — page: the array slice of its first slice
+    uint  PageShapeIdx;     // slot 21 — page: SRV StructuredBuffer<PageShape>, a stamp's segments per page (terrain_coverage.hlsli)
+    uint  PageListIdx;      // slot 22 — page: SRV StructuredBuffer<uint>, the segment lists and row parities they point into
+    uint  PageShapeBase;    // slot 23 — page: this page's first PageShape (one per stamp)
+    uint  PageStampOffset;  // slot 24 — page: the stamps whose box reaches the page, in order, in the uint list from here
+    uint  PageStampCount;   // slot 25
+    uint  RowStart;         // slot 26 — page: the slot's texel rows this dispatch bakes, from RowStart (a coarse page goes
+    uint  RowCount;         // slot 27     over several frames, TerrainMapResidency); 0 rows = the whole slot
 };
 
 #define DECO_OP_ADD      0u
@@ -60,11 +67,15 @@ cbuffer PushConstants : register(b3)
 
 SamplerState ClampSampler : register(s2);
 
-// Every deco stamp at a place (terrain UV): each decorator's coverage, and the rows of the last Add stamp that holds it
-void DecoCoverage(float2 terrainUV, uint decoCount, out float coverage[MAX_DECORATORS], out uint rowIdx, out uint rowSlot)
+// Every deco stamp at a place (terrain UV): each decorator's coverage, and the rows of the last Add stamp that holds it.
+// paged: a page bake's sample, whose spline stamps walk only the page's segments (sampleRow: its row in the page)
+void DecoCoverage(float2 terrainUV, uint decoCount, bool paged, uint sampleRow, out float coverage[MAX_DECORATORS],
+    out uint rowIdx, out uint rowSlot)
 {
     StructuredBuffer<CoverageStamp> stamps = ResourceDescriptorHeap[StampBufIdx];
     StructuredBuffer<StampSplinePoint> splinePoints = ResourceDescriptorHeap[SplineBufIdx];
+    StructuredBuffer<PageShape> pageShapes = ResourceDescriptorHeap[PageShapeIdx];
+    StructuredBuffer<uint> pageList = ResourceDescriptorHeap[PageListIdx];
 
     float heightNorm = 0, slopeDeg = 0;
     if (TerrainPagesIdx != 0)
@@ -111,12 +122,21 @@ void DecoCoverage(float2 terrainUV, uint decoCount, out float coverage[MAX_DECOR
     rowIdx = 0;
     rowSlot = COVERAGE_ALL_TARGETS;
 
+    // A page bake goes only through the stamps whose box reaches its page (the others weigh 0 there), in their order
+    paged = paged && PageShapeIdx != 0;
+    uint count = paged ? PageStampCount : StampCount;
+
     float shapeWeight = 0;   // the shape weight of the last stamp that was not COVERAGE_SAME_SHAPE
-    for (uint i = 0; i < StampCount; i++)
+    for (uint n = 0; n < count; n++)
     {
+        uint i = paged ? pageList[PageStampOffset + n] : n;
         CoverageStamp stamp = stamps[i];
 
-        if ((stamp.Flags & COVERAGE_SAME_SHAPE) == 0) shapeWeight = CoverageShapeWeight(stamp, terrainUV, splinePoints);
+        if ((stamp.Flags & COVERAGE_SAME_SHAPE) == 0)
+        {
+            if (paged) shapeWeight = CoverageShapeWeightPage(stamp, pageShapes[PageShapeBase + i], terrainUV, sampleRow, splinePoints, pageList);
+            else shapeWeight = CoverageShapeWeight(stamp, terrainUV, splinePoints);
+        }
         float weight = shapeWeight;
         if (weight <= 0) continue;
 
@@ -235,6 +255,8 @@ void PackTop8(float coverage[MAX_DECORATORS], uint decoCount, uint rowIdx, uint 
 [numthreads(8, 8, 1)]
 void CSBuildDecoPage(uint3 dtid : SV_DispatchThreadID)
 {
+    if (dtid.y >= (RowCount != 0 ? RowCount : DECO_SLOT_TEXELS)) return;
+    dtid.y += RowStart;
     if (dtid.x >= DECO_SLOT_TEXELS || dtid.y >= DECO_SLOT_TEXELS) return;
     RWTexture2DArray<uint4> controlTex = ResourceDescriptorHeap[ControlUAVIdx];
 
@@ -245,7 +267,7 @@ void CSBuildDecoPage(uint3 dtid : SV_DispatchThreadID)
     float coverage[MAX_DECORATORS];
     uint rowIdx = 0, rowSlot = COVERAGE_ALL_TARGETS;
     if (Level == 0)
-        DecoCoverage((j + 0.5) * invTexels, decoCount, coverage, rowIdx, rowSlot);
+        DecoCoverage((j + 0.5) * invTexels, decoCount, true, dtid.y, coverage, rowIdx, rowSlot);
     else
     {
         const uint S = 4;
@@ -257,7 +279,7 @@ void CSBuildDecoPage(uint3 dtid : SV_DispatchThreadID)
                 float2 c = (j + (float2(a, b) + 0.5) / S) * span;   // level 0 texels
                 float sub[MAX_DECORATORS];
                 uint subRow, subSlot;
-                DecoCoverage(c * invTexels, decoCount, sub, subRow, subSlot);
+                DecoCoverage(c * invTexels, decoCount, true, dtid.y * S + b, sub, subRow, subSlot);
                 for (uint d = 0; d < decoCount; d++) coverage[d] += sub[d];
             }
         for (uint d2 = 0; d2 < decoCount; d2++) coverage[d2] *= 1.0 / float(S * S);
@@ -286,7 +308,7 @@ void CSBuildDecoControl(uint3 groupTexel : SV_DispatchThreadID)
     uint decoCount = min(DecoratorCount, (uint)MAX_DECORATORS);
     float coverage[MAX_DECORATORS];
     uint rowIdx, rowSlot;
-    DecoCoverage((j + 0.5) * (1.0 / float(Resolution)), decoCount, coverage, rowIdx, rowSlot);
+    DecoCoverage((j + 0.5) * (1.0 / float(Resolution)), decoCount, false, 0, coverage, rowIdx, rowSlot);
 
     uint4 packed0, packed1;
     PackTop8(coverage, decoCount, rowIdx, rowSlot, packed0, packed1);

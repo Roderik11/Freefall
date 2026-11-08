@@ -1106,31 +1106,34 @@ namespace Freefall.Components
                           $"{across}x{across} pages of {Graphics.PaintPool.PageTexels} texels, {slices} slices");
             }
 
-            IReadOnlyList<(int level, int px, int py, int slot)> bakes;
+            IReadOnlyList<Graphics.PageBake> bakes;
             using (_paintResidencyMarker.Auto())
                 bakes = PaintResidency.Update(CameraTexels(texels), pagesPerSide, Math.Max(1, Engine.Settings.TerrainPaintBakesPerFrame));
             if (bakes.Count == 0 && !_paintPool.Slots.TableDirty) return;
 
-            var pages = new (int level, int px, int py, int slot)[bakes.Count];
+            var pages = new Graphics.PageBake[bakes.Count];
+            long bakeTexels = 0;
             for (int i = 0; i < pages.Length; i++)
             {
                 var b = bakes[i];
                 pages[i] = b;
-                _paintSlotSerial[b.slot] = ++_paintSerial;
-                _paintSlotPalette[b.slot] = _layerPalette;
+                bakeTexels += (long)b.Rows * Graphics.PaintPool.SlotTexels;
+                if (!b.Last) continue;   // the page's last rows: the slot is whole from this frame's list on
+                _paintSlotSerial[b.Slot] = ++_paintSerial;
+                _paintSlotPalette[b.Slot] = _layerPalette;
+                PaintPagesBaked++;
                 // A level 0 paint page that arrives: the level 0 decoration pages over its ground bake again from it (their
                 // layer filters read the paint, the coarse paint before). An edit marks its own
                 // decoration region at every level (Terrain.MarkDecoRegion); marking the decoration pages under every paint
                 // page an edit re-baked, coarse ones included (the top one covers the terrain), re-baked every coarse
                 // decoration page per edit: 196 decoration pages for 4 moves of a 7.5 m stamp (2026-11-08)
-                if (_decoPlan != null && b.level == 0 && !_paintPool.Slots.Written(b.slot))   // arrived: nothing wrote the slot yet
+                if (_decoPlan != null && b.Level == 0 && !_paintPool.Slots.Written(b.Slot))   // arrived: nothing wrote the slot yet
                 {
                     float m = Graphics.PaintPool.PageTexels / (float)texels;
-                    MarkDecoOver(new Vector2(b.px * m, b.py * m), new Vector2((b.px + 1) * m, (b.py + 1) * m), 0, 0);
+                    MarkDecoOver(new Vector2(b.Px * m, b.Py * m), new Vector2((b.Px + 1) * m, (b.Py + 1) * m), 0, 0);
                 }
             }
-            SplatBakeTexels = (long)pages.Length * Graphics.PaintPool.SlotTexels * Graphics.PaintPool.SlotTexels;
-            PaintPagesBaked += pages.Length;
+            SplatBakeTexels = bakeTexels;
 
             var plan = _splatPlan!;
             var pool = _paintPool;
@@ -1180,16 +1183,20 @@ namespace Freefall.Components
                           $"{across}x{across} pages of {Graphics.DecoPool.PageTexels} texels, {slices} slices");
             }
 
-            IReadOnlyList<(int level, int px, int py, int slot)> bakes;
+            IReadOnlyList<Graphics.PageBake> bakes;
             using (_decoResidencyMarker.Auto())
                 bakes = DecoResidency.Update(CameraTexels(texels), pagesPerSide, Math.Max(1, Engine.Settings.TerrainDecoBakesPerFrame));
             if (bakes.Count == 0 && !_decoPool.Slots.TableDirty) return;
 
-            var pages = new (int level, int px, int py, int slot)[bakes.Count];
-            for (int i = 0; i < pages.Length; i++) pages[i] = bakes[i];
-            if (pages.Length > 0)
-                DecoBakeTexels = (long)pages.Length * Graphics.DecoPool.SlotTexels * Graphics.DecoPool.SlotTexels;
-            DecoPagesBaked += pages.Length;
+            var pages = new Graphics.PageBake[bakes.Count];
+            long bakeTexels = 0;
+            for (int i = 0; i < pages.Length; i++)
+            {
+                pages[i] = bakes[i];
+                bakeTexels += (long)bakes[i].Rows * Graphics.DecoPool.SlotTexels;
+                if (bakes[i].Last) DecoPagesBaked++;
+            }
+            if (pages.Length > 0) DecoBakeTexels = bakeTexels;
 
             var plan = _decoPlan!;
             var pool = _decoPool;
@@ -3245,7 +3252,7 @@ namespace Freefall.Components
         [Reflection.DontSerialize]
         public string DecoPages => _decoPool.Control == null ? "none"
             : $"{(_decoPool.Slots.AllResident ? _decoPool.Capacity : _decoPool.Capacity - _decoPool.Slots.FreeSlots)} of {_decoPool.Capacity} slots, " +
-              $"{DecoResidency.Waiting} waiting, {DecoResidency.BakedLastFrame} baked last frame";
+              $"{DecoResidency.Waiting} waiting, {DecoResidency.InHandCount} being baked, {DecoResidency.BakedLastFrame} finished last frame";
 
         /// <summary>Diagnostics: what the last Check Deco Pages found.</summary>
         [Reflection.DontSerialize]
@@ -3273,7 +3280,7 @@ namespace Freefall.Components
         [Reflection.DontSerialize]
         public string PaintPages => _paintPool.Weights == null ? "none"
             : $"{(_paintPool.Slots.AllResident ? _paintPool.Capacity : _paintPool.Capacity - _paintPool.Slots.FreeSlots)} of {_paintPool.Capacity} slots, " +
-              $"{PaintResidency.Waiting} waiting, {PaintResidency.BakedLastFrame} baked last frame";
+              $"{PaintResidency.Waiting} waiting, {PaintResidency.InHandCount} being baked, {PaintResidency.BakedLastFrame} finished last frame";
 
         /// <summary>Diagnostics: height pages the last height bake went over (all of them, or a local edit's).</summary>
         [Reflection.DontSerialize]

@@ -49,6 +49,13 @@ cbuffer PushConstants : register(b3)
     uint  OutY;             // slot 19
     uint  OutSlice;         // slot 20 — page: the array slice of its first layer slice
     uint  OutTopSlice;      // slot 21 — page: its top layer's array slice
+    uint  PageShapeIdx;     // slot 22 — page: SRV StructuredBuffer<PageShape>, a stamp's segments per page (terrain_coverage.hlsli)
+    uint  PageListIdx;      // slot 23 — page: SRV StructuredBuffer<uint>, the segment lists and row parities they point into
+    uint  PageShapeBase;    // slot 24 — page: this page's first PageShape (one per stamp)
+    uint  PageStampOffset;  // slot 25 — page: the stamps whose box reaches the page, in order, in the uint list from here
+    uint  PageStampCount;   // slot 26
+    uint  RowStart;         // slot 27 — page: the slot's texel rows this dispatch bakes, from RowStart (a coarse page goes
+    uint  RowCount;         // slot 28     over several frames, TerrainMapResidency); 0 rows = the whole slot
 };
 
 #define PAINT_PAGE_TEXELS 256
@@ -86,11 +93,14 @@ void PaintOver(inout float raw[MAX_LAYERS], uint layer, float a, uint layerCount
     }
 }
 
-// Every stamp at a place (terrain UV), over the heights there: each layer's raw weight, as the stack holds them
-void Composite(float2 terrainUV, uint layerCount, out float raw[MAX_LAYERS])
+// Every stamp at a place (terrain UV), over the heights there: each layer's raw weight, as the stack holds them. paged:
+// a page bake's sample, whose spline stamps walk only the page's segments (sampleRow: its row in the page)
+void Composite(float2 terrainUV, uint layerCount, bool paged, uint sampleRow, out float raw[MAX_LAYERS])
 {
     StructuredBuffer<CoverageStamp> stamps = ResourceDescriptorHeap[StampBufIdx];
     StructuredBuffer<StampSplinePoint> splinePoints = ResourceDescriptorHeap[SplineBufIdx];
+    StructuredBuffer<PageShape> pageShapes = ResourceDescriptorHeap[PageShapeIdx];
+    StructuredBuffer<uint> pageList = ResourceDescriptorHeap[PageListIdx];
 
     float heightNorm = 0, slopeDeg = 0;
     if (TerrainPagesIdx != 0)
@@ -98,12 +108,21 @@ void Composite(float2 terrainUV, uint layerCount, out float raw[MAX_LAYERS])
 
     for (uint z = 0; z < MAX_LAYERS; z++) raw[z] = 0;
 
+    // A page bake goes only through the stamps whose box reaches its page (the others weigh 0 there), in their order
+    paged = paged && PageShapeIdx != 0;
+    uint count = paged ? PageStampCount : StampCount;
+
     float shapeWeight = 0;   // the shape weight of the last stamp that was not COVERAGE_SAME_SHAPE
-    for (uint i = 0; i < StampCount; i++)
+    for (uint n = 0; n < count; n++)
     {
+        uint i = paged ? pageList[PageStampOffset + n] : n;
         CoverageStamp stamp = stamps[i];
         // Before the target test, so a rule after a skipped one still reads its own shape's weight
-        if ((stamp.Flags & COVERAGE_SAME_SHAPE) == 0) shapeWeight = CoverageShapeWeight(stamp, terrainUV, splinePoints);
+        if ((stamp.Flags & COVERAGE_SAME_SHAPE) == 0)
+        {
+            if (paged) shapeWeight = CoverageShapeWeightPage(stamp, pageShapes[PageShapeBase + i], terrainUV, sampleRow, splinePoints, pageList);
+            else shapeWeight = CoverageShapeWeight(stamp, terrainUV, splinePoints);
+        }
         if (stamp.Target >= layerCount) continue;
 
         float weight = shapeWeight;
@@ -164,6 +183,8 @@ uint TopOf(float raw[MAX_LAYERS], uint layerCount)
 [numthreads(8, 8, 1)]
 void CS_SplatBakePage(uint3 dtid : SV_DispatchThreadID)
 {
+    if (dtid.y >= (RowCount != 0 ? RowCount : PAINT_SLOT_TEXELS)) return;
+    dtid.y += RowStart;
     if (dtid.x >= PAINT_SLOT_TEXELS || dtid.y >= PAINT_SLOT_TEXELS) return;
     RWTexture2DArray<float4> output = ResourceDescriptorHeap[OutputIdx];
 
@@ -174,7 +195,7 @@ void CS_SplatBakePage(uint3 dtid : SV_DispatchThreadID)
 
     float raw[MAX_LAYERS];
     if (Level == 0)
-        Composite((j + 0.5) * invTexels, layerCount, raw);
+        Composite((j + 0.5) * invTexels, layerCount, true, dtid.y, raw);
     else
     {
         const uint S = 4;
@@ -185,7 +206,7 @@ void CS_SplatBakePage(uint3 dtid : SV_DispatchThreadID)
             {
                 float2 c = (j + (float2(a, b) + 0.5) / S) * span;   // level 0 texels
                 float sub[MAX_LAYERS];
-                Composite(c * invTexels, layerCount, sub);
+                Composite(c * invTexels, layerCount, true, dtid.y * S + b, sub);
                 float cover = 1.0;
                 for (int k = int(layerCount) - 1; k >= 0; k--)
                 {
@@ -231,7 +252,7 @@ void CS_SplatBakeFlat(uint3 groupTexel : SV_DispatchThreadID)
 
     uint layerCount = min(LayerCount, (uint)MAX_LAYERS);
     float raw[MAX_LAYERS];
-    Composite(terrainUV, layerCount, raw);
+    Composite(terrainUV, layerCount, false, 0, raw);
 
     // Written from the output's corner: the check bakes one page's region at a time into an array of a page's size
     uint sliceCount = min(SliceCount, 8u);

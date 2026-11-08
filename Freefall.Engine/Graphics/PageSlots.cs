@@ -30,6 +30,8 @@ namespace Freefall.Graphics
         private int[] _pageOfSlot = Array.Empty<int>();
         // Per slot: the frame whose command list last wrote it; long.MinValue = never
         private long[] _writtenInFrame = Array.Empty<long>();
+        // Per slot: in the page table. A page baked over several frames is given its slot hidden and shown once whole
+        private bool[] _shown = Array.Empty<bool>();
         private readonly Stack<int> _free = new();
         private int _firstScratch;
         private uint[] _entries = Array.Empty<uint>();
@@ -84,6 +86,8 @@ namespace Freefall.Graphics
             Array.Fill(_pageOfSlot, -1);
             _writtenInFrame = new long[Capacity];
             Array.Fill(_writtenInFrame, long.MinValue);
+            _shown = new bool[Capacity];
+            if (allResident) Array.Fill(_shown, true);
             _free.Clear();
             _firstScratch = Capacity - ScratchCount;
             if (allResident)
@@ -122,8 +126,9 @@ namespace Freefall.Graphics
         }
 
         /// <summary>Give page (px, py) of a level a slot from the free list (its content is the caller's to write): the slot,
-        /// or -1 when none is free. The page table follows on its next copy.</summary>
-        public int Add(int level, int px, int py)
+        /// or -1 when none is free. The page table follows on its next copy; with <paramref name="shown"/> false only once
+        /// <see cref="Show"/> says the slot is whole (the coarser page over it shows meanwhile).</summary>
+        public int Add(int level, int px, int py, bool shown = true)
         {
             if (AllResident || level >= Levels) return -1;
             int index = py * PagesAcrossAt(level) + px;
@@ -133,9 +138,21 @@ namespace Freefall.Graphics
             _slots[level][index] = slot;
             _pageOfSlot[slot] = (level << LevelShift) | index;
             _writtenInFrame[slot] = long.MinValue;
-            UpdateEntries(level, px, py);
+            _shown[slot] = shown;
+            if (shown) UpdateEntries(level, px, py);
             return slot;
         }
+
+        /// <summary>A slot given out hidden is whole: the table takes it on its next copy.</summary>
+        public void Show(int slot)
+        {
+            if (slot < 0 || slot >= _shown.Length || _shown[slot]) return;
+            _shown[slot] = true;
+            if (PageIn(slot) is { } page) UpdateEntries(page.level, page.px, page.py);
+        }
+
+        /// <summary>Whether the slot is in the page table.</summary>
+        public bool Shown(int slot) => slot >= 0 && slot < _shown.Length && _shown[slot];
 
         /// <summary>Let page (px, py) of a level go: its slot back to the free list, the table over it to what is left.</summary>
         public void Remove(int level, int px, int py)
@@ -146,8 +163,10 @@ namespace Freefall.Graphics
             if (slot < 0) return;
             _slots[level][index] = -1;
             _pageOfSlot[slot] = -1;
+            bool wasShown = _shown[slot];
+            _shown[slot] = false;
             _free.Push(slot);
-            UpdateEntries(level, px, py);
+            if (wasShown) UpdateEntries(level, px, py);
         }
 
         /// <summary>Scratch slot i (0 .. <see cref="ScratchCount"/> − 1), or -1 in a layout without them.</summary>
@@ -189,7 +208,7 @@ namespace Freefall.Graphics
             for (int l = 0; l < Levels; l++)
             {
                 int s = _slots[l][(qy >> l) * PagesAcrossAt(l) + (qx >> l)];
-                if (s >= 0) return (uint)s | ((uint)l << LevelShift);
+                if (s >= 0 && _shown[s]) return (uint)s | ((uint)l << LevelShift);
             }
             return 0u;   // nothing resident over it yet
         }

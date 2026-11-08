@@ -732,10 +732,12 @@ namespace Freefall
          [System.ComponentModel.Description("Paint pages (the layers' blend weights, 256 texels each) a side round the camera at every level, coarser further out; use an odd number (3: full detail at least a page past the camera every way). 0 = every page of the whole map at full detail.")]
          public int TerrainPaintPages { get; set; } = 3;
 
-         /// <summary>Paint pages baked in a frame as they arrive or change away from the camera's own window (the level 0
-         /// pages an edit touches near the camera bake at once).</summary>
+         /// <summary>Paint baked in a frame as pages arrive or change away from the camera's own window, in level 0 pages'
+         /// worth: a coarser page samples each texel 16 times, so it costs 16 and is baked over several frames, shown once
+         /// whole (TerrainMapResidency). The level 0 pages an edit touches near the camera bake at once. Whole pages a frame
+         /// (until 2026-11-08) stalled a flight over TestWorld: four coarse pages were 16-25 ms of GPU in one frame.</summary>
          [ValueRange(1, 64)]
-         [System.ComponentModel.Description("Paint pages baked per frame as they come into range or after an edit away from the camera (near pages an edit touches bake at once).")]
+         [System.ComponentModel.Description("Paint baked per frame as pages come into range or after an edit away from the camera, in full-detail pages' worth: a coarser page costs 16 and is spread over several frames. Near pages an edit touches bake at once.")]
          public int TerrainPaintBakesPerFrame { get; set; } = 4;
 
          /// <summary>
@@ -747,9 +749,10 @@ namespace Freefall
          [System.ComponentModel.Description("Decoration pages (which plants grow where, one texel a metre, 256 each) a side round the camera at every level, coarser further out. 0 = every page of the whole map at full detail.")]
          public int TerrainDecoPages { get; set; } = 5;
 
-         /// <summary>Decoration control pages baked in a frame as they arrive or change away from the camera's own window.</summary>
+         /// <summary>Decoration control baked in a frame as pages arrive or change away from the camera's own window, in level
+         /// 0 pages' worth, as <see cref="TerrainPaintBakesPerFrame"/>: a coarser page costs 16 and is spread over frames.</summary>
          [ValueRange(1, 64)]
-         [System.ComponentModel.Description("Decoration pages baked per frame as they come into range or after an edit away from the camera.")]
+         [System.ComponentModel.Description("Decoration pages baked per frame as they come into range or after an edit away from the camera, in full-detail pages' worth: a coarser page costs 16 and is spread over several frames.")]
          public int TerrainDecoBakesPerFrame { get; set; } = 4;
 
          /// <summary>

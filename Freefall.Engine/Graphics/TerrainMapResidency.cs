@@ -35,7 +35,7 @@ namespace Freefall.Graphics
 
         private readonly IPagedMap _pool;
         private readonly HashSet<(int level, int px, int py)> _dirty = new();
-        private readonly List<(int level, int px, int py, int slot)> _bakes = new();
+        private readonly List<PageBake> _bakes = new();
         private readonly List<(float key, int level, int px, int py)> _candidates = new();
         private object? _poolTexture;
         private Vector2 _chosenAt = new(float.NaN);
@@ -115,27 +115,27 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// This frame's work: pages beyond their window let go, wanted ones given slots, and the list of pages to bake
-        /// (arrivals and dirty ones), each with its slot. A new pool fills within the budget too, coarsest first, so the
-        /// top page is there from its first frame. Main thread.
+        /// This frame's work: pages beyond their window let go, wanted ones given slots, and the rows of pages to bake
+        /// (arrivals and dirty ones), at most <paramref name="budget"/> level 0 pages' worth of samples: a coarser page
+        /// samples each texel 16 times and is baked over several frames, its slot hidden from the page table until its
+        /// last rows (the coarser page over it shows meanwhile). Pages in hand go on first; a new pool fills within the
+        /// budget too, coarsest first, so the top page is there within its first frames. Main thread.
         /// <paramref name="camera"/>: the camera in level 0 texels (terrain UV × texels).
         /// </summary>
-        public IReadOnlyList<(int level, int px, int py, int slot)> Update(Vector2 camera, int pagesPerSide, int budget)
+        public IReadOnlyList<PageBake> Update(Vector2 camera, int pagesPerSide, float budget)
         {
             _bakes.Clear();
             var slots = _pool.Slots;
             if (_pool.Resource == null) return _bakes;
+            int slotTexels = PageTexels + 2 * _pool.Border;
             bool fresh = !ReferenceEquals(_poolTexture, _pool.Resource);
             if (fresh)
             {
                 _poolTexture = _pool.Resource;
                 _dirty.Clear();
+                _inHand.Clear();
                 _chosenAt = new Vector2(float.NaN);
             }
-            // A new pool used to bake every page it wanted in one frame. On a 16 km terrain whose biome outlines are walked
-            // per rule, a coarse paint page is ~40 ms of GPU, and a whole window of them (~120 at 2 px a metre) is several
-            // seconds in one command list: past Windows' 2 s timeout, which removes the device (TestWorld, 2026-11-08)
-            int limit = budget;
 
             if (slots.AllResident)
             {
@@ -145,7 +145,7 @@ namespace Freefall.Graphics
                     for (int px = 0; px < n; px++)
                     {
                         int slot = slots.SlotOf(0, px, py);
-                        if (!slots.Written(slot) || _dirty.Remove((0, px, py))) _bakes.Add((0, px, py, slot));
+                        if (!slots.Written(slot) || _dirty.Remove((0, px, py))) _bakes.Add(new PageBake(0, px, py, slot, 0, slotTexels, true));
                     }
                 _dirty.Clear();
                 Waiting = 0;
@@ -153,37 +153,100 @@ namespace Freefall.Graphics
                 return _bakes;
             }
 
-            int h = (pagesPerSide - 1) / 2;
-            if (fresh || Waiting > 0 || pagesPerSide != _chosenSide || !(Vector2.DistanceSquared(camera, _chosenAt) < 32f * 32f))
-            {
-                Choose(camera, h, limit);
-                _chosenAt = camera;
-                _chosenSide = pagesPerSide;
-            }
+            // The frame's samples, in level 0 rows (a level 0 page's row samples its slot's texels once, a coarser one's 16
+            // times). A new pool used to bake every page it wanted in one frame: on a 16 km terrain whose biome outlines
+            // were walked per rule, a coarse paint page was ~40 ms of GPU, and a window of them (~120 at 2 px a metre)
+            // several seconds in one command list, past Windows' 2 s timeout (TestWorld, 2026-11-08). Whole pages a frame
+            // after that still stalled a flight: one coarse paint page was 4-7 ms of GPU, four of them 16-25 ms
+            double rows = Math.Max(budget, 0.05f) * slotTexels;
 
-            // Dirty pages: those in the level 0 window at once, the rest within what the budget leaves, nearest first
+            int h = (pagesPerSide - 1) / 2;
+            float near = (h + 0.5f) * PageTexels;
+
+            // Dirty pages: those in the level 0 window bake whole at once (an edit shows as it is dragged); the rest go in
+            // hand from their first row, nearest first, behind what is in hand already. A page in hand that turns dirty
+            // starts again.
             if (_dirty.Count > 0)
             {
+                for (int i = 0; i < _inHand.Count; i++)
+                    if (_dirty.Remove((_inHand[i].Level, _inHand[i].Px, _inHand[i].Py)))
+                        _inHand[i] = _inHand[i] with { NextRow = 0 };
+
                 _candidates.Clear();
                 foreach (var (l, px, py) in _dirty)
                     _candidates.Add((Distance(camera, px, py, PageTexels << l) - l * 1e7f, l, px, py));
                 _candidates.Sort((a, b) => a.key.CompareTo(b.key));
-                float near = (h + 0.5f) * PageTexels;
                 foreach (var (key, l, px, py) in _candidates)
                 {
-                    bool now = l == 0 && key <= near;
-                    if (!now && _bakes.Count >= limit) continue;
-                    _dirty.Remove((l, px, py));
                     int slot = slots.SlotOf(l, px, py);
-                    if (slot >= 0) _bakes.Add((l, px, py, slot));
+                    if (slot < 0) continue;
+                    if (l == 0 && key <= near)
+                    {
+                        _bakes.Add(new PageBake(0, px, py, slot, 0, slotTexels, true));
+                        rows -= slotTexels;
+                    }
+                    else _inHand.Add(new InHand(l, px, py, slot, 0));
                 }
+                _dirty.Clear();
             }
-            BakedLastFrame = _bakes.Count;
+
+            // Pages in hand go on where they stopped
+            BakeInHand(ref rows, slotTexels);
+
+            // The windows: what left them let go, what came into them given (hidden) slots and baked within what is left
+            if (fresh || Waiting > 0 || pagesPerSide != _chosenSide || !(Vector2.DistanceSquared(camera, _chosenAt) < 32f * 32f))
+            {
+                Choose(camera, h, ref rows, slotTexels);
+                _chosenAt = camera;
+                _chosenSide = pagesPerSide;
+            }
+
+            BakedLastFrame = 0;
+            foreach (var b in _bakes) if (b.Last) BakedLastFrame++;
             return _bakes;
         }
 
-        // Let go of what is beyond its window, then give slots to the wanted pages not resident, coarsest and nearest first
-        private void Choose(Vector2 camera, int h, int limit)
+        /// <summary>Pages in hand: their slots taken, rows still to bake from NextRow on (a new one hidden until done).</summary>
+        public int InHandCount => _inHand.Count;
+
+        // A page being baked over several frames: its slot, the row to go on from
+        private readonly record struct InHand(int Level, int Px, int Py, int Slot, int NextRow);
+        private readonly List<InHand> _inHand = new();
+
+        // Bake rows of the pages in hand, first in first, while the frame's samples last; a page whose last rows go out is
+        // shown (a dirty one already is)
+        private void BakeInHand(ref double rows, int slotTexels)
+        {
+            var slots = _pool.Slots;
+            int i = 0;
+            while (i < _inHand.Count && rows > 0)
+            {
+                var p = _inHand[i];
+                if (slots.SlotOf(p.Level, p.Px, p.Py) != p.Slot) { _inHand.RemoveAt(i); continue; }   // let go meanwhile
+                int perRow = p.Level == 0 ? 1 : 16;
+                // Whole groups of 8 rows (the kernels' thread groups), at least one. The page over the whole map goes whole:
+                // until it shows, a new pool has nothing under the ground anywhere
+                int take = p.Level == slots.Levels - 1 ? slotTexels - p.NextRow
+                    : (int)Math.Min(slotTexels - p.NextRow, Math.Max(8.0, Math.Floor(rows / perRow / 8) * 8));
+                bool last = p.NextRow + take >= slotTexels;
+                _bakes.Add(new PageBake(p.Level, p.Px, p.Py, p.Slot, p.NextRow, take, last));
+                rows -= (double)take * perRow;
+                if (last)
+                {
+                    slots.Show(p.Slot);
+                    _inHand.RemoveAt(i);
+                }
+                else
+                {
+                    _inHand[i] = p with { NextRow = p.NextRow + take };
+                    i++;
+                }
+            }
+        }
+
+        // Let go of what is beyond its window, then give slots to the wanted pages not resident, coarsest and nearest first,
+        // while the frame's samples last: each goes in hand, hidden, and bakes what it can of them now
+        private void Choose(Vector2 camera, int h, ref double rows, int slotTexels)
         {
             var slots = _pool.Slots;
             for (int l = 0; l < slots.Levels; l++)
@@ -198,6 +261,7 @@ namespace Freefall.Graphics
                             _dirty.Remove((l, px, py));
                         }
             }
+            _inHand.RemoveAll(p => slots.SlotOf(p.Level, p.Px, p.Py) != p.Slot);
 
             _candidates.Clear();
             for (int l = slots.Levels - 1; l >= 0; l--)
@@ -218,12 +282,19 @@ namespace Freefall.Graphics
             _candidates.Sort((a, b) => a.key.CompareTo(b.key));
             foreach (var (_, l, px, py) in _candidates)
             {
-                if (_bakes.Count >= limit) break;
-                int slot = slots.Add(l, px, py);
+                if (rows <= 0) break;
+                int slot = slots.Add(l, px, py, shown: false);
                 if (slot < 0) break;
-                _bakes.Add((l, px, py, slot));
+                _inHand.Add(new InHand(l, px, py, slot, 0));
                 Waiting--;
+                BakeInHand(ref rows, slotTexels);
             }
         }
     }
+
+    /// <summary>
+    /// Rows of one page to bake this frame into its slot: <see cref="Rows"/> of the slot's texel rows from
+    /// <see cref="Row0"/> (border included); <see cref="Last"/> when they finish the page.
+    /// </summary>
+    public readonly record struct PageBake(int Level, int Px, int Py, int Slot, int Row0, int Rows, bool Last);
 }

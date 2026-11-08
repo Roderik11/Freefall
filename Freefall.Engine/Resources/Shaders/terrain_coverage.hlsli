@@ -66,6 +66,66 @@ float CoverageShapeWeight(CoverageStamp s, float2 terrainUV, StructuredBuffer<St
         splinePoints, nearestH, nearestHalfW, false);
 }
 
+// ── A spline stamp's segments for one page (the paint and decoration page bakes) ──
+//
+// A page bake walked every segment of every spline stamp whose box held the sample, for every sample: a biome outline's
+// 113-176 points, 16 times a texel on a coarse page, ~10 ms of GPU a page on TestWorld and 35-85 ms frames while flying
+// (2026-11-08). TerrainBaker gives each page, per spline stamp, only the segments that can reach its samples: those
+// within the stamp's reach (width, falloff, edge noise) of the page's samples, or 16 times that where the stamp's width or
+// fade changes along it, so the segments left out weigh under a millionth in the blend (StampWalk). The weight is then
+// the whole walk's. A closed stamp's inside test, the parity of a ray from the sample to +X, is split at XR, a U right of
+// every sample of the page: the crossings up to XR are among the page's segments, and the parity beyond it is one bit
+// per sample row, made by the CPU from every segment (XR picked so no crossing comes near it). Matches C# PageShapeGPU.
+struct PageShape
+{
+    uint  SegOffset;        // into the bake's uint list: the segments (segment k joins point k and k + 1)
+    uint  SegCount;         // PAGE_SHAPE_WHOLE: walk the whole spline (circles, global stamps, one-point splines)
+    uint  ParityOffset;     // closed: the row parities' first uint in the list (bit r: sample row r's ray beyond XR)
+    float XR;               // closed: terrain U right of every sample of the page
+    float FarHalfWidth;     // width and fade where no segment of the list is near (an empty list)
+    float FarFade;
+    uint  Pad0, Pad1;
+};
+
+#define PAGE_SHAPE_WHOLE 0xFFFFFFFFu
+
+// A stamp's shape weight in a page bake: as CoverageShapeWeight, over the page's own segments. sampleRow: the sample's
+// row in the page (a level 0 page: the slot's texel row; a coarser one: texel row * 4 + the sub-row)
+float CoverageShapeWeightPage(CoverageStamp s, PageShape ps, float2 terrainUV, uint sampleRow,
+    StructuredBuffer<StampSplinePoint> splinePoints, StructuredBuffer<uint> pageList)
+{
+    if (ps.SegCount == PAGE_SHAPE_WHOLE) return CoverageShapeWeight(s, terrainUV, splinePoints);
+    if (any(terrainUV < s.Bounds.xy) || any(terrainUV > s.Bounds.zw)) return 0.0;
+
+    bool isClosed = (s.SplinePointCount & 0x80000000u) != 0;
+    uint ptCount = s.SplinePointCount & 0x7FFFFFFFu;
+    bool inside = isClosed && ((pageList[ps.ParityOffset + (sampleRow >> 5)] >> (sampleRow & 31u)) & 1u) != 0;
+
+    StampWalk w = StampWalkStart();
+    for (uint i = 0; i < ps.SegCount; i++)
+    {
+        uint seg = pageList[ps.SegOffset + i];
+        StampSplinePoint p0 = splinePoints[s.SplinePointOffset + seg];
+        StampSplinePoint p1 = splinePoints[s.SplinePointOffset + (seg + 1) % ptCount];
+        StampWalkSegment(w, terrainUV, p0, p1);
+
+        float xHit;
+        if (isClosed && StampRowCrossing(terrainUV, p0.UV, p1.UV, xHit) && terrainUV.x < xHit && xHit <= ps.XR)
+            inside = !inside;
+    }
+
+    float bestH = 0, bestHalfW = ps.FarHalfWidth, bestFade = ps.FarFade;
+    if (w.accW > 0)
+    {
+        bestH = w.accH / w.accW;
+        bestHalfW = w.accHalfW / w.accW;
+        bestFade = w.accFade / w.accW;
+    }
+    float nearestH, nearestHalfW;
+    return StampWeightAt(terrainUV, s.Center, s.Radius, s.Falloff, s.NoiseFreq, s.NoiseAmp, s.NoiseSeed, true, isClosed,
+        inside, w.bestDist, bestH, bestHalfW, bestFade, nearestH, nearestHalfW, false, false);
+}
+
 // Ramp that is 0 below (edge - blend) and 1 from edge on. A zero blend is a hard step that includes the
 // edge itself, so a range starting at 0 covers height 0 (smoothstep with equal edges is NaN there).
 float CoverageRampUp(float edge, float blend, float x)

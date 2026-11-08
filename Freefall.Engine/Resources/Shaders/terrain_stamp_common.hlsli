@@ -67,17 +67,85 @@ float StampDistToSegment(float2 P, float2 A, float2 B, out float projT, out floa
 // outsideClosed (with insetFalloff, HeightStamp.Outside): the mask is turned inside out. The area is everything beyond
 // the outline (radius moves its edge into the outline) and the falloff runs outward from that edge.
 
-float EvaluateStampWeightEx(
+// What a walk over a spline's segments gathers for a place: the nearest distance and the blend of height, width and fade
+// round it. EvaluateStampWeightEx walks every segment; the page bakes walk only the segments that can reach their page
+// (terrain_coverage.hlsli CoverageShapeWeightPage) and finish the same way (StampWeightAt).
+//
+// Height, width and fade come from the segments nearly as near as the nearest, weighted by ((nearest + e) / (d + e))^6,
+// not from the nearest alone. Taken from the nearest segment, they jumped where another segment became the nearest: on the
+// inside of every bend (the bisector) and between a meander's arms, where the two feet lie far apart along the spline.
+// With per-point widths (a river widening seaward) that jump in reach left steps up to 6 m in the ground beside the Great
+// River's valley (TestWorld, 2026-11-07). On the spline the nearest segment rules; one at 1.5x the distance weighs under
+// 0.1, at 4x 0.00024. Built up in the one walk: when a nearer segment turns up, what was gathered is rescaled to it.
+struct StampWalk
+{
+    float bestDist;
+    float accW, accH, accHalfW, accFade;
+};
+
+StampWalk StampWalkStart()
+{
+    StampWalk w;
+    w.bestDist = 1e10;
+    w.accW = 0; w.accH = 0; w.accHalfW = 0; w.accFade = 0;
+    return w;
+}
+
+// One segment (p0 to p1) into the walk
+void StampWalkSegment(inout StampWalk w, float2 uv, StampSplinePoint p0, StampSplinePoint p1)
+{
+    const float blendEps = 1e-7;    // terrain UV, ~2 mm on 16 km: keeps the ratio defined on the spline itself
+
+    float projT;
+    float2 nearest;
+    float d = StampDistToSegment(uv, p0.UV, p1.UV, projT, nearest);
+
+    if (d < w.bestDist)
+    {
+        float r = (d + blendEps) / (w.bestDist + blendEps);
+        float r2 = r * r;
+        float rescale = r2 * r2 * r2;
+        w.accW *= rescale; w.accH *= rescale; w.accHalfW *= rescale; w.accFade *= rescale;
+        w.bestDist = d;
+    }
+    float q = (w.bestDist + blendEps) / (d + blendEps);
+    float q2 = q * q;
+    float wt = q2 * q2 * q2;
+    w.accW += wt;
+    w.accH += wt * lerp(p0.Height, p1.Height, projT);
+    w.accHalfW += wt * lerp(p0.HalfWidth, p1.HalfWidth, projT);
+    w.accFade += wt * lerp(p0.Fade, p1.Fade, projT);
+}
+
+// Where segment a-b crosses the row through uv, in terrain U, or false when it does not: half-open in V (the lower end
+// counts, the upper does not), so a ray along the row counts a vertex once. 'precise': the page bakes split the ray from uv
+// to +X at a U the CPU chose, and both sides of the split must see the same crossing as the whole ray
+bool StampRowCrossing(float2 uv, float2 a, float2 b, out float xHit)
+{
+    xHit = 0;
+    if (!((a.y <= uv.y && b.y > uv.y) || (b.y <= uv.y && a.y > uv.y))) return false;
+    precise float t = (uv.y - a.y) / (b.y - a.y);
+    precise float x = a.x + t * (b.x - a.x);
+    xHit = x;
+    return true;
+}
+
+// The weight at a place from what a walk found (a spline stamp), or from the distance to the centre (a circle)
+float StampWeightAt(
     float2 uv,
     float2 center,
     float radius,
     float falloff,
-    uint splinePointOffset,
-    uint splinePointCount,
     float noiseFreq,
     float noiseAmp,
     uint noiseSeed,
-    StructuredBuffer<StampSplinePoint> splinePoints,
+    bool spline,
+    bool isClosed,
+    bool inside,
+    float bestDist,
+    float bestH,
+    float bestHalfW,
+    float bestFade,
     out float nearestHeight,
     out float nearestHalfWidth,
     bool insetFalloff,
@@ -91,84 +159,8 @@ float EvaluateStampWeightEx(
     nearestHeight = 0;
     nearestHalfWidth = radius;
 
-    if (splinePointCount > 0 && splinePointOffset != 0xFFFFFFFF)
+    if (spline)
     {
-        bool isClosed = (splinePointCount & 0x80000000) != 0;
-        uint ptCount = splinePointCount & 0x7FFFFFFF;
-
-        float bestDist = 1e10;
-        float bestH = 0;
-        float bestHalfW = radius;
-        float bestFade = 1;
-        bool inside = false;
-
-        // Height, width and fade come from the segments nearly as near as the nearest, weighted by
-        // ((nearest + e) / (d + e))^6, not from the nearest alone. Taken from the nearest segment, they jumped where
-        // another segment became the nearest: on the inside of every bend (the bisector) and between a meander's arms,
-        // where the two feet lie far apart along the spline. With per-point widths (a river widening seaward) that
-        // jump in reach left steps up to 6 m in the ground beside the Great River's valley (TestWorld, 2026-11-07).
-        // On the spline the nearest segment rules; one at 1.5x the distance weighs under 0.1. Built up in the one walk:
-        // when a nearer segment turns up, what was gathered is rescaled to it.
-        const float blendEps = 1e-7;    // terrain UV, ~2 mm on 16 km: keeps the ratio defined on the spline itself
-        float accW = 0, accH = 0, accHalfW = 0, accFade = 0;
-
-        uint segCount = isClosed ? ptCount : (ptCount - 1);
-
-        for (uint s = 0; s < segCount; s++)
-        {
-            uint idx0 = splinePointOffset + s;
-            uint idx1 = splinePointOffset + ((s + 1) % ptCount);
-            StampSplinePoint p0 = splinePoints[idx0];
-            StampSplinePoint p1 = splinePoints[idx1];
-
-            float projT;
-            float2 nearest;
-            float d = StampDistToSegment(uv, p0.UV, p1.UV, projT, nearest);
-
-            if (d < bestDist)
-            {
-                float r = (d + blendEps) / (bestDist + blendEps);
-                float r2 = r * r;
-                float rescale = r2 * r2 * r2;
-                accW *= rescale; accH *= rescale; accHalfW *= rescale; accFade *= rescale;
-                bestDist = d;
-            }
-            float q = (bestDist + blendEps) / (d + blendEps);
-            float q2 = q * q;
-            float w = q2 * q2 * q2;
-            accW += w;
-            accH += w * lerp(p0.Height, p1.Height, projT);
-            accHalfW += w * lerp(p0.HalfWidth, p1.HalfWidth, projT);
-            accFade += w * lerp(p0.Fade, p1.Fade, projT);
-
-            if (isClosed)
-            {
-                float2 a = p0.UV, b = p1.UV;
-                if ((a.y <= uv.y && b.y > uv.y) || (b.y <= uv.y && a.y > uv.y))
-                {
-                    float xHit = a.x + (uv.y - a.y) / (b.y - a.y) * (b.x - a.x);
-                    if (uv.x < xHit)
-                        inside = !inside;
-                }
-            }
-        }
-
-        if (accW > 0)
-        {
-            bestH = accH / accW;
-            bestHalfW = accHalfW / accW;
-            bestFade = accFade / accW;
-        }
-
-        if (ptCount == 1)
-        {
-            StampSplinePoint p0 = splinePoints[splinePointOffset];
-            bestDist = length(uv - p0.UV);
-            bestH = p0.Height;
-            bestHalfW = p0.HalfWidth;
-            bestFade = p0.Fade;
-        }
-
         // An open spline that fades at an end: nothing of it there, its round cap past the last point included
         if (!isClosed)
         {
@@ -242,6 +234,68 @@ float EvaluateStampWeightEx(
 
     float t = (dist - radius) / max(falloff, 0.001);
     return (1.0 - t * t * (3.0 - 2.0 * t)) * fade;
+}
+
+float EvaluateStampWeightEx(
+    float2 uv,
+    float2 center,
+    float radius,
+    float falloff,
+    uint splinePointOffset,
+    uint splinePointCount,
+    float noiseFreq,
+    float noiseAmp,
+    uint noiseSeed,
+    StructuredBuffer<StampSplinePoint> splinePoints,
+    out float nearestHeight,
+    out float nearestHalfWidth,
+    bool insetFalloff,
+    bool outsideClosed)
+{
+    if (splinePointCount > 0 && splinePointOffset != 0xFFFFFFFF)
+    {
+        bool isClosed = (splinePointCount & 0x80000000) != 0;
+        uint ptCount = splinePointCount & 0x7FFFFFFF;
+
+        StampWalk w = StampWalkStart();
+        bool inside = false;   // closed: the parity of a ray from uv to +X
+        uint segCount = isClosed ? ptCount : (ptCount - 1);
+        for (uint s = 0; s < segCount; s++)
+        {
+            StampSplinePoint p0 = splinePoints[splinePointOffset + s];
+            StampSplinePoint p1 = splinePoints[splinePointOffset + ((s + 1) % ptCount)];
+            StampWalkSegment(w, uv, p0, p1);
+
+            float xHit;
+            if (isClosed && StampRowCrossing(uv, p0.UV, p1.UV, xHit) && uv.x < xHit)
+                inside = !inside;
+        }
+
+        float bestDist = w.bestDist;
+        float bestH = 0;
+        float bestHalfW = radius;
+        float bestFade = 1;
+        if (w.accW > 0)
+        {
+            bestH = w.accH / w.accW;
+            bestHalfW = w.accHalfW / w.accW;
+            bestFade = w.accFade / w.accW;
+        }
+
+        if (ptCount == 1)
+        {
+            StampSplinePoint p0 = splinePoints[splinePointOffset];
+            bestDist = length(uv - p0.UV);
+            bestH = p0.Height;
+            bestHalfW = p0.HalfWidth;
+            bestFade = p0.Fade;
+        }
+
+        return StampWeightAt(uv, center, radius, falloff, noiseFreq, noiseAmp, noiseSeed, true, isClosed, inside,
+            bestDist, bestH, bestHalfW, bestFade, nearestHeight, nearestHalfWidth, insetFalloff, outsideClosed);
+    }
+    return StampWeightAt(uv, center, radius, falloff, noiseFreq, noiseAmp, noiseSeed, false, false, false,
+        0, 0, radius, 1, nearestHeight, nearestHalfWidth, insetFalloff, outsideClosed);
 }
 
 float EvaluateStampWeight(
