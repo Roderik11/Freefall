@@ -734,7 +734,7 @@ namespace Freefall.PCG
             for (int i = 0; i < points.Count; i++)
             {
                 var p = points.position[i];
-                var rng = new Random(HashCode.Combine(Seed, (int)MathF.Floor(p.X * 8f), (int)MathF.Floor(p.Z * 8f)));
+                var rng = new Random(PlaceSeed(Seed, (int)MathF.Floor(p.X * 8f), (int)MathF.Floor(p.Z * 8f)));
                 float leaderScale = MathF.Max(points.extents[i].X, points.extents[i].Z);
                 int n = lo + (int)MathF.Floor((hi - lo + 1) * MathF.Pow((float)rng.NextDouble(), MathF.Max(Bias, 0.01f)));
                 n = Math.Min(n, hi);
@@ -778,6 +778,27 @@ namespace Freefall.PCG
                 pos.Add(p); ext.Add(e); rot.Add(r); den.Add(points.density[src]);
                 tags.Add(points.tags != null && src < points.tags.Length ? points.tags[src] : null);
                 nrm.Add(points.normal != null && src < points.normal.Length ? points.normal[src] : Vector3.UnitY);
+            }
+        }
+
+        // A leader's seed from the node's and its place (an eighth of a metre). The same in every process: until
+        // 2026-11-08 it was HashCode.Combine, which .NET seeds anew in each process, so every forest graph that clusters
+        // (Forest, SpruceForest, BeechForest) came out different on each editor start
+        private static int PlaceSeed(int seed, int x, int z)
+        {
+            uint h = (uint)seed;
+            h = Mix(h ^ (uint)x);
+            h = Mix(h ^ (uint)z);
+            return (int)h;
+
+            // murmur3's finalizer, after a step of the golden ratio
+            static uint Mix(uint v)
+            {
+                v += 0x9E3779B9u;
+                v ^= v >> 16; v *= 0x85EBCA6Bu;
+                v ^= v >> 13; v *= 0xC2B2AE35u;
+                v ^= v >> 16;
+                return v;
             }
         }
     }

@@ -29,6 +29,7 @@ namespace Freefall.Graphics
         {
             FrameTrace.Step(name);
             GpuProfiler.Begin(list, name);
+            if (GpuBreadcrumbs.Enabled) GpuBreadcrumbs.Begin(list, name);
             try
             {
                 PIXBeginEventOnCommandList(list.NativePointer, 0xFF00FF00, name);
@@ -43,6 +44,7 @@ namespace Freefall.Graphics
         {
             FrameTrace.Step(name);
             GpuProfiler.Begin(list, name);
+            if (GpuBreadcrumbs.Enabled) GpuBreadcrumbs.Begin(list, name);
             try
             {
                 PIXBeginEventOnCommandList(list.NativePointer, color, name);
@@ -56,6 +58,7 @@ namespace Freefall.Graphics
         public static void End(ID3D12GraphicsCommandList list)
         {
             GpuProfiler.End(list);
+            if (GpuBreadcrumbs.Enabled) GpuBreadcrumbs.End(list);
             try
             {
                 PIXEndEventOnCommandList(list.NativePointer);

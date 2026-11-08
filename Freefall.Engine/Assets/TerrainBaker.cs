@@ -190,6 +190,7 @@ namespace Freefall.Assets
 
         private const uint CoverageGlobal = 1u;
         private const uint CoverageFilter = 2u;
+        private const uint CoverageSameShape = 4u;   // COVERAGE_SAME_SHAPE: reuse the previous stamp's shape weight
         private const uint AllTargets = 0xFFFFFFFFu;
 
         private static void EnsureInitialized()
@@ -1858,18 +1859,22 @@ namespace Freefall.Assets
             var plan = new CoveragePlan { TargetCount = layers.Count, LayerCount = layers.Count };
             var layerIndex = BuildIndex(layers);
             var terrainOrigin = renderer.Transform?.WorldPosition ?? Vector3.Zero;
+            TerrainStamp? lastShape = null;
 
             foreach (var entry in entries)
             {
                 if (entry.Layer == null || !layerIndex.TryGetValue(entry.Layer, out int channel)) continue;
 
+                int pointsBefore = plan.SplinePoints.Count;
                 if (!TryBuildCoverage(entry.Shape, entry.Filter, terrain, terrainOrigin, layerIndex, plan.SplinePoints, out var desc))
                     continue;
+                if (ReferenceEquals(entry.Shape, lastShape)) SameShapeAsLast(plan, ref desc, pointsBefore);
 
                 desc.Flags |= (uint)entry.Op << 8;
                 desc.Target = (uint)channel;
                 desc.Strength = entry.Strength;
                 plan.Stamps.Add(desc);
+                lastShape = entry.Shape;
             }
 
             return plan;
@@ -1889,6 +1894,7 @@ namespace Freefall.Assets
             var layerIndex = BuildIndex(layers);
             var decoratorIndex = BuildIndex(decorators);
             var terrainOrigin = renderer.Transform?.WorldPosition ?? Vector3.Zero;
+            TerrainStamp? lastShape = null;
 
             foreach (var entry in entries)
             {
@@ -1905,8 +1911,10 @@ namespace Freefall.Assets
                 }
                 else continue;
 
+                int pointsBefore = plan.SplinePoints.Count;
                 if (!TryBuildCoverage(entry.Shape, entry.Filter, terrain, terrainOrigin, layerIndex, plan.SplinePoints, out var desc))
                     continue;
+                if (ReferenceEquals(entry.Shape, lastShape)) SameShapeAsLast(plan, ref desc, pointsBefore);
 
                 desc.Flags |= (uint)entry.Op << 8;
                 desc.Target = target;
@@ -1923,9 +1931,25 @@ namespace Freefall.Assets
                     desc.Rows = (uint)plan.Rows.Count;
                 }
                 plan.Stamps.Add(desc);
+                lastShape = entry.Shape;
             }
 
             return plan;
+        }
+
+        /// <summary>
+        /// The entry just built has the shape of the stamp added before it (a biome stamp's next rule): the shaders reuse
+        /// that stamp's shape weight (COVERAGE_SAME_SHAPE) rather than walk the outline again for every rule, every sample.
+        /// On TestWorld a biome's 4-7 rules each walked its 113-176-point outline, 16 times a texel on a coarse page: about
+        /// 100 ms of GPU a page, 0.4 s a frame at four pages (2026-11-08). The copy of its spline points is dropped.
+        /// </summary>
+        private static void SameShapeAsLast(CoveragePlan plan, ref CoverageStampGPU desc, int pointsBefore)
+        {
+            var previous = plan.Stamps[^1];
+            plan.SplinePoints.RemoveRange(pointsBefore, plan.SplinePoints.Count - pointsBefore);
+            desc.SplinePointOffset = previous.SplinePointOffset;
+            desc.SplinePointCount = previous.SplinePointCount;
+            desc.Flags |= CoverageSameShape;
         }
 
         /// <summary>

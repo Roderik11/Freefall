@@ -32,6 +32,13 @@ namespace Freefall.Base
         {
             if (exception is TargetInvocationException { InnerException: { } inner }) exception = inner;
 
+            // A removed device shows first in whichever callback makes the next GPU call, often a Draw; the renderer then
+            // dies within the same frame on a failed Map, before Engine.Tick's own check writes the reason. Write it (and
+            // DRED's breadcrumbs, with FREEFALL_DRED=1) now (TestWorld's play load, 2026-11-08: no report at all)
+            // (not only while IsDeviceLost is false: a fence wait sets it without writing anything; LogDeviceRemoved writes once)
+            if (Engine.Device is { } device && device.NativeDevice.DeviceRemovedReason.Failure)
+                device.LogDeviceRemoved($"{owner?.GetType().Name}.{callback}");
+
             var type = owner?.GetType();
             string key = $"{type?.FullName}.{callback}|{exception.GetType().FullName}|{exception.Message}";
             long times;

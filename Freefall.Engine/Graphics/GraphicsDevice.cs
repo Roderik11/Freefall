@@ -230,6 +230,10 @@ namespace Freefall.Graphics
                 }
                 catch (Exception ex) { sb.AppendLine($"  DRED query failed: {ex.Message}"); }
             }
+            if (GpuBreadcrumbs.Enabled)
+                try { sb.Append(GpuBreadcrumbs.Report()); }
+                catch (Exception ex) { sb.AppendLine($"  GPU breadcrumbs failed: {ex.Message}"); }
+            else sb.AppendLine("  (FREEFALL_BREADCRUMBS=1 names the PIX regions the GPU began and did not finish)");
             var text = sb.ToString();
             Console.WriteLine(text);
             Debug.LogError("GraphicsDevice", text);

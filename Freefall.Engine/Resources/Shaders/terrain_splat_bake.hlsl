@@ -98,12 +98,15 @@ void Composite(float2 terrainUV, uint layerCount, out float raw[MAX_LAYERS])
 
     for (uint z = 0; z < MAX_LAYERS; z++) raw[z] = 0;
 
+    float shapeWeight = 0;   // the shape weight of the last stamp that was not COVERAGE_SAME_SHAPE
     for (uint i = 0; i < StampCount; i++)
     {
         CoverageStamp stamp = stamps[i];
+        // Before the target test, so a rule after a skipped one still reads its own shape's weight
+        if ((stamp.Flags & COVERAGE_SAME_SHAPE) == 0) shapeWeight = CoverageShapeWeight(stamp, terrainUV, splinePoints);
         if (stamp.Target >= layerCount) continue;
 
-        float weight = CoverageShapeWeight(stamp, terrainUV, splinePoints);
+        float weight = shapeWeight;
         if (weight <= 0) continue;
 
         if (stamp.Flags & COVERAGE_FILTER)

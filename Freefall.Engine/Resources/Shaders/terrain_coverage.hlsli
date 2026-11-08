@@ -41,6 +41,8 @@ struct CoverageStamp
 
 #define COVERAGE_GLOBAL 1u      // covers the whole terrain; shape fields are ignored
 #define COVERAGE_FILTER 2u      // height/slope/layer terms can reject a texel
+#define COVERAGE_SAME_SHAPE 4u  // the stamp before it has this one's shape (a biome stamp's next rule): reuse its shape
+                                // weight. Each rule walked the biome's outline again, per sample (TestWorld 2026-11-08)
 
 #define COVERAGE_ALL_TARGETS 0xFFFFFFFFu
 

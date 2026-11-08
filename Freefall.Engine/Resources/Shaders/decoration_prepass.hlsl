@@ -111,11 +111,13 @@ void DecoCoverage(float2 terrainUV, uint decoCount, out float coverage[MAX_DECOR
     rowIdx = 0;
     rowSlot = COVERAGE_ALL_TARGETS;
 
+    float shapeWeight = 0;   // the shape weight of the last stamp that was not COVERAGE_SAME_SHAPE
     for (uint i = 0; i < StampCount; i++)
     {
         CoverageStamp stamp = stamps[i];
 
-        float weight = CoverageShapeWeight(stamp, terrainUV, splinePoints);
+        if ((stamp.Flags & COVERAGE_SAME_SHAPE) == 0) shapeWeight = CoverageShapeWeight(stamp, terrainUV, splinePoints);
+        float weight = shapeWeight;
         if (weight <= 0) continue;
 
         if (stamp.Flags & COVERAGE_FILTER)
