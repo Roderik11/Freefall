@@ -116,7 +116,8 @@ namespace Freefall.Graphics
 
         /// <summary>
         /// This frame's work: pages beyond their window let go, wanted ones given slots, and the list of pages to bake
-        /// (arrivals and dirty ones), each with its slot. A new pool bakes every page it wants at once. Main thread.
+        /// (arrivals and dirty ones), each with its slot. A new pool fills within the budget too, coarsest first, so the
+        /// top page is there from its first frame. Main thread.
         /// <paramref name="camera"/>: the camera in level 0 texels (terrain UV × texels).
         /// </summary>
         public IReadOnlyList<(int level, int px, int py, int slot)> Update(Vector2 camera, int pagesPerSide, int budget)
@@ -131,7 +132,10 @@ namespace Freefall.Graphics
                 _dirty.Clear();
                 _chosenAt = new Vector2(float.NaN);
             }
-            int limit = fresh ? int.MaxValue : budget;
+            // A new pool used to bake every page it wanted in one frame. On a 16 km terrain whose biome outlines are walked
+            // per rule, a coarse paint page is ~40 ms of GPU, and a whole window of them (~120 at 2 px a metre) is several
+            // seconds in one command list: past Windows' 2 s timeout, which removes the device (TestWorld, 2026-11-08)
+            int limit = budget;
 
             if (slots.AllResident)
             {
