@@ -724,10 +724,13 @@ namespace Freefall
          /// Paint pages (the layers' blend weights, 256 texels a side) a side of the window round the camera at every level,
          /// each level's pages twice the last's size (TerrainMapResidency, TERRAIN_PAGES_PLAN.md 5b): the paint is baked
          /// from the stamps as pages arrive. 0 = every level 0 page in the pool, the whole map at full paint as before 5b.
+         /// 3 by default since 2026-11-08 (5 before): full paint at least a page past the camera every way (256 m at 1 texel
+         /// a metre), which the user found looks the same as 5 on TestWorld (193 → ~105 MB there). Odd numbers: an even one
+         /// reaches as far as the odd one below it with more slots, and 1 is only the camera's own page.
          /// </summary>
          [ValueRange(0, 32)]
-         [System.ComponentModel.Description("Paint pages (the layers' blend weights, 256 texels each) a side round the camera at every level, coarser further out. 0 = every page of the whole map at full detail.")]
-         public int TerrainPaintPages { get; set; } = 5;
+         [System.ComponentModel.Description("Paint pages (the layers' blend weights, 256 texels each) a side round the camera at every level, coarser further out; use an odd number (3: full detail at least a page past the camera every way). 0 = every page of the whole map at full detail.")]
+         public int TerrainPaintPages { get; set; } = 3;
 
          /// <summary>Paint pages baked in a frame as they arrive or change away from the camera's own window (the level 0
          /// pages an edit touches near the camera bake at once).</summary>
