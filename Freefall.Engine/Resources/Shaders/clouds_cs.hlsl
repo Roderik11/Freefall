@@ -136,7 +136,7 @@ float CloudCoverageAt(CloudParams C, Texture3D<float4> lut, float2 xz)
 // turret (−0.5..0.5, a ~2 km noise at the place) bulges and dents the column and the anvil's rim, so a tower is a stack
 // of turrets rather than a cylinder; lobe (−0.5..0.5, the ~6 km base shape) swells and pinches it in broad masses
 // (with turrets alone a tower read as a chimney); pouch (0..1, round blobs ~1.4 km apart) hangs mammatus under a mature
-// anvil. x the column, y the anvil (CloudFieldAt keeps an anvil's sheet whole).
+// anvil. x the column, y the anvil (CloudFieldInColumn keeps an anvil's sheet whole).
 float2 CloudTowerEnvelope(CloudParams C, CloudCell k, float2 center, float2 xz, float h, float turret, float lobe, float pouch)
 {
     float top = k.Top;
@@ -252,51 +252,119 @@ void CloudApplyRegions(inout CloudParams C, float2 xz)
 // The cloud field at a cloud-space place: density 0..1 (before CloudDensity) and the profile, after Nubis: the base
 // shape (Perlin-Worley eroded by Worley FBM) against the envelope (the layer's coverage × its height profile, or a
 // tower's), the detail left to the march
-float2 CloudFieldAt(CloudParams C, float2 xz, float h)
+//
+// In two parts, as the bake walks it (CSCloudBake, a thread a column of a brick): what a column's voxels share
+// (CloudColumnAt: everything that depends on xz alone, eight to ten of the field's noise reads) once, then each height
+// (CloudFieldInColumn). Until 2026-11-09 every voxel read all of it again, the towers' noises without a tower anywhere
+// and the shape's under a clear sky too.
+struct CloudColumn
 {
+    float2 fineXZ;          // where the fair-weather shape's finer octave is read
+    float rough;            // CloudBaseRough at the place (after its regions)
+    float fair;             // 1 − CloudDeckness
+    float cover;            // CloudCoverageAt
+    float bottom;           // the layer's base here (m above sea level) and its depth
+    float depth;
+    float pouch;            // mammatus (0 where no tower reaches)
+    bool towers;            // a storm cell's tower or anvil can reach this column
+};
+
+// Whether any storm cell can reach a column: CloudTowers' own test of each cell's reach, without the heights
+bool CloudTowersReach(CloudParams C, float2 xz)
+{
+    if (C.Cells == 0 || C.TowerShare <= 0.0)
+        return false;
+    StructuredBuffer<CloudCell> cells = ResourceDescriptorHeap[C.Cells];
+    int n = (int)C.CellsPerSide;
+    int2 home = (int2)floor(xz / C.CellSize);
+    bool any = false;
+    [loop] for (int j = -2; j <= 2; j++)
+    {
+        [loop] for (int i = -2; i <= 2; i++)
+        {
+            int2 c = home + int2(i, j);
+            int2 w = ((c % n) + n) % n;
+            CloudCell k = cells[w.y * n + w.x];
+            if (k.Radius <= 0.0)
+                continue;
+            float2 center = float2(c) * C.CellSize + k.Center;
+            float reach = k.Radius * (2.6 + 3.5 * k.Anvil) + 0.12 * (k.Top - C.Base);
+            float2 off = xz - center;
+            any = any || dot(off, off) <= reach * reach;
+        }
+    }
+    return any;
+}
+
+// C: the weather's layer in, the column's out (its regions applied)
+CloudColumn CloudColumnAt(inout CloudParams C, Texture3D<float4> lut, float2 xz, float3 slide)
+{
+    CloudColumn col;
     CloudApplyRegions(C, xz);
-    Texture3D<float4> lut = ResourceDescriptorHeap[C.NoiseLut];
-    float3 slide = float3(0.7, 0.3, 0.4) * (C.Evolution * 3.0);         // the noise slides through the shapes
-    float4 n = lut.SampleLevel(CloudWrap, (float3(xz.x, h, xz.y) + slide) / CLOUD_BASE_TILE, 0);
     // Fair weather: a finer octave (P/72, ~3.6 km) over the base shape, its place pushed about by a smooth noise of a
     // tile that shares no factor with either (P/11, ~23 km). The 6.4 km shape alone stood the same pair of clouds in
     // every 6.4 km square (a lattice across the sky) and made slabs several km wide. A storm's deck and the towers keep
     // the 6.4 km shape (rough decks, the towers' lobes).
-    float rough = CloudBaseRough(C);
-    float4 shapeNoise = n;
-    if (rough < 1.0)
+    col.rough = CloudBaseRough(C);
+    col.fineXZ = xz;
+    if (col.rough < 1.0)
     {
         float2 warp = float2(lut.SampleLevel(CloudWrap, float3(xz / (CLOUD_PERIOD / 11.0), 0.61), 0).r,
                              lut.SampleLevel(CloudWrap, float3(xz / (CLOUD_PERIOD / 11.0), 0.13), 0).r) - 0.5;
-        float2 fineXZ = xz + warp * 3000.0;
-        float4 fine = lut.SampleLevel(CloudWrap, (float3(fineXZ.x, h, fineXZ.y) + slide) / (CLOUD_PERIOD / 72.0), 0);
-        shapeNoise = lerp(0.6 * fine + 0.4 * n, n, rough);
+        col.fineXZ = xz + warp * 3000.0;
     }
 
-    float cover = CloudCoverageAt(C, lut, xz);
+    col.cover = CloudCoverageAt(C, lut, xz);
     // A rough base dips by up to CLOUD_BASE_DIP in broad swells (~5 km), the Perlin FBM sliding with the clouds
-    float dip = CLOUD_BASE_DIP * CloudBaseRough(C)
-              * saturate((lut.SampleLevel(CloudWrap, float3(xz.x + slide.x, 0.37, xz.y + slide.z) / (CLOUD_PERIOD / 50.0), 0).r - 0.35) / 0.3);
-    // Turrets: the Perlin-Worley at a 2.1 km tile (CLOUD_PERIOD / 120), for the towers' bulges
-    float turret = lut.SampleLevel(CloudWrap, (float3(xz.x, h, xz.y) + slide) / (CLOUD_PERIOD / 120.0), 0).a - 0.4;
+    float dip = 0.0;
+    if (col.rough > 0.0)
+        dip = CLOUD_BASE_DIP * col.rough
+            * saturate((lut.SampleLevel(CloudWrap, float3(xz.x + slide.x, 0.37, xz.y + slide.z) / (CLOUD_PERIOD / 50.0), 0).r - 0.35) / 0.3);
     // Fair weather: the base swells ±150 m over a few km (neighbouring clouds at their own heights), and fades in over
     // ~350 m so the shape noise lowers each underside in broad lumps (every base at one height, dead flat, read as cut
     // off; user)
-    float fair = 1.0 - CloudDeckness(C);
-    float swell = fair > 0.0
-        ? (lut.SampleLevel(CloudWrap, float3(xz / (CLOUD_PERIOD / 60.0), 0.71), 0).r - 0.5) * 300.0 * fair : 0.0;
+    col.fair = 1.0 - CloudDeckness(C);
+    float swell = col.fair > 0.0
+        ? (lut.SampleLevel(CloudWrap, float3(xz / (CLOUD_PERIOD / 60.0), 0.71), 0).r - 0.5) * 300.0 * col.fair : 0.0;
     swell = max(swell, C.SlabBottom + 20.0 - C.Base);       // the slab has room below the base only for towers' bases
-    float bottom = C.Base + swell - dip;
-    float layer = cover * CloudLayerProfile((h - bottom) / max(C.Thickness + dip - swell, 1.0), C.Type);
-    layer *= lerp(1.0, smoothstep(0.0, 350.0, h - bottom), fair);
+    col.bottom = C.Base + swell - dip;
+    col.depth = max(C.Thickness + dip - swell, 1.0);
+    col.towers = CloudTowersReach(C, xz);
     // Mammatus pouches: the Worley FBM's blobs (high at the cells' centres) at a ~1.4 km tile, flat in height
     // (a mip down: the Worley cells' creases blurred, so each pouch is a smooth dome)
-    float pouch = saturate((lut.SampleLevel(CloudWrap, float3(xz.x + slide.x, 0.0, xz.y + slide.z) / (CLOUD_PERIOD / 180.0), 1.5).g - 0.5) / 0.35);
-    float2 towers = CloudTowers(C, xz, h, turret, n.a - 0.45, pouch);
+    col.pouch = 0.0;
+    if (col.towers)
+        col.pouch = saturate((lut.SampleLevel(CloudWrap, float3(xz.x + slide.x, 0.0, xz.y + slide.z) / (CLOUD_PERIOD / 180.0), 1.5).g - 0.5) / 0.35);
+    return col;
+}
+
+// C: as CloudColumnAt left it
+float2 CloudFieldInColumn(CloudParams C, CloudColumn col, Texture3D<float4> lut, float2 xz, float h, float3 slide)
+{
+    float layer = col.cover * CloudLayerProfile((h - col.bottom) / col.depth, C.Type);
+    layer *= lerp(1.0, smoothstep(0.0, 350.0, h - col.bottom), col.fair);
+    // Clear sky with no tower in reach: nothing more to read
+    if (!col.towers && layer <= 0.002)
+        return 0;
+
+    float4 n = lut.SampleLevel(CloudWrap, (float3(xz.x, h, xz.y) + slide) / CLOUD_BASE_TILE, 0);
+    float2 towers = 0.0;
+    if (col.towers)
+    {
+        // Turrets: the Perlin-Worley at a 2.1 km tile (CLOUD_PERIOD / 120), for the towers' bulges
+        float turret = lut.SampleLevel(CloudWrap, (float3(xz.x, h, xz.y) + slide) / (CLOUD_PERIOD / 120.0), 0).a - 0.4;
+        towers = CloudTowers(C, xz, h, turret, n.a - 0.45, col.pouch);
+    }
     float env = max(layer, max(towers.x, towers.y));
     if (env <= 0.002)
         return 0;
 
+    float4 shapeNoise = n;
+    if (col.rough < 1.0)
+    {
+        float4 fine = lut.SampleLevel(CloudWrap, (float3(col.fineXZ.x, h, col.fineXZ.y) + slide) / (CLOUD_PERIOD / 72.0), 0);
+        shapeNoise = lerp(0.6 * fine + 0.4 * n, n, col.rough);
+    }
     float fbm = shapeNoise.g * 0.75 + shapeNoise.b * 0.25;
     float shape = saturate(CloudRemap(shapeNoise.a, fbm - 1.0, 1.0, 0.0, 1.0));
     // The LUT's shape sits in a narrow band (~0.45-0.8): spread over 0..1, so coverage thins the clouds gradually
@@ -309,7 +377,9 @@ float2 CloudFieldAt(CloudParams C, float2 xz, float h)
 
 groupshared uint BrickMaxShared;
 
-[numthreads(8, 8, 8)]
+// A group a brick, a thread a column of its 8 × 8: the column's part of the field once (CloudColumnAt), then its
+// CLOUD_BRICK voxels in height; id.z is the brick's layer
+[numthreads(8, 8, 1)]
 void CSCloudBake(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 {
     if (gi == 0)
@@ -320,20 +390,29 @@ void CSCloudBake(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
     CloudLevel L = C.Levels[BakeLevel];
     int2 texel = int2(asint(RegionX0Bits), asint(RegionZ0Bits)) + int2(id.xy);
     float2 xz = (float2(texel) + 0.5) * L.VoxelSize;
-    float h = C.SlabBottom + (id.z + 0.5) / L.Layers * (C.SlabTop - C.SlabBottom);
-    float2 field = CloudFieldAt(C, xz, h);
+    Texture3D<float4> lut = ResourceDescriptorHeap[C.NoiseLut];
+    float3 slide = float3(0.7, 0.3, 0.4) * (C.Evolution * 3.0);         // the noise slides through the shapes
+    CloudColumn col = CloudColumnAt(C, lut, xz, slide);
 
-    int3 wrapped = int3(((texel % CLOUD_TEXELS) + CLOUD_TEXELS) % CLOUD_TEXELS, id.z);
+    int2 wrapped = ((texel % CLOUD_TEXELS) + CLOUD_TEXELS) % CLOUD_TEXELS;
     RWTexture3D<float2> density = ResourceDescriptorHeap[DensityUAVIdx];
-    density[wrapped] = field;
-    // A brick holds cloud where the field comes within the billows' reach of the surface
-    InterlockedMax(BrickMaxShared, (uint)(saturate(field.x - (0.5 - CLOUD_BILLOW)) * 255.0 + 0.999));
+    uint most = 0;
+    [loop] for (uint k = 0; k < CLOUD_BRICK; k++)
+    {
+        uint z = id.z * CLOUD_BRICK + k;
+        float h = C.SlabBottom + (z + 0.5) / L.Layers * (C.SlabTop - C.SlabBottom);
+        float2 field = CloudFieldInColumn(C, col, lut, xz, h, slide);
+        density[int3(wrapped, z)] = field;
+        // A brick holds cloud where the field comes within the billows' reach of the surface
+        most = max(most, (uint)(saturate(field.x - (0.5 - CLOUD_BILLOW)) * 255.0 + 0.999));
+    }
+    InterlockedMax(BrickMaxShared, most);
     GroupMemoryBarrierWithGroupSync();
 
     if (gi == 0)
     {
         RWTexture3D<float> bricks = ResourceDescriptorHeap[BrickUAVIdx];
-        bricks[wrapped / CLOUD_BRICK] = BrickMaxShared / 255.0;
+        bricks[int3(wrapped / CLOUD_BRICK, id.z)] = BrickMaxShared / 255.0;
     }
 }
 
@@ -672,8 +751,12 @@ void CSCloudShadowMap(uint3 id : SV_DispatchThreadID)
             rest = lerp(rest, CloudLightDepthAt(C, level + 1, xz, h, CloudWrap), blend);
         tau += rest;
     }
-    RWTexture2D<float> target = ResourceDescriptorHeap[TargetUAVIdx];
-    target[phys] = tau;
+    // With τ what it lets through, worked out here once a texel (sky_common.fx CloudShadowMapDisc filters these shares,
+    // not τ): the beam and the forward share from τ clamped to CLOUD_SHADOW_MARCH_TAU (both are gone past it, and past
+    // it τ jumps from texel to texel), CloudThrough from the τ itself
+    float tauClamped = min(tau, CLOUD_SHADOW_MARCH_TAU);
+    RWTexture2D<float4> target = ResourceDescriptorHeap[TargetUAVIdx];
+    target[phys] = float4(tau, exp(-tauClamped), CloudThrough(tau), CloudForwardAt(tauClamped));
 }
 
 // Schneider's in-scatter probability (Nubis 2017): light gets scattered toward the eye only where it has had some cloud

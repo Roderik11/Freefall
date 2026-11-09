@@ -73,9 +73,11 @@ struct CloudParams
     float FlashIntensity;   // a lightning flash's luminous intensity now (cd; 0 = none)
     float3 FlashPos;        // where it is, camera-relative (m)
     float FlashSpread;      // the extinction (per m) its light diffuses through, the cloud's mean round it
-    uint ShadowMap;         // Texture2D<float> (R16F) CLOUD_SHADOW_TEXELS²: the optical depth toward the light from where a
-                            // ray toward it crosses the slab's bottom (the ground shadow map, clouds_cs.hlsl
-                            // CSCloudShadowMap), toroidal in cloud space; always a real texture
+    uint ShadowMap;         // Texture2D<float4> (RGBA16F) CLOUD_SHADOW_TEXELS²: r the optical depth toward the light from
+                            // where a ray toward it crosses the slab's bottom (the ground shadow map, clouds_cs.hlsl
+                            // CSCloudShadowMap), gba what that depth lets through (the beam, all of it, the forward
+                            // share: sky_common.fx CloudShadowMapDisc filters those); toroidal in cloud space; always a
+                            // real texture
     float ShadowTexel;      // metres a texel spans (0 = not made yet)
     float2 ShadowCentre;    // cloud-space xz the map's window is centred on (where the camera's ray toward the light
                             // crosses the slab's bottom, snapped to texels)
@@ -307,8 +309,10 @@ float2 CloudWrapDelta(float2 d)
 // map instead, handing over to the light volume over CLOUD_SHADOW_MARGIN at its edge: a low light crosses the slab
 // kilometres away, where the light volume's texels are 0.25-1 km, and its shadows came out as blocks that flipped as its
 // levels followed the camera (the moon's glint on the sea cut by squares; user, 2026-10-20).
-// mapAt: where the map was read (its uv), how far the crossing is (m) and the map's share there (0 = not read).
-float CloudShadowDepthAt(CloudParams C, float3 rel, float3 toLight, SamplerState wrap, out float4 mapAt)
+// mapAt: where the map is read (its uv), how far the crossing is (m) and the map's share there (0 = not in its window).
+// needTau false: a caller that filters the map itself where its share is 1 (sky_common.fx CloudTransmissionForward);
+// 0 comes back there and the map is not read here.
+float CloudShadowDepthAt(CloudParams C, float3 rel, float3 toLight, SamplerState wrap, bool needTau, out float4 mapAt)
 {
     mapAt = 0.0;
     if (dot(toLight, C.LightDir) < 0.99)
@@ -329,12 +333,17 @@ float CloudShadowDepthAt(CloudParams C, float3 rel, float3 toLight, SamplerState
             float halfSize = 0.5 * CLOUD_SHADOW_TEXELS * C.ShadowTexel;
             mapShare = saturate((halfSize - CLOUD_SHADOW_MARGIN - max(abs(fromCentre.x), abs(fromCentre.y)))
                                 / CLOUD_SHADOW_MARGIN);
-            Texture2D<float> map = ResourceDescriptorHeap[C.ShadowMap];
             float2 uv = xzc / (CLOUD_SHADOW_TEXELS * C.ShadowTexel);
-            mapTau = map.SampleLevel(wrap, uv, 0);
             mapAt = float4(uv, s, mapShare);
-            if (mapShare >= 1.0)
-                return mapTau;
+            if (mapShare >= 1.0 && !needTau)
+                return 0.0;
+            if (mapShare > 0.0)
+            {
+                Texture2D<float4> map = ResourceDescriptorHeap[C.ShadowMap];
+                mapTau = map.SampleLevel(wrap, uv, 0).r;
+                if (mapShare >= 1.0)
+                    return mapTau;
+            }
         }
     }
     float dist = max(abs(q.x), abs(q.z));
@@ -356,7 +365,7 @@ float CloudShadowDepthAt(CloudParams C, float3 rel, float3 toLight, SamplerState
 float CloudShadowDepth(CloudParams C, float3 rel, float3 toLight, SamplerState wrap)
 {
     float4 mapAt;
-    return CloudShadowDepthAt(C, rel, toLight, wrap, mapAt);
+    return CloudShadowDepthAt(C, rel, toLight, wrap, true, mapAt);
 }
 
 // Optical depth straight up (x) and down (y) from a place (camera-relative), from the sky volume of the level its

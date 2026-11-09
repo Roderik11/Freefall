@@ -255,8 +255,9 @@ namespace Freefall.Graphics
                 _regions[i] = GraphicsBuffer.CreateUpload<GpuRegion>(MaxRegions, mapped: true);
             }
 
-            // Optical depths, half floats as the light volumes
-            _shadowMap = new RenderTexture2D(device, ShadowMapTexels, ShadowMapTexels, Format.R16_Float, randomWrite: true);
+            // The optical depth (half floats as the light volumes) and what it lets through: the beam, all of it, the
+            // forward share (CSCloudShadowMap), which the readers filter as they are
+            _shadowMap = new RenderTexture2D(device, ShadowMapTexels, ShadowMapTexels, Format.R16G16B16A16_Float, randomWrite: true);
 
             // The probe's clouds: pre-exposed light and a transmittance, as the probe holds light
             const Format probeFormat = Format.R16G16B16A16_Float;

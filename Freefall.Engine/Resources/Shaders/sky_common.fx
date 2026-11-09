@@ -437,40 +437,34 @@ float CloudForwardAt(float tau)
          * (1.0 - smoothstep(CLOUD_SHADOW_MARCH_TAU * 0.5, CLOUD_SHADOW_MARCH_TAU, tau));
 }
 
-// One bilinear tap of the ground shadow map (clouds_cs.hlsl CSCloudShadowMap) as CloudTransmissionForward's shares, the
-// beam and the forward share from each texel's τ clamped to CLOUD_SHADOW_MARCH_TAU before the filter (both are gone past
-// it), CloudThrough from the τ itself. A texel whose march gets past that τ takes the light volume's rest on top, so as
-// the clouds change shape it flips between ~12 and 12 + tens; filtered as τ, the flip reached across into the texels
-// round it, down into the τ the forward light shows, and drew blotches of 30-60 m that popped (user, 2026-10-22).
-float3 CloudShadowMapTap(Texture2D<float> map, SamplerState wrapSampler, float2 uv)
-{
-    float2 p = uv * CLOUD_SHADOW_TEXELS - 0.5;
-    float2 f = frac(p);
-    float4 g = map.GatherRed(wrapSampler, (floor(p) + 1.0) / CLOUD_SHADOW_TEXELS);    // x (0,1) y (1,1) z (1,0) w (0,0)
-    float4 c = min(g, CLOUD_SHADOW_MARCH_TAU);
-    float tauClamped = lerp(lerp(c.w, c.z, f.x), lerp(c.x, c.y, f.x), f.y);
-    float tau = lerp(lerp(g.w, g.z, f.x), lerp(g.x, g.y, f.x), f.y);
-    return float3(exp(-tauClamped), CloudThrough(tau), CloudForwardAt(tauClamped));
-}
-
-// The ground shadow map seen through the light's disc (CloudShadowMapTap's shares): the disc's edge crosses the slab
-// radiusTexels off the middle (the penumbra: 125 m, four texels, for a cloud 27 km toward a sun 4° up), so the means over
-// it from 13 taps of a Vogel spiral. One tap of τ, which runs 0 → 30 within a few of the map's 31 m texels at a cloud's
-// edge, drew the edges as stairs of texels, and they rippled as the clouds moved (user, 2026-10-22).
+// The ground shadow map seen through the light's disc, as CloudTransmissionForward's shares: the disc's edge crosses the
+// slab radiusTexels off the middle (the penumbra: 125 m, four texels, for a cloud 27 km toward a sun 4° up), so the means
+// over it from the taps of a Vogel spiral. One tap of τ, which runs 0 → 30 within a few of the map's 31 m texels at a
+// cloud's edge, drew the edges as stairs of texels, and they rippled as the clouds moved (user, 2026-10-22).
+// The map holds the shares beside τ (gba; clouds_cs.hlsl CSCloudShadowMap works them out once a texel), so a tap is one
+// bilinear read of them: the beam and the forward share from each texel's τ clamped to CLOUD_SHADOW_MARCH_TAU (both are
+// gone past it), CloudThrough from the τ itself. A texel whose march gets past that τ takes the light volume's rest on
+// top, so as the clouds change shape it flips between ~12 and 12 + tens; filtered as τ, the flip reached across into the
+// texels round it, down into the τ the forward light shows, and drew blotches of 30-60 m that popped (user, 2026-10-22).
+// (Until 2026-11-09 each tap gathered four τ, filtered them and took three exp per tap, 13 taps whatever the radius:
+// per lit pixel, froxel and aerial perspective sample.)
+// As many taps as the disc has texels to tell apart: 4 round the middle under a texel's radius, 8 under two, 12 above.
 #define CLOUD_LIGHT_DISC 0.00465    // rad: the sun's (and the moon's) angular radius
 float3 CloudShadowMapDisc(CloudParams C, SamplerState wrapSampler, float2 uv, float radiusTexels)
 {
-    Texture2D<float> map = ResourceDescriptorHeap[C.ShadowMap];
-    float3 t = CloudShadowMapTap(map, wrapSampler, uv);
+    Texture2D<float4> map = ResourceDescriptorHeap[C.ShadowMap];
+    float3 t = map.SampleLevel(wrapSampler, uv, 0).gba;
     if (radiusTexels < 0.35)
         return t;
     float r = radiusTexels / CLOUD_SHADOW_TEXELS;
+    int taps = radiusTexels < 1.0 ? 4 : (radiusTexels < 2.0 ? 8 : 12);
     [unroll] for (int i = 0; i < 12; i++)
     {
         float a = i * 2.3999632;            // the golden angle
-        t += CloudShadowMapTap(map, wrapSampler, uv + sqrt((i + 0.5) / 12.0) * r * float2(cos(a), sin(a)));
+        if (i < taps)
+            t += map.SampleLevel(wrapSampler, uv + sqrt((i + 0.5) / taps) * r * float2(cos(a), sin(a)), 0).gba;
     }
-    return t / 13.0;
+    return t / (taps + 1.0);
 }
 
 // Of what the clouds let through beyond their beam (t: CloudTransmission), the share that goes on forward
@@ -499,7 +493,7 @@ float3 CloudTransmissionForward(SamplerState wrapSampler, float3 relPos, float3 
             return float3(t, CloudForwardShare(t));
         }
         float4 mapAt;
-        float tau = CloudShadowDepthAt(C, relPos, toLight, wrapSampler, mapAt);
+        float tau = CloudShadowDepthAt(C, relPos, toLight, wrapSampler, false, mapAt);
         if (mapAt.w >= 1.0)
             return CloudShadowMapDisc(C, wrapSampler, mapAt.xy, mapAt.z * CLOUD_LIGHT_DISC / C.ShadowTexel);
         return float3(exp(-tau), CloudThrough(tau), CloudForwardAt(tau));
