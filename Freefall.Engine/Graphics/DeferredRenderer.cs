@@ -97,8 +97,27 @@ namespace Freefall.Graphics
         /// <summary>SMAA 1x anti-aliasing (Jimenez et al. 2012).</summary>
         public SMAA? Smaa { get; private set; }
 
-        /// <summary>Sparse 3D Radiance Cascades (world-space GI).</summary>
+        /// <summary>Sparse 3D Radiance Cascades (world-space GI, experimental). Null while
+        /// EngineSettings.EnableRadianceCascades is off: they took ~200 MiB a renderer, allocated whether on or not.</summary>
         public RadianceCascades? RadianceCascades { get; private set; }
+
+        // Radiance cascades exist only while the setting is on: made when it turns on (at the light buffer's size, as
+        // Initialize made them), let go when it turns off, their buffers disposed once the frames in flight are done
+        private void SyncRadianceCascades()
+        {
+            bool on = Engine.Settings.EnableRadianceCascades;
+            if (on && RadianceCascades == null && LightBuffer?.Native is { } light)
+            {
+                var desc = light.Description;
+                RadianceCascades = new RadianceCascades();
+                RadianceCascades.Initialize((int)desc.Width, (int)desc.Height);
+            }
+            else if (!on && RadianceCascades != null)
+            {
+                Engine.Device.DeferDispose(RadianceCascades);
+                RadianceCascades = null;
+            }
+        }
 
         /// <summary>HDR Bloom (COD-style dual-filter pyramid).</summary>
         public BloomPyramid? BloomPyramid { get; private set; }
@@ -253,9 +272,7 @@ namespace Freefall.Graphics
             // Screen-space displacement
             ScreenSpaceDisplacement = new ScreenSpaceDisplacement();
 
-            // Radiance Cascades GI
-            RadianceCascades = new RadianceCascades();
-            RadianceCascades.Initialize(width, height);
+            // Radiance Cascades GI: made only while EngineSettings.EnableRadianceCascades is on (SyncRadianceCascades)
 
             // SMAA anti-aliasing
             Smaa = new SMAA();
@@ -930,6 +947,7 @@ namespace Freefall.Graphics
 
              // Radiance Cascades GI — runs while LightBuffer is still in SRV state
              // so it can read last frame's lighting for bounce radiance estimation.
+             SyncRadianceCascades();
              if (RadianceCascades != null && Engine.Settings.EnableRadianceCascades)
              {
                  RadianceCascades.Execute(list, camera, this);
