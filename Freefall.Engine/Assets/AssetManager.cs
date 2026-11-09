@@ -392,7 +392,7 @@ namespace Freefall.Assets
 
             // Fast path: already cached
             if (_assets.TryGetValue(cacheKey, out var cached))
-                return (T)cached;
+                return (T)PinIfCold(cached);
 
             var assetType = typeof(T);
 
@@ -402,7 +402,7 @@ namespace Freefall.Assets
             {
                 // Double-check after acquiring lock
                 if (_assets.TryGetValue(cacheKey, out var cached2))
-                    return (T)cached2;
+                    return (T)PinIfCold(cached2);
 
                 T asset = null;
 
@@ -451,6 +451,18 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// A material texture loaded cold (Texture.MaterialCold) that something other than a material's loader asks for (the
+        /// UI, a terrain layer, a decal's own texture, a script): resident for good from now on, read at once if it is not
+        /// there yet, since such users read its bindless index or resource right away. Material loads keep it cold.
+        /// </summary>
+        private static Asset PinIfCold(Asset asset)
+        {
+            if (asset is Texture { MaterialCold: true } texture && !Freefall.Assets.Loaders.TextureLoader.ForMaterial)
+                texture.Pin();
+            return asset;
+        }
+
+        /// <summary>
         /// Load an asset by GUID. Used by loaders to resolve cross-asset references.
         /// </summary>
         public T LoadByGuid<T>(string guid) where T : Asset
@@ -463,7 +475,7 @@ namespace Freefall.Assets
             if (_assets.TryGetValue(cacheKey, out var cached))
             {
                 if (cached is T hit)
-                    return hit;
+                    return (T)PinIfCold(hit);
                 // Same type NAME, different type: an asset class defined in project scripts, loaded before a
                 // script hot reload. The old instance belongs to the unloaded assembly — load it again.
                 _assets.TryRemove(cacheKey, out _);

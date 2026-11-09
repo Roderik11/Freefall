@@ -64,6 +64,20 @@ namespace Freefall.Assets
             return File.OpenRead(cachePath);
         }
 
+        /// <summary>The artifact's size in bytes (the mounted packs' entry, else the file's), or -1 when there is none.</summary>
+        public static long Length(string cachePath)
+        {
+            if (string.IsNullOrEmpty(cachePath)) return -1;
+            var packs = _packs;
+            if (packs != null && packs.TryGet(GuidOf(cachePath), out var entry)) return entry.Length;
+            try
+            {
+                var file = new FileInfo(cachePath);
+                return file.Exists ? file.Length : -1;
+            }
+            catch { return -1; }
+        }
+
         public static bool Exists(string cachePath)
         {
             if (string.IsNullOrEmpty(cachePath)) return false;

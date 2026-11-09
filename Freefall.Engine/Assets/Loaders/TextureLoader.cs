@@ -28,9 +28,32 @@ namespace Freefall.Assets.Loaders
             if (IsOnDemand(sourceGuid))
                 return Texture.OnDemandFrom(cachePath, name);
 
+            // A material's texture of some size loads cold: its copy is made while something draws with the material
+            // (Material.OnDemand.cs). Nothing is read now; any other load of it later makes it resident (AssetManager, Pin)
+            if (t_forMaterial && OnDemandTextures.MaterialTexturesOnDemand
+                && Artifacts.Length(cachePath) >= OnDemandTextures.ColdMinBytes)
+                return Texture.ColdFrom(cachePath, name);
+
             var texture = Texture.CreateAsync(Engine.Device, ReadCpuData(cachePath, name));
             texture.Name = name;
             return texture;
+        }
+
+        [System.ThreadStatic] private static bool t_forMaterial;
+
+        /// <summary>Whether the calling thread is resolving a material's texture (<see cref="LoadForMaterial"/>).</summary>
+        internal static bool ForMaterial => t_forMaterial;
+
+        /// <summary>
+        /// A material's texture by GUID (MaterialLoader): loaded cold when it is not loaded yet and its cache file is at
+        /// least <see cref="OnDemandTextures.ColdMinBytes"/>; the instance already loaded otherwise, cold or not.
+        /// </summary>
+        public static Texture LoadForMaterial(AssetManager manager, string guid)
+        {
+            bool was = t_forMaterial;
+            t_forMaterial = true;
+            try { return manager.LoadByGuid<Texture>(guid); }
+            finally { t_forMaterial = was; }
         }
 
         /// <summary>The texture's pixels from its cache file, parsed. Any thread.</summary>

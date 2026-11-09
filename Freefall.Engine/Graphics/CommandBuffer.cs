@@ -66,6 +66,10 @@ namespace Freefall.Graphics
     {
         // One handle per (draw, render pass). Touched only on the main thread (CommandBuffer.FlushPersistent).
         internal readonly List<InstanceBatch.InstanceHandle> Handles = new();
+
+        // The material of every draw added, held (Material.Acquire) from AddPersistent to RemovePersistent: a material's
+        // on-demand textures are on the GPU while a persistent draw uses it. Locked on itself (adds come from parallel draws).
+        internal readonly List<Material> Held = new();
     }
 
     /// <summary>
@@ -702,6 +706,7 @@ namespace Freefall.Graphics
             int instanceCount,
             ReadOnlySpan<InstanceBatch.GPUBufferBinding> customBindings = default)
         {
+            material.Touch();
             var key = new BatchKey(material.Effect);
             var pass = current.passes[(int)RenderPass.Opaque];
 
@@ -716,6 +721,7 @@ namespace Freefall.Graphics
         /// <param name="lodManaged">See <see cref="DrawCall.LodManaged"/>.</param>
         public static void Enqueue(Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot = -1, uint boneBufferIdx = 0, bool lodManaged = false)
         {
+            material.Touch();   // drawn this frame: its on-demand textures stay held while it keeps being drawn
             var key = new BatchKey(material.Effect);
             var drawCall = new DrawCall 
             {
@@ -777,6 +783,11 @@ namespace Freefall.Graphics
                 }
             };
 
+            // Held from now on: its on-demand textures load and are bound as they arrive (Material.OnDemand.cs)
+            material.Acquire();
+            lock (group.Held)
+                group.Held.Add(material);
+
             lock (_persistentLock)
                 _persistentOps.Add(op);
         }
@@ -786,6 +797,15 @@ namespace Freefall.Graphics
         /// </summary>
         public static void RemovePersistent(DrawGroup group)
         {
+            // Let go of its materials now. A material nobody else holds binds its fallbacks at once, so the draw's last
+            // frame (the removal applies at the next pass execution) never reads a copy that may go
+            lock (group.Held)
+            {
+                foreach (var material in group.Held)
+                    material.Release();
+                group.Held.Clear();
+            }
+
             lock (_persistentLock)
                 _persistentOps.Add(new PersistentOp { Group = group, Add = false });
         }

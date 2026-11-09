@@ -73,6 +73,12 @@ namespace Freefall.Assets
         public static Texture Gray { get; private set; }
         public static Texture FlatNormal { get; private set; }
 
+        /// <summary>
+        /// What a material's albedo binds while its texture's copy is on its way (Texture.OnDemand): dark grey (0.2 linear)
+        /// with no alpha, so an opaque surface shows grey and an alpha-tested one (people, leaves) nothing yet.
+        /// </summary>
+        public static Texture Pending { get; private set; }
+
         public static Texture BlackArray { get; private set; }
         public static Texture WhiteArray { get; private set; }
         public static Texture FlatNormalArray { get; private set; }
@@ -181,6 +187,15 @@ namespace Freefall.Assets
             }
             FlatNormal = Texture.CreateFromData(device, 4, 4, normal, Format.R8G8B8A8_UNorm);
             FlatNormal.Name = "FlatNormal";
+
+            // Pending: a material texture's stand-in until its copy arrives (Material.OnDemand.cs)
+            byte[] pending = new byte[4 * 4 * 4];
+            for (int i = 0; i < pending.Length; i += 4)
+            {
+                pending[i] = 51; pending[i + 1] = 51; pending[i + 2] = 51; pending[i + 3] = 0;
+            }
+            Pending = Texture.CreateFromData(device, 4, 4, pending, Format.R8G8B8A8_UNorm);
+            Pending.Name = "Pending";
 
             // Arrays
             WhiteArray = Texture.CreateTexture2DArray(device, new[] { White });

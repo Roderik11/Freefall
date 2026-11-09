@@ -108,7 +108,7 @@ namespace Freefall.Assets.Loaders
             // Resolve and bind textures
             foreach (var (slot, texRef) in def.TextureRefs)
             {
-                var texture = manager.LoadByGuid<Texture>(texRef);
+                var texture = TextureLoader.LoadForMaterial(manager, texRef);   // cold: on the GPU while drawn
                 if (texture != null)
                     material.SetTexture(slot, texture);
                 else

@@ -490,6 +490,9 @@ namespace Freefall.Components
             if (device != null) _holePool.Dispose();
 
             // ── Decorator buffers ──
+            foreach (var material in _heldDecoMaterials)
+                material.Release();
+            _heldDecoMaterials.Clear();
             device?.DeferDispose(_decoratorHeadersBuffer);
             device?.DeferDispose(_decoratorSlotsBuffer);
             device?.DeferDispose(_decoratorLODTableBuffer);
@@ -2655,6 +2658,8 @@ namespace Freefall.Components
             var lodTable = new List<LODTableEntry>();
             float maxReach = 0;
             bool hasBlades = false, hasPlants = false;
+            var heldBefore = _heldDecoMaterials;
+            _heldDecoMaterials = new List<Material>();
 
             foreach (var decorator in _decoratorPalette)
             {
@@ -2675,6 +2680,12 @@ namespace Freefall.Components
                     {
                         var mesh = variant.Mesh!;
                         uint meshMatId = (uint)(variant.Material?.MaterialID ?? 0);
+                        if (variant.Material != null)
+                        {
+                            // The decorations read its MaterialData by ID: held while it is in the palette
+                            variant.Material.Acquire();
+                            _heldDecoMaterials.Add(variant.Material);
+                        }
 
                         // Determine LOD0 part indices
                         int[] lod0Indices;
@@ -2854,8 +2865,16 @@ namespace Freefall.Components
                 _decoratorTintBuffer = GraphicsBuffer.CreateStructured(tintCount, 16, srv: true, uav: true);
             }
             _bladeColorsDirty = true;
+
+            // The palette's materials held anew above, the ones held before let go of now (one in both stays held)
+            foreach (var material in heldBefore)
+                material.Release();
+
             DecoratorsRebuilt?.Invoke(this);
         }
+
+        // The mesh decorations' materials (Material.Acquire): their on-demand textures on the GPU while in the palette
+        private List<Material> _heldDecoMaterials = new();
 
         /// <summary>One procedural decorator pipeline over the procedural instance buffer (grass_procedural.hlsli).</summary>
         private void DrawProcedural(ID3D12GraphicsCommandList6 commandList, RenderPass pass, Material? material, string marker)

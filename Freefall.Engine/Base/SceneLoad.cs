@@ -28,6 +28,9 @@ namespace Freefall.Base
         private static readonly float[] Weights = { 0.10f, 0.10f, 0.35f, 0.03f, 0.35f, 0.04f, 0.03f };
         private const int TerrainWaitFrames = 300;
         private const int FinishFrames = 2;
+        private const double TextureWaitSeconds = 15;   // the most Finishing waits for the textures the first frames draw with
+        private int _textureFrames, _texturesAtStart = -1;
+        private long _textureWaitStart;
 
         public SceneAsset? Scene { get; }
         public string Name { get; }
@@ -208,7 +211,7 @@ namespace Freefall.Base
             Step.Generating => Fraction(_ranTotal, PCGScheduler.PendingCount),
             Step.Waiting => Fraction(_waits.FindAll(w => w.Task.IsCompleted).Count + _workDone.Count,
                                      _waits.FindAll(w => !w.Task.IsCompleted).Count + _work.Count),
-            Step.Finishing => (float)_finishFrames / FinishFrames,
+            Step.Finishing => Math.Min(1f, (float)_finishFrames / FinishFrames),
             _ => 1f,
         };
 
@@ -405,7 +408,25 @@ namespace Freefall.Base
                     // A frame or two with everything in place, before the world counts as ready (the first draws of new
                     // content create pipelines and upload buffers)
                     Activity = "Finishing";
-                    return ++_finishFrames > FinishFrames;
+                    if (++_finishFrames <= FinishFrames) return false;
+
+                    // Then the textures those frames drew with (Texture.OnDemand: held as renderers registered, read on
+                    // workers): the world shows with them, not with their fallbacks
+                    int pending = Graphics.OnDemandTextures.Pending;
+                    if (pending == 0) return true;
+                    if (_texturesAtStart < 0)
+                    {
+                        _texturesAtStart = pending;
+                        _textureWaitStart = Stopwatch.GetTimestamp();
+                    }
+                    if (Stopwatch.GetElapsedTime(_textureWaitStart).TotalSeconds > TextureWaitSeconds)
+                    {
+                        Debug.LogWarning("SceneLoad", $"'{Name}': {pending} textures still on their way after {TextureWaitSeconds:F0} s; going on without them");
+                        return true;
+                    }
+                    _textureFrames++;
+                    Activity = $"Textures ({pending} on their way)";
+                    return false;
             }
             return true;
         }
@@ -448,6 +469,8 @@ namespace Freefall.Base
             for (int i = 0; i < _stepMs.Length; i++)
                 text.Append($" {(Step)i} {_stepMs[i]:F0}/{_stepEndS[i]:F1}");
             text.Append($"); {_slices} slices, longest {_longestSliceMs:F0} ms; PCG {_ranTotal} runs");
+            if (_texturesAtStart > 0)
+                text.Append($"; {_texturesAtStart} textures waited for over {_textureFrames} frames ({Stopwatch.GetElapsedTime(_textureWaitStart).TotalSeconds:F1} s)");
             _work.Clear();   // a script's work is not kept (the last load stays referenced: SceneManager.LastLoad)
             var waited = _waits.ConvertAll(w => w.What);
             waited.AddRange(_workDone);

@@ -59,6 +59,7 @@ namespace Freefall.Graphics
         private int[]? _ringTransforms;         // the ring's own transform slots, taken at the first spawn
         private int _ringNext;
         private double _ringLiveUntil = double.NegativeInfinity;   // Time.TotalTime the last spawned one has faded by
+        private readonly HashSet<Material> _ringMaterials = new(); // held while the ring has used them (until it starts over)
 
         /// <summary>Registry slots handed out so far (the ring's and the placed decals'): the cull walks this many.</summary>
         public int SlotCount => _nextSlot;
@@ -102,6 +103,9 @@ namespace Freefall.Graphics
                     _records.Set(i, default); // disabled
                 _ringNext = 0;
                 _ringLiveUntil = double.NegativeInfinity;
+                foreach (var material in _ringMaterials)
+                    material.Release();
+                _ringMaterials.Clear();
             }
         }
 
@@ -150,6 +154,16 @@ namespace Freefall.Graphics
                 decal.GpuSlot = -1;
                 _placed--;
             }
+            Hold(decal, null);
+        }
+
+        // A placed decal holds the material it is drawn with (its on-demand textures on the GPU while it shows)
+        private static void Hold(Decal decal, Material? material)
+        {
+            if (decal.HeldMaterial == material) return;
+            material?.Acquire();
+            decal.HeldMaterial?.Release();
+            decal.HeldMaterial = material;
         }
 
         /// <summary>
@@ -170,6 +184,7 @@ namespace Freefall.Graphics
                         _ringTransforms[i] = TransformBuffer.Instance.AllocateSlot();
                 }
                 int slot = _ringNext++ % RingSize;
+                if (_ringMaterials.Add(material)) material.Acquire();   // held until the ring starts over
                 TransformBuffer.Instance.SetTransform(_ringTransforms[slot], box);
                 double now = Base.Time.TotalTime;
                 lifetime = MathF.Max(lifetime, 0.01f);
@@ -200,6 +215,7 @@ namespace Freefall.Graphics
             // Only a material of the decal effect has the settings block the pass reads
             var material = decal.Material;
             bool drawn = decal.Enabled && transformSlot >= 0 && material != null && IsDecalMaterial(material);
+            Hold(decal, drawn ? material : null);
             _records.Set(slot, new Record
             {
                 TransformSlot = (uint)Math.Max(transformSlot, 0),

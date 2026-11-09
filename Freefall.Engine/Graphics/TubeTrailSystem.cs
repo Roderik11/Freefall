@@ -327,6 +327,7 @@ namespace Freefall.Graphics
                 }
                 return;
             }
+            entry.Material.Touch();   // drawn this frame: its on-demand textures stay held while it burns
 
             // Its way, head first: the entity, then its places from the newest, the oldest cut where it runs out
             if (_way.Length < count)

@@ -168,7 +168,12 @@ namespace Freefall.Editor.Commands
         public static Freefall.Assets.Asset FindOrLoadAsset(string guid)
         {
             var asset = Engine.Assets.FindByGuid(guid);
-            if (asset != null) return asset;
+            if (asset != null)
+            {
+                // A material texture loaded cold, handed to whatever field asked: resident for good, as any other load does
+                if (asset is Freefall.Graphics.Texture { MaterialCold: true } cold) cold.Pin();
+                return asset;
+            }
 
             var type = Freefall.Assets.AssetDatabase.GetAssetType(guid);
 

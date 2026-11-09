@@ -461,7 +461,8 @@ namespace Freefall.Editor.Commands
                         applied[kv.Name] = null;
                         continue;
                     }
-                    if (CommandHelpers.FindOrLoadAsset(kv.Value.GetString()) is not Texture tex)
+                    // As the material's loader does: a texture not loaded yet loads cold (on the GPU while drawn)
+                    if (Freefall.Assets.Loaders.TextureLoader.LoadForMaterial(Engine.Assets, kv.Value.GetString()) is not Texture tex)
                         return CommandResult.NotFound($"Texture not found for '{kv.Name}': {kv.Value}");
                     material.SetTexture(kv.Name, tex);
                     applied[kv.Name] = tex.Name;

@@ -28,6 +28,9 @@ namespace Freefall.Components
         /// <summary>Registry slot (DecalBuffer), -1 while not registered.</summary>
         internal int GpuSlot = -1;
 
+        /// <summary>The material DecalBuffer holds for it while it is drawn (Material.Acquire), or null.</summary>
+        internal Material? HeldMaterial;
+
         [System.ComponentModel.Description("The decal's look: a material of the effect \"decal\" (textures, modes, fades, what it lands on)")]
         public Material? Material
         {

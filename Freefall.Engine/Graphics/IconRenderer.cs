@@ -298,8 +298,27 @@ namespace Freefall.Graphics
             if (!Bounds(parts, view.Rotation, out var min, out var max)) return null;
 
             int ss = Math.Clamp(view.Supersample, 1, 8);
+            EnsureTargets(width * ss, height * ss);
+
+            // The parts' materials held and their on-demand textures on the GPU and bound, before the materials buffer goes up
+            var held = new HashSet<Material>();
+            foreach (var part in parts)
+                if (part.Materials != null)
+                    foreach (var material in part.Materials)
+                        if (material != null) held.Add(material);
+            OnDemandTextures.HoldNow(held);
+            try { return RenderHeld(parts, view, width, height, min, max); }
+            finally
+            {
+                foreach (var material in held)
+                    material.Release();
+            }
+        }
+
+        private byte[]? RenderHeld(IReadOnlyList<IconPart> parts, IconView view, int width, int height, Vector3 min, Vector3 max)
+        {
+            int ss = Math.Clamp(view.Supersample, 1, 8);
             int w = width * ss, h = height * ss;
-            EnsureTargets(w, h);
 
             // Orthographic framing: the item's box centred, its larger share of the picture filled up to the margin
             var center = (min + max) * 0.5f;

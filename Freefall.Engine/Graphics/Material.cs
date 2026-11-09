@@ -175,7 +175,7 @@ namespace Freefall.Graphics
     }
 
     [CreateAsset("Material")]
-    public class Material : Asset, IDisposable
+    public partial class Material : Asset, IDisposable
     {
         // Per-pass PSOs (Apex pattern for multi-pass rendering like shadow maps)
         private Dictionary<int, PipelineState> _passPipelineStates = new();
@@ -421,7 +421,7 @@ namespace Freefall.Graphics
                 {
                     _effectTextureSettings[name] = desc;
                     _textures.TryGetValue(name, out var assigned);
-                    WriteSetting(at, (assigned ?? desc.DefaultTextureAsset)?.BindlessIndex ?? 0u);
+                    WriteSetting(at, SettingIndex(desc, assigned));
                     var slot = new TextureEffectParameter { Name = name, Material = this };
                     slot.Value = assigned;    // its setter calls SetTexture, which is fine: the setting is known
                     _effectTextureParameters.Add(slot);
@@ -591,9 +591,13 @@ namespace Freefall.Graphics
             _textureSlots.Clear();
             _bindlessIndices.Clear();
 
-            // Preserve existing textures — they'll be re-bound after init
-            var savedTextures = new Dictionary<string, Texture>(_textures);
-            _textures.Clear();
+            // Preserve existing textures — they'll be re-bound after init (the ones held stay held: SetTexture syncs)
+            Dictionary<string, Texture> savedTextures;
+            lock (OnDemandTextures.Sync)
+            {
+                savedTextures = new Dictionary<string, Texture>(_textures);
+                _textures.Clear();
+            }
 
             InitFromEffect(effect, Freefall.Engine.Device);
             InitEffectProperties();
@@ -601,6 +605,7 @@ namespace Freefall.Graphics
             // Re-apply saved textures
             foreach (var (slot, tex) in savedTextures)
                 SetTexture(slot, tex);
+            lock (OnDemandTextures.Sync) SyncHeldTextures();
 
             EffectChanged?.Invoke(this);
 
@@ -1169,10 +1174,15 @@ namespace Freefall.Graphics
         public void SetTexture(string name, Texture texture)
         {
             if (texture == null) return;
-            _textures[name] = texture;
-            UpdateMaterialData(name, texture.BindlessIndex);
-            if (_effectTextureSettings.TryGetValue(name, out var setting))
-                WriteSetting(setting.Offset, texture.BindlessIndex);
+            // An on-demand texture binds once it is held and arrived, a fallback until then (Material.OnDemand.cs)
+            lock (OnDemandTextures.Sync)
+            {
+                _textures[name] = texture;
+                SyncHeldTextures();
+                UpdateMaterialData(name, SlotIndex(name, texture));
+                if (_effectTextureSettings.TryGetValue(name, out var setting))
+                    WriteSetting(setting.Offset, SettingIndex(setting, texture));
+            }
 
             // Keep TextureEffectParameter in sync (for inspector display)
             foreach (var tp in _textureParameters)
@@ -1190,10 +1200,14 @@ namespace Freefall.Graphics
         /// </summary>
         public void ClearTexture(string name)
         {
-            if (!_textures.Remove(name)) return;
-            UpdateMaterialData(name, 0);
-            if (_effectTextureSettings.TryGetValue(name, out var setting))
-                WriteSetting(setting.Offset, setting.DefaultTextureAsset?.BindlessIndex ?? 0u);
+            lock (OnDemandTextures.Sync)
+            {
+                if (!_textures.Remove(name)) return;
+                SyncHeldTextures();
+                UpdateMaterialData(name, 0);
+                if (_effectTextureSettings.TryGetValue(name, out var setting))
+                    WriteSetting(setting.Offset, setting.DefaultTextureAsset?.BindlessIndex ?? 0u);
+            }
 
             foreach (var tp in _textureParameters)
             {
@@ -1354,6 +1368,9 @@ namespace Freefall.Graphics
             // Apply Material Block Overrides if present
             block?.Apply(this);
 
+            // Drawn by whoever applies it: its on-demand textures are held while it keeps being applied
+            Touch();
+
             // Bind Pipeline - use selected pass's PSO, wireframe variant if enabled
             var pso = _passPipelineStates.TryGetValue(Pass, out var selectedPso) ? selectedPso : _passPipelineStates.GetValueOrDefault(0);
             if (Engine.Settings.Wireframe && !_isFullscreenPass && _passWireframePSOs.TryGetValue(Pass, out var wireframePso))
@@ -1403,7 +1420,7 @@ namespace Freefall.Graphics
                 // Then try textures (set via SetTexture)
                 else if (_textures.TryGetValue(binding.Name, out var tex))
                 {
-                    index = tex.BindlessIndex;
+                    index = SlotIndex(binding.Name, tex);
                 }
                 
                 commandList.SetGraphicsRoot32BitConstant(0, index, (uint)binding.Slot);

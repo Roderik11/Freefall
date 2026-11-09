@@ -313,6 +313,7 @@ namespace Freefall
         private static readonly ProfilerMarker _renderMarker = ProfilerMarker.Get("Render");
         private static readonly ProfilerMarker _cameraMarker = ProfilerMarker.Get("Camera");
         private static readonly ProfilerMarker _queueMarker = ProfilerMarker.Get("Main thread queue");
+        private static readonly ProfilerMarker _onDemandMarker = ProfilerMarker.Get("On-demand textures");
 
         /// <summary>The thread that runs the engine's frame (the one that first called <see cref="Tick"/>).</summary>
         public static int MainThreadId { get; private set; } = -1;
@@ -384,6 +385,10 @@ namespace Freefall
                     throw;
                 }
             }
+
+            // On-demand textures: reads done go up, arrived copies are bound by their materials, idle ones trimmed
+            using (_onDemandMarker.Auto())
+                Graphics.OnDemandTextures.Update();
 
             // --- Process all deferred resizes before rendering ---
             // Must sync GPU first — previous frames may still be using resources
