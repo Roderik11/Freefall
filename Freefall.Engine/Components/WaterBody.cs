@@ -763,22 +763,23 @@ namespace Freefall.Components
                 Array.Reverse(heights);
             }
 
-            if (MathF.Abs(Expand) > 0.001f)
+            // Grown by Expand along the vertex normals, an outline with arms close together folds over itself where they
+            // pass (a neck narrower than twice Expand), and the ear clipping stops there: the lake drew with a fan of
+            // triangles missing (TestWorld's Lake 08 after it was given arms, 2026-11-09: 61 of 66). So the outline is
+            // grown less until it clips whole: half, a quarter, then not at all.
+            var outline = polygon;
+            List<int> triangles = null!;
+            foreach (float share in new[] { 1f, 0.5f, 0.25f, 0f })
             {
-                var grown = new List<Vector2>(samples);
-                for (int i = 0; i < samples; i++)
-                {
-                    var e0 = polygon[i] - polygon[(i - 1 + samples) % samples];
-                    var e1 = polygon[(i + 1) % samples] - polygon[i];
-                    var outward = new Vector2(e0.Y, -e0.X) + new Vector2(e1.Y, -e1.X);
-                    grown.Add(outward.LengthSquared() > 1e-10f
-                        ? polygon[i] + Vector2.Normalize(outward) * Expand
-                        : polygon[i]);
-                }
-                polygon = grown;
+                float grow = Expand * share;
+                if (share < 1f && MathF.Abs(Expand) <= 0.001f) break;
+                polygon = MathF.Abs(grow) > 0.001f ? Grown(outline, grow) : outline;
+                triangles = RuntimeMesh.EarClipTriangulate(polygon);
+                if (triangles.Count == 3 * (samples - 2)) break;
+                if (share > 0f)
+                    Debug.LogWarning("WaterBody", $"'{Entity.Name}': its outline grown {grow:0.#} m does not triangulate whole " +
+                                                  $"({triangles.Count / 3} of {samples - 2} triangles); growing it less");
             }
-
-            var triangles = RuntimeMesh.EarClipTriangulate(polygon);
             if (triangles == null || triangles.Count < 3) return null!;
 
             var verts = new List<Vector3>(samples);
@@ -819,6 +820,21 @@ namespace Freefall.Components
                 grouped.AddRange(list);
             }
             return BuildSurface(verts, normals, uvs, grouped, parts);
+        }
+
+        /// <summary>A counter-clockwise outline moved <paramref name="by"/> metres outward along its vertex normals.</summary>
+        private static List<Vector2> Grown(List<Vector2> polygon, float by)
+        {
+            int n = polygon.Count;
+            var grown = new List<Vector2>(n);
+            for (int i = 0; i < n; i++)
+            {
+                var e0 = polygon[i] - polygon[(i - 1 + n) % n];
+                var e1 = polygon[(i + 1) % n] - polygon[i];
+                var outward = new Vector2(e0.Y, -e0.X) + new Vector2(e1.Y, -e1.X);
+                grown.Add(outward.LengthSquared() > 1e-10f ? polygon[i] + Vector2.Normalize(outward) * by : polygon[i]);
+            }
+            return grown;
         }
 
         private static MeshPart SurfacePart(int baseIndex, int count) =>
