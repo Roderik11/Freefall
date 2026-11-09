@@ -67,8 +67,25 @@ namespace Freefall.Graphics
             lock (_lock)
             {
                 _pendingFences.Enqueue((fenceValue, _head));
+                _batchStart = -1;
             }
         }
+
+        /// <summary>The batch being recorded is not submitted after all (nothing in it to copy): its bytes are free again.</summary>
+        public void AbandonBatch()
+        {
+            lock (_lock)
+            {
+                if (_batchStart >= 0) _head = _batchStart;
+                _batchStart = -1;
+            }
+        }
+
+        // Where the batch being recorded began (its first allocation), -1 before it has one. Its bytes are in use too:
+        // until 2026-11-09 only submitted batches counted, so one batch of more than the ring (43 terrain brushes at once,
+        // 344 MiB through 256) wrapped onto its own first textures before the GPU had copied them, and those textures came
+        // out as rows of other textures' bytes (spiky terrain where the brushes were read).
+        private long _batchStart = -1;
 
         /// <summary>
         /// Drain completed fences to advance _tail, freeing ring buffer space.
@@ -92,92 +109,70 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Allocates space in the ring buffer.
-        /// Reclaims GPU-completed space first. If still insufficient, waits for the GPU.
+        /// Allocates space in the ring buffer for the batch being recorded. Reclaims what the GPU has finished copying,
+        /// waits for older batches while they are in the way, and throws <see cref="UploadBatchFullException"/> (before
+        /// anything is written) when only this batch's own bytes are: the batch must go to the GPU first, and the upload
+        /// that asked goes first in the next one (StreamingManager).
         /// </summary>
         public long Allocate(long size, long alignment)
         {
+            if (size > _capacity)
+                throw new InvalidOperationException($"Asset size {size} exceeds UploadHeap capacity {_capacity}");
             lock (_lock)
             {
-                // Try to reclaim space that the GPU has finished reading
-                ReclaimCompleted();
-                
-                // Align head
-                long alignedHead = (_head + (alignment - 1)) & ~(alignment - 1);
-                
-                // Check if we need to wrap
-                if (alignedHead + size > _capacity)
+                while (true)
                 {
-                    // Wrap to beginning of buffer
-                    alignedHead = 0;
-                }
-                
-                // Check if we'd overwrite in-flight data
-                // In a ring buffer: if head < tail, we must not write past tail
-                // If head >= tail, we're fine unless we wrapped
-                if (WouldOverlap(alignedHead, size))
-                {
-                    // Wait for the oldest pending fence to complete
-                    WaitForOldestFence();
                     ReclaimCompleted();
-                    
-                    // Re-check after reclamation
-                    if (WouldOverlap(alignedHead, size))
+                    if (TryPlace(size, alignment, out long offset))
                     {
-                        // Extreme case: asset may be larger than available contiguous space.
-                        // Try wrapping to 0 if we haven't already.
-                        if (alignedHead != 0)
-                        {
-                            alignedHead = 0;
-                            if (WouldOverlap(alignedHead, size))
-                            {
-                                // Full flush — wait for all pending fences
-                                while (_pendingFences.Count > 0)
-                                {
-                                    WaitForOldestFence();
-                                    ReclaimCompleted();
-                                }
-                            }
-                        }
+                        if (_batchStart < 0) _batchStart = offset;
+                        _head = offset + size;
+                        return offset;
                     }
+                    if (_pendingFences.Count > 0)
+                    {
+                        WaitForOldestFence();
+                        if (_device.IsDeviceLost)
+                            throw new InvalidOperationException("UploadHeap: the device was lost while waiting for the copy queue");
+                        continue;
+                    }
+                    throw new UploadBatchFullException();
                 }
-                
-                if (alignedHead + size > _capacity)
-                {
-                    throw new InvalidOperationException($"Asset size {size} exceeds UploadHeap capacity {_capacity}");
-                }
-                
-                _head = alignedHead + size;
-                return alignedHead;
             }
+        }
+
+        /// <summary>
+        /// A place for <paramref name="size"/> bytes that touches nothing in use: the submitted batches not yet copied and
+        /// the batch being recorded, the ring from the oldest of them (start) to the head. After the head, or wrapped to
+        /// 0 when the end is too close. Under the lock.
+        /// </summary>
+        private bool TryPlace(long size, long alignment, out long offset)
+        {
+            long head = (_head + (alignment - 1)) & ~(alignment - 1);
+            bool inUse = _pendingFences.Count > 0 || _batchStart >= 0;
+            if (!inUse)
+            {
+                offset = head + size <= _capacity ? head : 0;
+                return true;
+            }
+
+            long start = _pendingFences.Count > 0 ? _tail : _batchStart;
+            if (_head > start)
+            {
+                // In use: [start, head). Free: [head, end) and [0, start)
+                if (head + size <= _capacity) { offset = head; return true; }
+                if (size <= start) { offset = 0; return true; }
+            }
+            else if (_head < start)
+            {
+                // Wrapped. In use: [start, end) and [0, head). Free: [head, start)
+                if (head + size <= start) { offset = head; return true; }
+            }
+            // _head == start with something in use: the ring is full
+            offset = 0;
+            return false;
         }
         
-        /// <summary>
-        /// Checks if writing 'size' bytes at 'offset' would overlap with in-flight data.
-        /// </summary>
-        private bool WouldOverlap(long offset, long size)
-        {
-            // If no pending fences, the entire buffer is available
-            if (_pendingFences.Count == 0)
-                return false;
-                
-            long writeEnd = offset + size;
-            
-            // Ring buffer overlap check:
-            // tail marks the end of the oldest in-flight data
-            // If head >= tail: free space is [head, capacity) + [0, tail)
-            // If head < tail (wrapped): free space is [head, tail)
-            if (offset >= _tail)
-            {
-                // Writing forward from offset — only overflows if we'd go past capacity
-                return writeEnd > _capacity;
-            }
-            else
-            {
-                // We've wrapped — must not write past tail
-                return writeEnd > _tail;
-            }
-        }
 
         /// <summary>
         /// CPU-waits for the oldest outstanding fence to complete.
@@ -205,5 +200,14 @@ namespace Freefall.Graphics
         {
             _heap?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// The batch being recorded fills the upload ring: submit it, then record the upload that asked again (nothing of it
+    /// was written). Thrown by <see cref="UploadHeap.Allocate"/> only when no older batch is left to wait for.
+    /// </summary>
+    public sealed class UploadBatchFullException : Exception
+    {
+        public UploadBatchFullException() : base("The upload batch fills the upload heap: submit it first") { }
     }
 }

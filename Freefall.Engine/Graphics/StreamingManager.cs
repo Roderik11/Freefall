@@ -25,7 +25,10 @@ namespace Freefall.Graphics
 
         private static long _bytesUploaded;
         public static long BytesUploaded => Interlocked.Read(ref _bytesUploaded);
-        public static int PendingItems => _instance?._pendingUploads.Count ?? 0;
+        public static int PendingItems => _instance == null ? 0 : _instance._pendingUploads.Count + (_instance._carryOver != null ? 1 : 0);
+
+        // An upload that did not fit the batch it came in (UploadBatchFullException): recorded first in the next batch
+        private volatile Action<ID3D12GraphicsCommandList, UploadHeap>? _carryOver;
 
         private static StreamingManager _instance;
         public static StreamingManager Instance => _instance;
@@ -176,10 +179,10 @@ namespace Freefall.Graphics
 
             while (!_cts.IsCancellationRequested)
             {
-                _workAvailable.WaitOne(10);
+                if (_carryOver == null) _workAvailable.WaitOne(10);   // a batch that filled the ring goes on at once
                 if (_cts.IsCancellationRequested) break;
 
-                if (_pendingUploads.IsEmpty) continue;
+                if (_pendingUploads.IsEmpty && _carryOver == null) continue;
                 if (_device.IsDeviceLost) continue;
 
                 _processing = true;
@@ -202,19 +205,32 @@ namespace Freefall.Graphics
                     _currentBatchAssets.Clear();
                     
                     int processed = 0;
-                    while (_pendingUploads.TryDequeue(out var uploadAction))
+                    while (true)
                     {
-                         try 
-                         {
-                             uploadAction(cmdList, _uploadHeap);
-                             processed++;
-                             if (processed > 64) break;
-                         }
-                         catch (Exception ex)
-                         {
-                             Debug.LogError("StreamingManager", $"Upload failed: {ex.Message}");
-                         }
+                        // The upload that did not fit the last batch goes first
+                        var uploadAction = _carryOver;
+                        if (uploadAction != null) _carryOver = null;
+                        else if (!_pendingUploads.TryDequeue(out uploadAction)) break;
+
+                        try
+                        {
+                            uploadAction(cmdList, _uploadHeap);
+                            processed++;
+                            if (processed > 64) break;
+                        }
+                        catch (UploadBatchFullException)
+                        {
+                            // This batch fills the ring: it goes to the GPU now, and this upload with the next one
+                            _carryOver = uploadAction;
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogError("StreamingManager", $"Upload failed: {ex.Message}");
+                        }
                     }
+                    // Nothing recorded to submit: what was allocated for it is free again
+                    if (processed == 0) _uploadHeap.AbandonBatch();
 
                     if (processed > 0)
                     {
@@ -267,7 +283,7 @@ namespace Freefall.Graphics
         {
             // Wait until the upload thread has drained the queue AND finished its current batch
             int drainTimeout = 30000;
-            while (!_pendingUploads.IsEmpty || _processing)
+            while (!_pendingUploads.IsEmpty || _processing || _carryOver != null)
             {
                 if (_device.IsDeviceLost) break;
                 _workAvailable.Set(); // Wake the upload thread in case it's sleeping
