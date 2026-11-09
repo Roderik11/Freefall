@@ -757,11 +757,14 @@ namespace Freefall
          /// <summary>
          /// Decoration control pages (the top 8 decorators per metre, 256 a side) a side of the window round the camera at every
          /// level (TerrainMapResidency, TERRAIN_PAGES_PLAN.md 5c): full detail where plants are spawned, coarser beyond for the
-         /// sward's colour on the far ground. 0 = every level 0 page, the whole map as before 5c.
+         /// sward's colour on the far ground. 0 = every level 0 page, the whole map as before 5c. 3 by default since
+         /// 2026-11-09 (5 before): full detail at least a page past the camera every way (256 m), past the 120-140 m the
+         /// plants are drawn to; the far sward and the fields from 500 m looked the same as at 5 (TestWorld 213 -> ~110 MiB).
+         /// Odd numbers, as <see cref="TerrainPaintPages"/>.
          /// </summary>
          [ValueRange(0, 32)]
-         [System.ComponentModel.Description("Decoration pages (which plants grow where, one texel a metre, 256 each) a side round the camera at every level, coarser further out. 0 = every page of the whole map at full detail.")]
-         public int TerrainDecoPages { get; set; } = 5;
+         [System.ComponentModel.Description("Decoration pages (which plants grow where, one texel a metre, 256 each) a side round the camera at every level, coarser further out; use an odd number (3: full detail at least a page past the camera every way, beyond where plants are drawn). 0 = every page of the whole map at full detail.")]
+         public int TerrainDecoPages { get; set; } = 3;
 
          /// <summary>Decoration control baked in a frame as pages arrive or change away from the camera's own window, in level
          /// 0 pages' worth, as <see cref="TerrainPaintBakesPerFrame"/>: a coarser page costs 16 and is spread over frames.</summary>

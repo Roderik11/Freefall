@@ -218,6 +218,17 @@ namespace Freefall.Components
         private bool _decoDispatchLogged;
         private int _maxDecoInstances;
 
+        // The card and mesh instance buffers (three of them, 64 bytes an instance) start at this many and grow with what the
+        // spawn asks for, up to MaxDecoInstances. They were made for a million each (192 MiB) from the decoration map's
+        // size, although plants spawn only within the decoration radius: on TestWorld, whose plants are blades, they held 0
+        // card and up to 20 mesh instances (2026-11-09).
+        private const int DecoInstancesAtFirst = 32 * 1024;
+        private const int MaxDecoInstances = 1024 * 1024;
+
+        // This renderer's last card and mesh counts as the spawn's counters had them: every instance it tried to write,
+        // kept or not, so a count past the capacity says how many were wanted
+        private int _cardsWanted, _meshesWanted;
+
         // ───── Mesh-Mode Decorators ──────────────────────────────────────────
         private GraphicsBuffer? _meshDecoInstanceBuffer;    // unsorted mesh instances (DecoInstance, 64 bytes)
         private GraphicsBuffer? _sortedMeshInstanceBuffer;  // sorted by mesh type (DecoInstance, 64 bytes)
@@ -918,6 +929,9 @@ namespace Freefall.Components
                 if (_decoVariantCount > 0)
                 {
                     EnsureDecoRenderBuffers();
+                    // Here, before this frame's passes are queued: the opaque pass spawns into the buffers the shadow pass
+                    // then draws from
+                    GrowDecoInstanceBuffers();
 
                     CommandBuffer.Enqueue(RenderPass.Opaque, (list) => { PixMarker.Begin(list, "Decorators"); self.DispatchDecorator(list, fi, RenderPass.Opaque); PixMarker.End(list); });
                     CommandBuffer.Enqueue(RenderPass.Shadow, (list) => { PixMarker.Begin(list, "Decorators"); self.DispatchDecorator(list, fi, RenderPass.Shadow); PixMarker.End(list); });
@@ -2928,10 +2942,10 @@ namespace Freefall.Components
             int resolution = Terrain?.EffectiveDecorationMapResolution ?? 256;
             long maxTiles = (long)resolution * resolution;
 
-            // Worst-case instances: ~64 per tile max (64 threads/group)
-            // But realistically with density, far fewer. Use maxTiles * 8 as reasonable upper bound. In longs: 16 km
-            // (16,384 tiles a side) times 8 is one past int.MaxValue, and the negative count failed every Draw (2026-11-08)
-            _maxDecoInstances = (int)Math.Min(maxTiles * 8, 1024 * 1024); // cap at 1M
+            // Card and mesh instances: a small start, grown with what the spawn asks for (GrowDecoInstanceBuffers). In
+            // longs: 16 km (16,384 tiles a side) times 8 was one past int.MaxValue, and the negative count failed every
+            // Draw (2026-11-08)
+            _maxDecoInstances = (int)Math.Min(maxTiles * 8, DecoInstancesAtFirst);
 
             _decoInstanceBuffer = GraphicsBuffer.CreateStructured(_maxDecoInstances, 64, srv: true, uav: true); // 64 bytes per DecoInstance
             _instanceCounterBuffer = GraphicsBuffer.CreateRaw(3, uav: true, clearable: true); // card, mesh, blade clump counts
@@ -2974,6 +2988,32 @@ namespace Freefall.Components
             }
 
             _decoBuffersCreated = true;
+        }
+
+        /// <summary>
+        /// Grow the card and mesh instance buffers when the spawn asked for more than three quarters of them (its counters
+        /// count every instance it tried, kept or not): to twice what was asked, a power of two, up to MaxDecoInstances.
+        /// The old buffers go after the frames in flight. A frame or two past a sudden rise draw what fitted. Main thread,
+        /// before the frame's decoration passes are queued.
+        /// </summary>
+        private void GrowDecoInstanceBuffers()
+        {
+            int wanted = Math.Max(_cardsWanted, _meshesWanted);
+            if (wanted <= _maxDecoInstances / 4 * 3 || _maxDecoInstances >= MaxDecoInstances) return;
+
+            int capacity = (int)Math.Min(System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Min(wanted, MaxDecoInstances) * 2u),
+                                         MaxDecoInstances);
+            var device = Engine.Device;
+            device.DeferDispose(_decoInstanceBuffer);
+            device.DeferDispose(_meshDecoInstanceBuffer);
+            device.DeferDispose(_sortedMeshInstanceBuffer);
+            _decoInstanceBuffer = GraphicsBuffer.CreateStructured(capacity, 64, srv: true, uav: true);
+            _meshDecoInstanceBuffer = GraphicsBuffer.CreateStructured(capacity, 64, srv: true, uav: true);
+            _sortedMeshInstanceBuffer = GraphicsBuffer.CreateStructured(capacity, 64, srv: true, uav: true);
+            Debug.LogAlways($"[Terrain] '{Terrain?.Name}': decoration instance buffers {_maxDecoInstances:N0} -> {capacity:N0} " +
+                            $"(the spawn asked for {_cardsWanted:N0} cards, {_meshesWanted:N0} meshes)");
+            _maxDecoInstances = capacity;
+            _cardsWanted = _meshesWanted = 0;   // the next counts come from the new buffers
         }
 
         /// <summary>D3D12's largest 2D texture, texels a side.</summary>
@@ -3187,6 +3227,8 @@ namespace Freefall.Components
                         uint* pData = (uint*)_instanceCounterReadbackPtr;
                         LastInstanceCount = (int)pData[0];
                         LastMeshInstanceCount = (int)pData[1];
+                        _cardsWanted = (int)Math.Min(pData[0], (uint)int.MaxValue);
+                        _meshesWanted = (int)Math.Min(pData[1], (uint)int.MaxValue);
                         LastMeshDrawCount = (int)pData[2];
                         LastBladeInstanceCount = (int)pData[3];
                     }
