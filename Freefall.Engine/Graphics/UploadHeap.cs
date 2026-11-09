@@ -40,7 +40,7 @@ namespace Freefall.Graphics
             _capacity = sizeInBytes;
             _fence = fence;
 
-            _heap = _device.NativeDevice.CreateCommittedResource(
+            _heap = _device.CreateCommittedResource(
                 new HeapProperties(HeapType.Upload),
                 HeapFlags.None,
                 ResourceDescription.Buffer((ulong)_capacity),

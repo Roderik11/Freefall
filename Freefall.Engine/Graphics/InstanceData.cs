@@ -162,7 +162,7 @@ namespace Freefall.Graphics
                     int capacity = Math.Max(slots, _bufferSlots * 2);
                     int bytes = capacity * Stride;
                     if (_buffer != null) device.DeferDispose(_buffer);
-                    _buffer = device.NativeDevice.CreateCommittedResource(
+                    _buffer = device.CreateCommittedResource(
                         new HeapProperties(HeapType.Upload),
                         HeapFlags.None,
                         ResourceDescription.Buffer((ulong)bytes),

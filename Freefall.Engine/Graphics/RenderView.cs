@@ -198,7 +198,7 @@ namespace Freefall.Graphics
             
             var clearValue = new ClearValue(Format.D32_Float, 0.0f, 0); // Reverse depth: far=0
 
-            _depthStencil = _graphicsDevice.NativeDevice.CreateCommittedResource(
+            _depthStencil = _graphicsDevice.CreateCommittedResource(
                 new HeapProperties(HeapType.Default),
                 HeapFlags.None,
                 depthDesc,

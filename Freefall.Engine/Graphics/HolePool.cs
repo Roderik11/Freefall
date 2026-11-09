@@ -142,7 +142,7 @@ namespace Freefall.Graphics
             var texture = Texture!;
             int across = store.PagesAcross;
             ulong pageBytes = (ulong)(RowPitch * PageSamples + 511) & ~511UL;
-            var upload = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Upload), HeapFlags.None,
+            var upload = device.CreateCommittedResource(new HeapProperties(HeapType.Upload), HeapFlags.None,
                 ResourceDescription.Buffer(pageBytes * (ulong)pages.Count), ResourceStates.GenericRead, null);
             void* data;
             upload.Map(0, null, &data);

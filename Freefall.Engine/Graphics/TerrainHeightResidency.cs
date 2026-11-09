@@ -115,7 +115,7 @@ namespace Freefall.Graphics
             Choose(cameraLocal, spacing, radius, int.MaxValue);
             var device = Engine.Device;
             const int batch = 128;
-            var buffer = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Upload), HeapFlags.None,
+            var buffer = device.CreateCommittedResource(new HeapProperties(HeapType.Upload), HeapFlags.None,
                 ResourceDescription.Buffer((ulong)PageBytes * batch), ResourceStates.GenericRead, null);
             var all = new List<(int level, int px, int py, int slot)>(_staged);
             _staged.Clear();
@@ -197,7 +197,7 @@ namespace Freefall.Graphics
 
             if (_staged.Count == 0) return;
             var device = Engine.Device;
-            _stagedBuffer = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Upload), HeapFlags.None,
+            _stagedBuffer = device.CreateCommittedResource(new HeapProperties(HeapType.Upload), HeapFlags.None,
                 ResourceDescription.Buffer((ulong)PageBytes * (ulong)_staged.Count), ResourceStates.GenericRead, null);
             Fill(pages, _stagedBuffer, _staged, 0, _staged.Count);
         }

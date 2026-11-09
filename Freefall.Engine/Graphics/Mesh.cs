@@ -819,7 +819,7 @@ namespace Freefall.Graphics
             public ID3D12Resource Create<T>(T[] data) where T : unmanaged
             {
                 int size = data.Length * System.Runtime.InteropServices.Marshal.SizeOf<T>();
-                var buffer = _device.NativeDevice.CreateCommittedResource(
+                var buffer = _device.CreateCommittedResource(
                     new HeapProperties(HeapType.Default), HeapFlags.None, ResourceDescription.Buffer((ulong)size), ResourceStates.Common, null);
 
                 var upload = _device.CreateUploadBuffer(data);
@@ -851,7 +851,7 @@ namespace Freefall.Graphics
         private static ID3D12Resource CreateBuffer<T>(GraphicsDevice device, T[] data) where T : unmanaged
         {
              int size = data.Length * System.Runtime.InteropServices.Marshal.SizeOf<T>();
-             var buffer = device.NativeDevice.CreateCommittedResource(
+             var buffer = device.CreateCommittedResource(
                 new HeapProperties(HeapType.Default), HeapFlags.None, ResourceDescription.Buffer((ulong)size), ResourceStates.Common, null);
              
              // Synchronous Upload

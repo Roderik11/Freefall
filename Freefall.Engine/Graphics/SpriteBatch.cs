@@ -144,7 +144,7 @@ namespace Freefall.Graphics
             if (buffer.Resource != null && buffer.Capacity >= count) return;
             buffer.Resource?.Dispose();
 
-            buffer.Resource = _device.NativeDevice.CreateCommittedResource(
+            buffer.Resource = _device.CreateCommittedResource(
                 new HeapProperties(HeapType.Upload),
                 HeapFlags.None,
                 ResourceDescription.Buffer((ulong)(count * stride)),

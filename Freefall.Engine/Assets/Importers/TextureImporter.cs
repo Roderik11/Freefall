@@ -338,7 +338,7 @@ namespace Freefall.Assets.Importers
             return (Side(width * scale), Side(height * scale));
         }
 
-        /// <summary>The pixel size from the file's header (PNG, BMP, TGA, JPEG), or null for another or an unreadable file.</summary>
+        /// <summary>The pixel size from the file's header (PNG, BMP, TGA, JPEG, TIFF), or null for another or an unreadable file.</summary>
         public static (int Width, int Height)? ImageSize(string path)
         {
             try
@@ -376,6 +376,36 @@ namespace Freefall.Assets.Importers
                         fs.Position += length - 2;
                     }
                     return null;
+                }
+
+                // TIFF: "II*\0" (little endian) or "MM\0*" (big endian), then the first image directory's ImageWidth (tag
+                // 256) and ImageLength (257), each a SHORT or a LONG. Until 2026-11-09 a TIFF had no size here, so a Max Size
+                // on one was never applied (the Sweetgum trees' 4096² maps)
+                bool little = head[0] == 'I' && head[1] == 'I' && head[2] == 42 && head[3] == 0;
+                bool big = head[0] == 'M' && head[1] == 'M' && head[2] == 0 && head[3] == 42;
+                if (little || big)
+                {
+                    int U16(byte[] b, int i) => little ? b[i] | b[i + 1] << 8 : b[i] << 8 | b[i + 1];
+                    long U32(byte[] b, int i) => little
+                        ? (uint)(b[i] | b[i + 1] << 8 | b[i + 2] << 16 | b[i + 3] << 24)
+                        : (uint)(b[i] << 24 | b[i + 1] << 16 | b[i + 2] << 8 | b[i + 3]);
+
+                    fs.Position = U32(head, 4);
+                    var countBytes = new byte[2];
+                    if (fs.Read(countBytes, 0, 2) < 2) return null;
+                    int entries = U16(countBytes, 0);
+                    var entry = new byte[12];
+                    int width = 0, height = 0;
+                    for (int e = 0; e < entries && (width == 0 || height == 0); e++)
+                    {
+                        if (fs.Read(entry, 0, 12) < 12) return null;
+                        int tag = U16(entry, 0), type = U16(entry, 2);
+                        // A SHORT sits in the first two bytes of the value field in either byte order
+                        int value = type == 3 ? U16(entry, 8) : type == 4 ? (int)U32(entry, 8) : 0;
+                        if (tag == 256) width = value;
+                        else if (tag == 257) height = value;
+                    }
+                    return width > 0 && height > 0 ? (width, height) : null;
                 }
 
                 // TGA (no signature): by extension, width and height little endian at 12 and 14

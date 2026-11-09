@@ -676,7 +676,7 @@ namespace Freefall.Graphics
         {
             int rowBytes = n * texelBytes;
             pitch = (rowBytes + 255) & ~255;
-            var upload = device.NativeDevice.CreateCommittedResource(
+            var upload = device.CreateCommittedResource(
                 new HeapProperties(HeapType.Upload), HeapFlags.None,
                 ResourceDescription.Buffer((ulong)pitch * (ulong)n * MaxBands), ResourceStates.GenericRead, null);
             void* mapped;

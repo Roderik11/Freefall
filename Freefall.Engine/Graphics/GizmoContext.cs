@@ -546,7 +546,7 @@ namespace Freefall.Graphics
 
             private static ID3D12Resource CreateUploadBuffer(GraphicsDevice device, int sizeBytes)
             {
-                return device.NativeDevice.CreateCommittedResource(
+                return device.CreateCommittedResource(
                     new HeapProperties(HeapType.Upload),
                     HeapFlags.None,
                     ResourceDescription.Buffer((ulong)sizeBytes),

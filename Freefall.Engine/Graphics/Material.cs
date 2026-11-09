@@ -495,7 +495,7 @@ namespace Freefall.Graphics
             {
                 int bytes = capacity * SettingsStride;
                 if (_settingsBuffer != null) device.DeferDispose(_settingsBuffer);
-                _settingsBuffer = device.NativeDevice.CreateCommittedResource(
+                _settingsBuffer = device.CreateCommittedResource(
                     new HeapProperties(HeapType.Upload),
                     HeapFlags.None,
                     ResourceDescription.Buffer((ulong)bytes),
@@ -1455,7 +1455,7 @@ namespace Freefall.Graphics
                 if (_materialsBuffer != null) device.DeferDispose(_materialsBuffer);
                 if (_materialsBufferBindlessIndex != 0) device.DeferReleaseBindlessIndex(_materialsBufferBindlessIndex);
                 _materialsBufferBindlessIndex = 0;
-                _materialsBuffer = device.NativeDevice.CreateCommittedResource(
+                _materialsBuffer = device.CreateCommittedResource(
                     new HeapProperties(HeapType.Upload),
                     HeapFlags.None,
                     ResourceDescription.Buffer((ulong)newBufferSize),

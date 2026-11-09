@@ -116,12 +116,26 @@ namespace Freefall.Editor.Publishing
 
                     int failed = 0;
                     await job.Step(Reimporting, async () => failed = await AssetDatabase.ImportAssetsAsync(changed, job.Report));
+
+                    // An import that ran without scaling (a source whose size the importer cannot read) is no cap: count it
+                    // as failed, by the size the cache file came out at
+                    var notScaled = new List<string>();
+                    if (maxSize > 0)
+                        foreach (var guid in changed)
+                            if (TextureBudgetScan.CachedSize(AssetDatabase.ResolveCachePathByGuid(guid)) is { } size
+                                && Math.Max(size.Width, size.Height) > maxSize)
+                                notScaled.Add($"{AssetDatabase.GuidToPath(guid) ?? guid} ({size.Width}x{size.Height})");
+                    foreach (var path in notScaled)
+                        Debug.LogWarning("Textures", $"Not scaled to {maxSize}: {path}");
+                    failed += notScaled.Count;
+                    int capped = changed.Count - notScaled.Count;
+
                     await BuildScanJob.Run(job, profile);
 
                     string done = maxSize > 0 ? $"capped at {maxSize}" : "back at their source size";
-                    Debug.LogAlways($"[Textures] {changed.Count} textures {done}, {failed} failed, {job.Elapsed.TotalSeconds:0} s");
-                    await job.Finish($"{changed.Count} textures {done}" + (failed > 0 ? $", {failed} failed (see the console)" : ""));
-                    return changed.Count;
+                    Debug.LogAlways($"[Textures] {capped} textures {done}, {failed} failed, {job.Elapsed.TotalSeconds:0} s");
+                    await job.Finish($"{capped} textures {done}" + (failed > 0 ? $", {failed} failed (see the console)" : ""));
+                    return capped;
                 }
                 catch (Exception ex)
                 {

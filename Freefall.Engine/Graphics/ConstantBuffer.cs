@@ -178,7 +178,7 @@ namespace Freefall.Graphics
 
             for (int i = 0; i < CommandBuffer.FrameCount; i++)
             {
-                _buffers[i] = device.NativeDevice.CreateCommittedResource(
+                _buffers[i] = device.CreateCommittedResource(
                     new HeapProperties(HeapType.Upload),
                     HeapFlags.None,
                     ResourceDescription.Buffer((ulong)_size),
@@ -217,7 +217,7 @@ namespace Freefall.Graphics
 
             for (int i = 0; i < CommandBuffer.FrameCount; i++)
             {
-                _buffers[i] = device.NativeDevice.CreateCommittedResource(
+                _buffers[i] = device.CreateCommittedResource(
                     new HeapProperties(HeapType.Upload),
                     HeapFlags.None,
                     ResourceDescription.Buffer((ulong)_size),

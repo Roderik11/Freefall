@@ -110,7 +110,7 @@ namespace Freefall.Graphics
              }
              
              var arr = new Texture();
-             arr._resource = device.NativeDevice.CreateCommittedResource(
+             arr._resource = device.CreateCommittedResource(
                  new HeapProperties(HeapType.Default), HeapFlags.None, desc, ResourceStates.CopyDest, null);
              device.NameForDebug(arr._resource);
                  
@@ -188,7 +188,7 @@ namespace Freefall.Graphics
                  (ushort)arraySize, (ushort)mipCount, 1, 0, ResourceFlags.AllowUnorderedAccess);
 
              var arr = new Texture();
-             arr._resource = device.NativeDevice.CreateCommittedResource(
+             arr._resource = device.CreateCommittedResource(
                  new HeapProperties(HeapType.Default), HeapFlags.None, arrayDesc, ResourceStates.UnorderedAccess, null);
              device.NameForDebug(arr._resource);
 
@@ -417,11 +417,12 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
             var desc = ResourceDescription.Texture2D(cpuData.Format, (uint)cpuData.Width, (uint)cpuData.Height, (ushort)cpuData.ArraySize, (ushort)cpuData.MipLevels);
 
             // Textures on copy queue should be in Common or CopyDest
-            _resource = device.NativeDevice.CreateCommittedResource(
+            _resource = device.CreateCommittedResource(
                 new HeapProperties(HeapType.Default),
                 HeapFlags.None,
                 desc,
-                ResourceStates.Common); // Implicit promotion to CopyDest will happen on CopyQueue
+                ResourceStates.Common, // Implicit promotion to CopyDest will happen on CopyQueue
+                owner: OnDemand ? "Texture assets (on demand)" : "Texture assets", detail: cpuData.Path);
             device.NameForDebug(_resource);
 
             // 2. Create SRV immediately (so we can bind it even if black/empty)

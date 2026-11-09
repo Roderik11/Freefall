@@ -301,7 +301,7 @@ namespace Freefall.Graphics
             int stride = Unsafe.SizeOf<T>();
             int size = count * stride;
 
-            var resource = device.NativeDevice.CreateCommittedResource(
+            var resource = device.CreateCommittedResource(
                 new HeapProperties(HeapType.Readback),
                 HeapFlags.None,
                 ResourceDescription.Buffer((ulong)size),

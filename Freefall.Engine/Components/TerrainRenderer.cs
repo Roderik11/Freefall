@@ -1354,7 +1354,7 @@ namespace Freefall.Components
             _splitFlagsFresh[i] = true;
             // A header of 4 uints and four lists of WalkCapacity entries (terrain_quadtree.hlsl WalkList)
             _walkBuffers[i] = GraphicsBuffer.CreateRaw(4 + 4 * WalkCapacity, uav: true);
-            _countReadbacks[i] = Engine.Device.NativeDevice.CreateCommittedResource(
+            _countReadbacks[i] = Engine.Device.CreateCommittedResource(
                 new HeapProperties(HeapType.Readback), HeapFlags.None, ResourceDescription.Buffer(8), ResourceStates.CopyDest, null);
             unsafe
             {
@@ -2118,7 +2118,7 @@ namespace Freefall.Components
                 total += ((long)pitches[m] * w + 511) & ~511L;
             }
             var device = Engine.Device;
-            var upload = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Upload), HeapFlags.None,
+            var upload = device.CreateCommittedResource(new HeapProperties(HeapType.Upload), HeapFlags.None,
                 ResourceDescription.Buffer((ulong)total), ResourceStates.GenericRead, null);
             void* data;
             upload.Map(0, null, &data);
@@ -2394,7 +2394,7 @@ namespace Freefall.Components
                 Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
             }, device.GetCpuHandle(flatSrv));
             int rowPitch = (res + 255) & ~255;
-            var upload = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Upload), HeapFlags.None,
+            var upload = device.CreateCommittedResource(new HeapProperties(HeapType.Upload), HeapFlags.None,
                 ResourceDescription.Buffer((ulong)rowPitch * (ulong)res), ResourceStates.GenericRead, null);
             void* data;
             upload.Map(0, null, &data);
@@ -2402,7 +2402,7 @@ namespace Freefall.Components
             upload.Unmap(0);
 
             var result = GraphicsBuffer.CreateRaw(4, uav: true, clearable: true);
-            var readback = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Readback), HeapFlags.None,
+            var readback = device.CreateCommittedResource(new HeapProperties(HeapType.Readback), HeapFlags.None,
                 ResourceDescription.Buffer(16), ResourceStates.CopyDest, null);
             var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
             var cmd = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
@@ -2941,7 +2941,7 @@ namespace Freefall.Components
             Debug.Log($"[TerrainRenderer] Deco buffers created: maxTiles={maxTiles} maxInstances={_maxDecoInstances} resolution={resolution}");
 
             // Readback buffer: card count, mesh count, mesh draw count, blade clump count (4 uints)
-            _instanceCounterReadback = Engine.Device.NativeDevice.CreateCommittedResource(
+            _instanceCounterReadback = Engine.Device.CreateCommittedResource(
                 new Vortice.Direct3D12.HeapProperties(Vortice.Direct3D12.HeapType.Readback),
                 Vortice.Direct3D12.HeapFlags.None,
                 Vortice.Direct3D12.ResourceDescription.Buffer(16),

@@ -403,7 +403,7 @@ namespace Freefall.Graphics
             var device = Engine.Device;
             uint rowPitch = (uint)((w * 8 + 255) & ~255);
             ulong size = (ulong)rowPitch * (uint)h;
-            var buffer = device.NativeDevice.CreateCommittedResource(
+            var buffer = device.CreateCommittedResource(
                 new HeapProperties(HeapType.Readback), HeapFlags.None, ResourceDescription.Buffer(size), ResourceStates.CopyDest);
             try
             {

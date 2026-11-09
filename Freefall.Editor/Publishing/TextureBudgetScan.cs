@@ -230,17 +230,31 @@ namespace Freefall.Editor.Publishing
 
         // ── Textures ──
 
+        /// <summary>A texture's size in its cache file (the DDS header after the packer's), or null when unreadable.</summary>
+        public static (int Width, int Height)? CachedSize(string cachePath)
+        {
+            if (cachePath == null || !File.Exists(cachePath)) return null;
+            var (head, n, i) = DdsHead(cachePath);
+            return i < 0 ? null : (BitConverter.ToInt32(head, i + 16), BitConverter.ToInt32(head, i + 12));
+        }
+
+        // The cache file's first bytes and where the DDS header starts in them (-1: none)
+        static (byte[] head, int n, int i) DdsHead(string cachePath)
+        {
+            var head = new byte[256];
+            int n;
+            using (var fs = File.OpenRead(cachePath))
+                n = fs.Read(head, 0, head.Length);
+            int i = 0;
+            while (i + 148 <= n && !(head[i] == 'D' && head[i + 1] == 'D' && head[i + 2] == 'S' && head[i + 3] == ' ')) i++;
+            return (head, n, i + 148 > n ? -1 : i);
+        }
+
         static BudgetTexture? ReadHeader(BuildArtifact a, int budget)
         {
             if (!File.Exists(a.CachePath)) return null;
-            var head = new byte[256];
-            int n;
-            using (var fs = File.OpenRead(a.CachePath))
-                n = fs.Read(head, 0, head.Length);
-
-            int i = 0;
-            while (i + 148 <= n && !(head[i] == 'D' && head[i + 1] == 'D' && head[i + 2] == 'S' && head[i + 3] == ' ')) i++;
-            if (i + 148 > n) return null;
+            var (head, n, i) = DdsHead(a.CachePath);
+            if (i < 0) return null;
 
             int height = BitConverter.ToInt32(head, i + 12), width = BitConverter.ToInt32(head, i + 16);
             int mips = Math.Max(1, BitConverter.ToInt32(head, i + 28));

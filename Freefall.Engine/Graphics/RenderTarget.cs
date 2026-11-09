@@ -90,7 +90,7 @@ namespace Freefall.Graphics
                 Format.D32_Float, (uint)w, (uint)h, 1, 1, 1, 0,
                 ResourceFlags.AllowDepthStencil);
 
-            _depthBuffer = _device.NativeDevice.CreateCommittedResource(
+            _depthBuffer = _device.CreateCommittedResource(
                 new HeapProperties(HeapType.Default),
                 HeapFlags.None,
                 depthDesc,

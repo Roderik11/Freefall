@@ -1273,7 +1273,7 @@ namespace Freefall.Assets
                     {
                         readbacks = new ID3D12Resource[4];
                         for (int i = 0; i < readbacks.Length; i++)
-                            readbacks[i] = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Readback),
+                            readbacks[i] = device.CreateCommittedResource(new HeapProperties(HeapType.Readback),
                                 HeapFlags.None, ResourceDescription.Buffer(sliceBytes * (ulong)_pool.Slices), ResourceStates.CopyDest, null);
                     }
                     UploadHeightPlan(plan);
@@ -1469,7 +1469,7 @@ namespace Freefall.Assets
             int rowPitch = (NoiseLUTSize * bytesPerPixel + 255) & ~255; // 256-byte aligned
             int totalBytes = rowPitch * NoiseLUTSize;
 
-            var uploadResource = device.NativeDevice.CreateCommittedResource(
+            var uploadResource = device.CreateCommittedResource(
                 new HeapProperties(HeapType.Upload),
                 HeapFlags.None,
                 ResourceDescription.Buffer((ulong)totalBytes),
@@ -1643,7 +1643,7 @@ namespace Freefall.Assets
             int pageBytes = (rowPitch * texels + 511) & ~511;
             int batch = Math.Min(UploadBatch, count);
 
-            var uploadResource = device.NativeDevice.CreateCommittedResource(
+            var uploadResource = device.CreateCommittedResource(
                 new HeapProperties(HeapType.Upload),
                 HeapFlags.None,
                 ResourceDescription.Buffer((ulong)pageBytes * (ulong)batch),
@@ -1789,7 +1789,7 @@ namespace Freefall.Assets
             var edit = basis.Edit();
             int cx0 = int.MaxValue, cx1 = int.MinValue, cz0 = int.MaxValue, cz1 = int.MinValue;
             int replaced = 0;
-            var readbackResource = device.NativeDevice.CreateCommittedResource(
+            var readbackResource = device.CreateCommittedResource(
                 new HeapProperties(HeapType.Readback),
                 HeapFlags.None,
                 ResourceDescription.Buffer((ulong)(pageBytes * Math.Min(batch, pageList.Count))),
@@ -2673,7 +2673,7 @@ namespace Freefall.Assets
             const int texels = Graphics.PaintPool.PageTexels;
             const int rowPitch = (texels + 255) & ~255;
             var device = Engine.Device;
-            var readback = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Readback), HeapFlags.None,
+            var readback = device.CreateCommittedResource(new HeapProperties(HeapType.Readback), HeapFlags.None,
                 ResourceDescription.Buffer((ulong)(rowPitch * texels)), ResourceStates.CopyDest, null);
             var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
             var cmd = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
@@ -2739,7 +2739,7 @@ namespace Freefall.Assets
                 ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
                 Texture2DArray = new Texture2DArrayUnorderedAccessView { MipSlice = 0, FirstArraySlice = 0, ArraySize = (uint)g },
             }, device.GetCpuHandle(flatUav));
-            var readback = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Readback), HeapFlags.None,
+            var readback = device.CreateCommittedResource(new HeapProperties(HeapType.Readback), HeapFlags.None,
                 ResourceDescription.Buffer((ulong)sliceBytes * (ulong)g * 2), ResourceStates.CopyDest, null);
             var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
             long differ = 0, compared = 0;
@@ -2954,7 +2954,7 @@ namespace Freefall.Assets
                 ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
                 Texture2DArray = new Texture2DArrayUnorderedAccessView { MipSlice = 0, FirstArraySlice = 0, ArraySize = 2 },
             }, device.GetCpuHandle(flatUav));
-            var readback = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Readback), HeapFlags.None,
+            var readback = device.CreateCommittedResource(new HeapProperties(HeapType.Readback), HeapFlags.None,
                 ResourceDescription.Buffer((ulong)sliceBytes * 4), ResourceStates.CopyDest, null);
             var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
             long differ = 0, compared = 0;

@@ -887,6 +887,12 @@ namespace Freefall.Graphics
         /// gives the process (DXGI QueryVideoMemoryInfo). Null when the adapter cannot be asked. For engine_stats.
         /// </summary>
         public object? DescribeVideoMemory()
+            => VideoMemory() is { } vm
+                ? new { usageMiB = Math.Round(vm.usage / 1048576.0, 1), budgetMiB = Math.Round(vm.budget / 1048576.0, 1) }
+                : null;
+
+        /// <summary>The adapter's local memory in bytes as the OS counts it for this process: in use and its budget.</summary>
+        public (long usage, long budget)? VideoMemory()
         {
             try
             {
@@ -895,16 +901,37 @@ namespace Freefall.Graphics
                 _memoryAdapter ??= _factory.EnumAdapterByLuid<IDXGIAdapter3>(
                     System.Runtime.CompilerServices.Unsafe.As<long, Vortice.Luid>(ref luid));
                 var info = _memoryAdapter.QueryVideoMemoryInfo(0, MemorySegmentGroup.Local);
-                return new
-                {
-                    usageMiB = Math.Round(info.CurrentUsage / 1048576.0, 1),
-                    budgetMiB = Math.Round(info.Budget / 1048576.0, 1),
-                };
+                return ((long)info.CurrentUsage, (long)info.Budget);
             }
             catch
             {
                 return null;
             }
+        }
+
+        /// <summary>The descriptor heaps the device keeps (the bindless one, RTV, DSV), in bytes.</summary>
+        public long DescriptorHeapBytes()
+        {
+            long Of(ID3D12DescriptorHeap? heap)
+                => heap == null ? 0 : (long)heap.Description.DescriptorCount * _device.GetDescriptorHandleIncrementSize(heap.Description.Type);
+            return Of(_srvHeap) + Of(_rtvHeap) + Of(_dsvHeap);
+        }
+
+        /// <summary>
+        /// ID3D12Device.CreateCommittedResource, recorded in the VRAM ledger (<see cref="GpuMemory"/>) under the calling
+        /// method, or <paramref name="owner"/> when given; <paramref name="detail"/> says what it is (a texture's name).
+        /// Every resource the engine keeps is made through here, so engine_stats can say where video memory goes.
+        /// </summary>
+        public ID3D12Resource CreateCommittedResource(HeapProperties heapProperties, HeapFlags heapFlags,
+            ResourceDescription description, ResourceStates initialState, ClearValue? optimizedClearValue = null,
+            string? owner = null, string? detail = null,
+            [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "",
+            [System.Runtime.CompilerServices.CallerMemberName] string callerMember = "")
+        {
+            var resource = _device.CreateCommittedResource(heapProperties, heapFlags, description, initialState, optimizedClearValue);
+            GpuMemory.Track(_device, resource, heapProperties.Type,
+                owner ?? $"{System.IO.Path.GetFileNameWithoutExtension(callerFile)}.{callerMember}", detail);
+            return resource;
         }
 
         /// <summary>
@@ -1008,7 +1035,7 @@ namespace Freefall.Graphics
 
             try
             {
-                return NameForDebug(_device.CreateCommittedResource(
+                return NameForDebug(CreateCommittedResource(
                     new HeapProperties(HeapType.Default),
                     HeapFlags.None,
                     desc,
@@ -1040,7 +1067,7 @@ namespace Freefall.Graphics
                 Flags = flags
             };
 
-            return NameForDebug(_device.CreateCommittedResource(
+            return NameForDebug(CreateCommittedResource(
                 new HeapProperties(HeapType.Default),
                 HeapFlags.None,
                 desc,
@@ -1066,7 +1093,7 @@ namespace Freefall.Graphics
 
         public ID3D12Resource CreateUploadBuffer(int size)
         {
-             return _device.CreateCommittedResource(
+             return CreateCommittedResource(
                 new Vortice.Direct3D12.HeapProperties(HeapType.Upload),
                 HeapFlags.None,
                 ResourceDescription.Buffer((ulong)size),
@@ -1077,7 +1104,7 @@ namespace Freefall.Graphics
         public ID3D12Resource CreateUploadBuffer<T>(T[] data) where T : unmanaged
         {
              int size = data.Length * System.Runtime.InteropServices.Marshal.SizeOf<T>();
-             var buffer = _device.CreateCommittedResource(
+             var buffer = CreateCommittedResource(
                 new Vortice.Direct3D12.HeapProperties(HeapType.Upload),
                 HeapFlags.None,
                 ResourceDescription.Buffer((ulong)size),
@@ -1118,7 +1145,7 @@ namespace Freefall.Graphics
         /// </summary>
         public ID3D12Resource CreateDefaultBuffer(int size, ResourceFlags flags = ResourceFlags.AllowUnorderedAccess)
         {
-            return NameForDebug(_device.CreateCommittedResource(
+            return NameForDebug(CreateCommittedResource(
                 new HeapProperties(HeapType.Default),
                 HeapFlags.None,
                 ResourceDescription.Buffer((ulong)size, flags),

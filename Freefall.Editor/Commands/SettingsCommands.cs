@@ -146,6 +146,9 @@ namespace Freefall.Editor.Commands
                 vram = Engine.Device?.DescribeVideoMemory(),
                 // On-demand textures (the terrain's brushes): GPU copies held or idle, their MiB, loads since the start
                 onDemandTextures = Freefall.Graphics.OnDemandTextures.Describe(),
+                // Where video memory goes: every committed resource by its maker, the largest ones, texture assets by
+                // folder, and what the ledger cannot see (swap chain, pipelines, the driver's own)
+                gpuMemory = Engine.Device != null ? Freefall.Graphics.GpuMemory.Describe(Engine.Device) : null,
                 // System tree in update order, one "Name  ms" line per system (indent = nesting)
                 systems = Freefall.Base.Systems.Describe().Split('\n', StringSplitOptions.RemoveEmptyEntries)
             });

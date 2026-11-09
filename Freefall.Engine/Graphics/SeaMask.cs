@@ -168,7 +168,7 @@ namespace Freefall.Graphics
             }
 
             int rowPitch = (size + 255) & ~255;
-            var upload = device.NativeDevice.CreateCommittedResource(
+            var upload = device.CreateCommittedResource(
                 new HeapProperties(HeapType.Upload), HeapFlags.None,
                 ResourceDescription.Buffer((ulong)(rowPitch * size)), ResourceStates.GenericRead, null);
 
