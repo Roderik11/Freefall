@@ -142,6 +142,10 @@ namespace Freefall.Editor.Commands
                     ? ComponentCache<Freefall.Components.EnvironmentController>.All[0].Describe() : null,
                 // Decals: registry slots the cull walks, and the spawned ones (footprints, blood) since the scene loaded
                 decals = Freefall.Graphics.DecalBuffer.Instance?.Describe(),
+                // Video memory: what this process has in the adapter's local memory and the budget the OS gives it (MiB)
+                vram = Engine.Device?.DescribeVideoMemory(),
+                // On-demand textures (the terrain's brushes): GPU copies held or idle, their MiB, loads since the start
+                onDemandTextures = Freefall.Graphics.OnDemandTextures.Describe(),
                 // System tree in update order, one "Name  ms" line per system (indent = nesting)
                 systems = Freefall.Base.Systems.Describe().Split('\n', StringSplitOptions.RemoveEmptyEntries)
             });

@@ -880,6 +880,33 @@ namespace Freefall.Graphics
         private const int DeferredDisposeFrames = 3 + 1;
         private readonly List<(IDisposable resource, int tickToDispose)> _frameDeferredDisposals = new();
 
+        private IDXGIAdapter3? _memoryAdapter;
+
+        /// <summary>
+        /// The adapter's local (video) memory as the OS counts it for this process, in MiB: in use now, and the budget it
+        /// gives the process (DXGI QueryVideoMemoryInfo). Null when the adapter cannot be asked. For engine_stats.
+        /// </summary>
+        public object? DescribeVideoMemory()
+        {
+            try
+            {
+                long luid = _device.AdapterLuid;
+                // LUID is { uint LowPart; int HighPart }: the same 8 bytes as the long D3D12 hands back
+                _memoryAdapter ??= _factory.EnumAdapterByLuid<IDXGIAdapter3>(
+                    System.Runtime.CompilerServices.Unsafe.As<long, Vortice.Luid>(ref luid));
+                var info = _memoryAdapter.QueryVideoMemoryInfo(0, MemorySegmentGroup.Local);
+                return new
+                {
+                    usageMiB = Math.Round(info.CurrentUsage / 1048576.0, 1),
+                    budgetMiB = Math.Round(info.Budget / 1048576.0, 1),
+                };
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         /// <summary>
         /// Dispose <paramref name="resource"/> once every frame currently in flight has finished.
         /// Safe to call from Update/Destroy on the main thread; pass null to no-op.

@@ -325,6 +325,113 @@ namespace Freefall.Assets
             internal readonly List<HeightStampDescriptorGPU> Descriptors = new();
             internal readonly List<StampSplinePointGPU> SplinePoints = new();
             internal readonly List<string> Sources = new();   // GUIDs of the heightmap textures, in the order the plan uses them
+
+            // Brushes: the heightmap textures the stamps read, each once, and which descriptor or import step reads which.
+            // The plan holds a placeholder (BrushPlaceholder) where a brush's bindless index goes; the indices go in only
+            // when the plan is uploaded (ResolveBrushes), since an on-demand brush (TextureImporter.LoadOnDemand) has a GPU
+            // copy only while somebody holds it. A bake holds the brushes its pages read (BrushesForBox / BrushesForPages)
+            // from before it is recorded until its list has retired. The hash sees only that a stamp has a heightmap.
+            internal readonly List<Texture> Brushes = new();
+            internal readonly List<(int Descriptor, int Brush)> DescriptorBrushes = new();
+            internal readonly List<(int Step, int Brush)> StepBrushes = new();
+            private int[]? _brushOf;    // per descriptor: its brush, or -1
+
+            /// <summary>The brush's index in <see cref="Brushes"/>, added the first time.</summary>
+            internal int BrushSlot(Texture texture)
+            {
+                int slot = Brushes.IndexOf(texture);
+                if (slot < 0)
+                {
+                    slot = Brushes.Count;
+                    Brushes.Add(texture);
+                }
+                return slot;
+            }
+
+            /// <summary>
+            /// The brushes a bake of this box of pages reads (px0, py0 inclusive, px1, py1 exclusive; every page for null):
+            /// those of the descriptors in the pages' lists, and every import step's (an import covers every page).
+            /// </summary>
+            internal List<Texture> BrushesForBox((int px0, int py0, int px1, int py1)? box)
+            {
+                if (Brushes.Count == 0) return new List<Texture>();
+                if (box is not { } b || (b.px0 <= 0 && b.py0 <= 0 && b.px1 >= PagesAcross && b.py1 >= PagesAcross))
+                    return new List<Texture>(Brushes);
+                var used = new bool[Brushes.Count];
+                for (int py = Math.Max(b.py0, 0); py < Math.Min(b.py1, PagesAcross); py++)
+                    for (int px = Math.Max(b.px0, 0); px < Math.Min(b.px1, PagesAcross); px++)
+                        MarkPageBrushes(px, py, used);
+                return Picked(used);
+            }
+
+            /// <summary>The brushes a bake of these pages reads (<see cref="BrushesForBox"/>).</summary>
+            internal List<Texture> BrushesForPages(IReadOnlyList<(int px, int py, int slot)> pages)
+            {
+                if (Brushes.Count == 0) return new List<Texture>();
+                var used = new bool[Brushes.Count];
+                foreach (var (px, py, _) in pages)
+                    MarkPageBrushes(px, py, used);
+                return Picked(used);
+            }
+
+            private void MarkPageBrushes(int px, int py, bool[] used)
+            {
+                foreach (var (_, brush) in StepBrushes) used[brush] = true;
+                if (DescriptorBrushes.Count == 0) return;
+                if (_brushOf == null)
+                {
+                    var brushOf = new int[Descriptors.Count];
+                    Array.Fill(brushOf, -1);
+                    foreach (var (d, brush) in DescriptorBrushes) brushOf[d] = brush;
+                    _brushOf = brushOf;
+                }
+                int page = py * PagesAcross + px;
+                foreach (var step in Steps)
+                {
+                    if (step.Kind != HeightStepKind.Influence) continue;
+                    var (start, count) = PageRuns[step.PageRuns + page];
+                    for (int i = start; i < start + count; i++)
+                        if (_brushOf[PageStamps[i]] is var brush && brush >= 0) used[brush] = true;
+                }
+            }
+
+            private List<Texture> Picked(bool[] used)
+            {
+                var list = new List<Texture>();
+                for (int i = 0; i < used.Length; i++)
+                    if (used[i]) list.Add(Brushes[i]);
+                return list;
+            }
+
+            /// <summary>
+            /// Write every brush's bindless index where the plan reads it, as it is now: 0 for a brush without a GPU copy (a
+            /// stamp then bakes without its relief, an import step is skipped). Only the brushes the bake holds are read on
+            /// the GPU. True when an index changed since the last call, so an upload of this plan is out of date.
+            /// </summary>
+            internal bool ResolveBrushes()
+            {
+                bool changed = false;
+                foreach (var (d, brush) in DescriptorBrushes)
+                {
+                    uint index = Brushes[brush].BindlessIndex;
+                    var desc = Descriptors[d];
+                    if (desc.HeightmapIdx == index) continue;
+                    desc.HeightmapIdx = index;
+                    Descriptors[d] = desc;
+                    changed = true;
+                }
+                foreach (var (s, brush) in StepBrushes)
+                {
+                    uint index = Brushes[brush].BindlessIndex;
+                    var step = Steps[s];
+                    if (step.SourceSrv == index) continue;
+                    step.SourceSrv = index;
+                    Steps[s] = step;
+                    changed = true;
+                }
+                return changed;
+            }
+
             internal int Resolution;
             internal Vector2 TerrainSize;
             internal float MaxHeight;
@@ -406,6 +513,8 @@ namespace Freefall.Assets
 
                 var descriptors = Descriptors.ToArray();
                 for (int i = 0; i < descriptors.Length; i++) descriptors[i].HeightmapIdx = descriptors[i].HeightmapIdx != 0 ? 1u : 0u;
+                // A stamp's brush counts as there whether or not it has a GPU copy now (ResolveBrushes may have written 0)
+                foreach (var (d, _) in DescriptorBrushes) descriptors[d].HeightmapIdx = 1u;
                 h = Fnv.Mix(h, MemoryMarshal.AsBytes(descriptors.AsSpan()));
 
                 h = Fnv.Mix(h, MemoryMarshal.AsBytes(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(SplinePoints)));
@@ -451,6 +560,14 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// What a plan holds where a brush's bindless index goes until <see cref="HeightPlan.ResolveBrushes"/>: 1 for a
+        /// heightmap that is there (loaded, or on demand), 0 for none (no texture, or a reference whose asset never
+        /// loaded). The hash takes any index as 1, so a plan hashes as it did when every brush was resident.
+        /// </summary>
+        private static uint BrushPlaceholder(Texture? texture)
+            => texture != null && (texture.OnDemand || texture.BindlessIndex != 0) ? 1u : 0u;
+
+        /// <summary>
         /// Collect the height stamps that apply to the terrain and lay out the bake: consecutive
         /// HeightStamps become one step, and every whole-terrain operation (import, noise) is a step of its
         /// own at its place in the priority order. Main thread.
@@ -492,7 +609,7 @@ namespace Freefall.Assets
                     case HeightStamp height when height.IsGlobal:
                     {
                         // Whole-terrain import: nothing to do without a heightmap
-                        if (height.Heightmap == null || height.Heightmap.BindlessIndex == 0) break;
+                        if (BrushPlaceholder(height.Heightmap) == 0) break;
                         CloseRun();
                         plan.Sources.Add(height.Heightmap.Guid ?? height.Heightmap.Name ?? "");
                         // World Y, as the target height of a local stamp (see TryBuildHeightDescriptor)
@@ -502,7 +619,7 @@ namespace Freefall.Assets
                             Kind = HeightStepKind.Import,
                             BlendMode = (uint)HeightBlendMode.Set,
                             Opacity = 1f,
-                            SourceSrv = height.Heightmap.BindlessIndex,
+                            SourceSrv = BrushPlaceholder(height.Heightmap),     // ResolveBrushes
                             Scale = height.Strength / maxHeight * (height.InvertShape ? -1f : 1f),
                             Bias = baseY / maxHeight,
                             // Laid over the terrain as it is, in world metres: its first sample on the terrain's
@@ -510,6 +627,7 @@ namespace Freefall.Assets
                             ImportMin = plan.Origin,
                             ImportInvSize = new Vector2(1f / terrainSize.X, 1f / terrainSize.Y),
                         });
+                        plan.StepBrushes.Add((plan.Steps.Count - 1, plan.BrushSlot(height.Heightmap!)));
                         break;
                     }
 
@@ -518,6 +636,8 @@ namespace Freefall.Assets
                         {
                             plan.Descriptors.Add(desc);
                             if (height.Heightmap != null) plan.Sources.Add(height.Heightmap.Guid ?? height.Heightmap.Name ?? "");
+                            if (desc.HeightmapIdx != 0)
+                                plan.DescriptorBrushes.Add((plan.Descriptors.Count - 1, plan.BrushSlot(height.Heightmap!)));
                         }
                         break;
 
@@ -699,7 +819,7 @@ namespace Freefall.Assets
 
             if (stamp.Heightmap != null)
             {
-                desc.HeightmapIdx = stamp.Heightmap.BindlessIndex;
+                desc.HeightmapIdx = BrushPlaceholder(stamp.Heightmap);     // the plan's ResolveBrushes writes the index
                 desc.HeightmapStrength = stamp.Strength / maxHeight;
 
                 if (stamp.IsSplineMode)
@@ -856,12 +976,9 @@ namespace Freefall.Assets
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
 
-            bool fresh = _pool.Ensure(plan.Resolution, PoolCapacity, cmd);
-            // Another grid or height range than the last bake's moves every sample, whatever region the caller saw
-            var grid = (plan.Resolution, plan.Origin, plan.Spacing, plan.MaxHeight);
-            bool gridChanged = _bakedGrid is { } last && last != grid;
-            _bakedGrid = grid;
-            var box = fresh || gridChanged || pages == null ? (0, 0, plan.PagesAcross, plan.PagesAcross) : pages.Value;
+            var box = BakeBox(plan, pages);
+            _pool.Ensure(plan.Resolution, PoolCapacity, cmd);
+            _bakedGrid = (plan.Resolution, plan.Origin, plan.Spacing, plan.MaxHeight);
 
             UploadHeightPlan(plan);
             _lastPlan = plan;
@@ -889,6 +1006,20 @@ namespace Freefall.Assets
             cmd.ResourceBarrierTransition(_pool.Texture, ResourceStates.UnorderedAccess, ResourceStates.Common);
             if (_pool.AllResident) _pool.Filled = true;
             HeightVersion++;
+        }
+
+        /// <summary>
+        /// The pages <see cref="BakeHeight"/> bakes for this plan and box if it runs now: every page when the pool is yet to
+        /// be made at this size and layout (a new pool holds nothing), or the plan's grid or height range is not the last
+        /// bake's (every sample moves, whatever region the caller saw). The renderer holds the brushes of this box for the
+        /// bake (<see cref="HeightPlan.BrushesForBox"/>), so both must see the same <see cref="PoolCapacity"/>.
+        /// </summary>
+        public (int px0, int py0, int px1, int py1) BakeBox(HeightPlan plan, (int px0, int py0, int px1, int py1)? pages)
+        {
+            bool fresh = !_pool.Matches(plan.Resolution, PoolCapacity);
+            var grid = (plan.Resolution, plan.Origin, plan.Spacing, plan.MaxHeight);
+            bool gridChanged = _bakedGrid is { } last && last != grid;
+            return fresh || gridChanged || pages == null ? (0, 0, plan.PagesAcross, plan.PagesAcross) : pages.Value;
         }
 
         /// <summary>
@@ -941,7 +1072,10 @@ namespace Freefall.Assets
         /// </summary>
         private void UploadHeightPlan(HeightPlan plan)
         {
-            if (_uploadedHeightPlan == plan) return;
+            // The brushes' bindless indices as they are now: a brush dropped and loaded again since the last upload of this
+            // plan has another one (the readback's scratch bakes with the last bake's plan)
+            bool brushesMoved = plan.ResolveBrushes();
+            if (_uploadedHeightPlan == plan && !brushesMoved) return;
             _uploadedHeightPlan = plan;
             var steps = new List<HeightStepGPU>(plan.Steps.Count);
             foreach (var step in plan.Steps) steps.Add(step.ToGpu());
@@ -1011,6 +1145,9 @@ namespace Freefall.Assets
             for (int s = 0; s < plan.Steps.Count; s++)
             {
                 var step = plan.Steps[s];
+                // An import whose brush could not be loaded (ResolveBrushes wrote 0) is left out, as a heightmap that never
+                // loaded always was
+                if (step.Kind == HeightStepKind.Import && step.SourceSrv == 0) continue;
                 if (step.Kind == HeightStepKind.Influence)
                     DispatchInfluence(cmd, plan, step, pages, wholeRuns);
                 else
@@ -1759,10 +1896,14 @@ namespace Freefall.Assets
         {
             var device = Engine.Device;
             EnsureInitialized();
+            // The brushes these pages read, held until the GPU is done (usually still held by the bake before this readback)
+            var brushes = plan.BrushesForPages(pages);
+            foreach (var brush in brushes) brush.Acquire();
             var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
             var cmd = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
             try
             {
+                OnDemandTextures.WaitGpuReady(brushes);
                 cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
                 cmd.SetComputeRootSignature(device.GlobalRootSignature);
                 UploadHeightPlan(plan);
@@ -1776,6 +1917,7 @@ namespace Freefall.Assets
             {
                 cmd.Dispose();
                 allocator.Dispose();
+                foreach (var brush in brushes) brush.Release();
             }
         }
 

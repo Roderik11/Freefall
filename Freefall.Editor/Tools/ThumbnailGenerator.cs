@@ -63,10 +63,23 @@ namespace Freefall.Editor
         public bool Generate(string guid, AssetManager assets, object renderer)
         {
             var texture = assets.LoadByGuid<Texture>(guid);
-            if (texture?.Native == null) return false;
+            if (texture == null) return false;
 
-            var tr = (ThumbnailRenderer)renderer;
-            var pixels = tr.RenderTextureThumbnail(texture);
+            // An on-demand texture (a terrain brush) is held for the thumbnail and let go after: the thumbnail renderer
+            // submits and waits
+            byte[] pixels;
+            texture.Acquire();
+            try
+            {
+                texture.WaitGpuReady();
+                if (texture.Native == null) return false;
+                var tr = (ThumbnailRenderer)renderer;
+                pixels = tr.RenderTextureThumbnail(texture);
+            }
+            finally
+            {
+                texture.Release();
+            }
             if (pixels == null) return false;
 
             var thumbPath = AssetDatabase.GetThumbnailPath(guid);

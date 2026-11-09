@@ -55,6 +55,15 @@ namespace Freefall.Assets.Importers
 
         public bool sRGB = true;
         public bool GenerateMips = true;
+
+        /// <summary>
+        /// Loaded without its GPU copy, which code that reads the texture makes while it holds it (Texture.OnDemand):
+        /// the terrain's brush heightmaps, needed only when a height bake reads them. A material sampling such a texture
+        /// sees nothing. Takes effect when the texture is loaded anew: the editor keeps a loaded texture across scene loads
+        /// (and reloads it in place on a reimport), so there from its next start; a published game always.
+        /// </summary>
+        [System.ComponentModel.Description("Loaded only while code that reads it holds it, as a height bake does its brushes. A material sampling it sees nothing. In the editor from its next start")]
+        public bool LoadOnDemand = false;
         public bool IsNormalMap = false;
         public bool AlphaFromGrayscale = false;
         public bool IgnoreAlpha = false;
@@ -235,8 +244,9 @@ namespace Freefall.Assets.Importers
 
                 var args = $"-y -gpu 0 -f {format}";
 
-                if (GenerateMips)
-                    args += " -m 0";
+                // texconv builds the whole chain unless told otherwise: without "-m 1" GenerateMips off changed nothing
+                // (until 2026-11-09 the terrain brushes took a quarter more for mips no shader read)
+                args += GenerateMips ? " -m 0" : " -m 1";
 
                 // Premultiplied alpha: multiplies RGB×A so transparent pixels stay
                 // black (0,0,0,0), fixing white fringing at alpha edges.

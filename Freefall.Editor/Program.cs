@@ -94,6 +94,10 @@ namespace Freefall.Editor
             // Initialize engine WITHOUT a project (landing page first)
             Engine.Initialize(form.Handle, form.ClientSize.Width, form.ClientSize.Height);
 
+            // On-demand textures (the terrain's brushes) stay on the GPU a while after a bake let go of them: editing a stamp
+            // again does not upload its brush again. 64 MiB = eight 2048² R16 brushes; the player keeps none (0)
+            OnDemandTextures.IdleBudget = 64L << 20;
+
             // Register editor assembly so Reflector can discover PropertyControl types, GUIInspectors, etc.
             Freefall.Reflection.Reflector.RegisterAssemblies(System.Reflection.Assembly.GetAssembly(typeof(Program)));
 

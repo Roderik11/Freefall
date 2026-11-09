@@ -11,7 +11,7 @@ using Freefall.Assets;
 namespace Freefall.Graphics
 {
     [AssetTypeAlias("DdsTextureData")]
-    public class Texture : Asset, IDisposable
+    public partial class Texture : Asset, IDisposable
     {
         protected ID3D12Resource _resource;
         public ID3D12Resource Native => _resource;
@@ -399,22 +399,36 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
         public static Texture CreateAsync(GraphicsDevice device, CpuTextureData cpuData)
         {
             var texture = new Texture();
+            texture.CreateGpuCopy(device, cpuData, trackUpload: false);
+            texture.AssetPath = cpuData.Path;
+            texture.Name = Path.GetFileNameWithoutExtension(cpuData.Path);
+            return texture;
+        }
+
+        /// <summary>
+        /// Make this texture's GPU copy: a committed resource and a bindless SRV now, the pixels queued for the copy queue
+        /// (StreamingManager). With <paramref name="trackUpload"/> the texture counts as not ready (<see cref="Asset.IsReady"/>)
+        /// until the upload thread has submitted that copy; otherwise it counts as ready at once, as it always has (the render
+        /// queue waits for the copy queue's submissions each frame). Main thread.
+        /// </summary>
+        private void CreateGpuCopy(GraphicsDevice device, CpuTextureData cpuData, bool trackUpload)
+        {
             // 1. Create committed resource (fast on main thread)
             var desc = ResourceDescription.Texture2D(cpuData.Format, (uint)cpuData.Width, (uint)cpuData.Height, (ushort)cpuData.ArraySize, (ushort)cpuData.MipLevels);
-            
+
             // Textures on copy queue should be in Common or CopyDest
-            texture._resource = device.NativeDevice.CreateCommittedResource(
+            _resource = device.NativeDevice.CreateCommittedResource(
                 new HeapProperties(HeapType.Default),
                 HeapFlags.None,
                 desc,
                 ResourceStates.Common); // Implicit promotion to CopyDest will happen on CopyQueue
-            device.NameForDebug(texture._resource);
+            device.NameForDebug(_resource);
 
             // 2. Create SRV immediately (so we can bind it even if black/empty)
-            texture.BindlessIndex = device.AllocateBindlessIndex();
-            texture.SrvCpuHandle = device.GetCpuHandle(texture.BindlessIndex);
-            texture.SrvHandle = device.GetGpuHandle(texture.BindlessIndex);
-            
+            BindlessIndex = device.AllocateBindlessIndex();
+            SrvCpuHandle = device.GetCpuHandle(BindlessIndex);
+            SrvHandle = device.GetGpuHandle(BindlessIndex);
+
             var srvDesc = new ShaderResourceViewDescription
             {
                 Format = cpuData.Format,
@@ -422,15 +436,12 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
                 Shader4ComponentMapping = ShaderComponentMapping.Default,
                 Texture2D = new Texture2DShaderResourceView { MipLevels = (uint)cpuData.MipLevels }
             };
-            device.NativeDevice.CreateShaderResourceView(texture._resource, srvDesc, texture.SrvCpuHandle);
+            device.NativeDevice.CreateShaderResourceView(_resource, srvDesc, SrvCpuHandle);
 
-            // 3. Queue Upload
-            StreamingManager.Instance.EnqueueTextureUpload(texture, cpuData);
-            
-            texture.AssetPath = cpuData.Path;
-            texture.Name = Path.GetFileNameWithoutExtension(cpuData.Path);
-            
-            return texture;
+            // 3. Queue Upload. The upload thread sets the ready fence once it has submitted the copy, so "not ready" goes
+            // first: set after the enqueue it could overwrite that fence
+            if (trackUpload) SetReadyFence(long.MaxValue);
+            StreamingManager.Instance.EnqueueTextureUpload(this, cpuData);
         }
 
         public static Texture CreateFromCpuData(GraphicsDevice device, CpuTextureData cpuData)
@@ -734,6 +745,13 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
 
         public void Dispose()
         {
+            // An on-demand texture's copy may be on a list still in flight (a bake that acquired it): it goes once they
+            // are done, and a reader that still holds the texture gets a new copy (Texture.OnDemand.cs)
+            if (OnDemand)
+            {
+                DisposeOnDemand();
+                return;
+            }
             _resource?.Dispose();
              // Release bindless index?
         }

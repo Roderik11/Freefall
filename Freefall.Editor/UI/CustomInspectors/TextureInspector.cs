@@ -58,6 +58,8 @@ namespace Freefall.Editor
             // Texture info (read-only)
             AddCategory("Texture");
             AddText("Name", tex?.Name ?? "(unnamed)");
+            if (tex is { OnDemand: true })
+                AddText("Loaded", tex.Native != null ? $"on demand: on the GPU, held by {tex.Readers}" : "on demand: not on the GPU");
 
             if (tex?.Native != null)
             {

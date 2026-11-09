@@ -400,6 +400,9 @@ namespace Freefall.Components
             _computeInitialized = false;
             var device = Engine.Device;
 
+            // The brushes a bake held: their copies outlive the frames in flight (Texture.DropGpuCopy defers them)
+            LetGoOfBrushes();
+
             // Nothing below is released here. The command lists of the frames in flight still bind these
             // buffers, textures and pipeline states, copy into the readback buffers and index the descriptor
             // heap with the bindless slots; releasing them now risks removing the device (see
@@ -673,7 +676,7 @@ namespace Freefall.Components
             }
 
             // ── Height: lay out the bake from the height stamps in scope ──
-            bool heightBake = Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake);
+            bool heightBake = Terrain.NeedsUpdate(TerrainDirtyFlags.HeightBake);
             TerrainBaker.HeightPlan? heightPlan = null;
             if (heightBake)
             {
@@ -681,6 +684,26 @@ namespace Freefall.Components
                     heightPlan = _baker.PrepareHeight(Terrain, this);
             }
             bool hasHeightWork = heightPlan is { HasWork: true };
+
+            // The first bake of this renderer, of a map that is already right: keep it (it reads no brush)
+            bool keepHeights = false;
+            if (heightBake && _initialHeightCheck)
+            {
+                _initialHeightCheck = false;
+                keepHeights = hasHeightWork && KeepsHeights(heightPlan!);
+            }
+
+            // A bake waits until the brushes its pages read are on the GPU (on-demand heightmaps, Texture.OnDemand): its flag
+            // stays set and its region keeps gathering, and the next frame lays it out again
+            if (heightBake && hasHeightWork && !keepHeights && !HoldBrushes(heightPlan!, PendingHeightPages(heightPlan!)))
+            {
+                heightBake = false;
+                heightPlan = null;
+                hasHeightWork = false;
+            }
+            if (heightBake)
+                Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake);
+
             (int px0, int py0, int px1, int py1)? heightPages = null;
             if (heightBake)
             {
@@ -696,15 +719,10 @@ namespace Freefall.Components
                 _heightBakeMax = new Vector2(float.MinValue);
             }
 
-            // The first bake of this renderer, of a map that is already right: keep it
-            if (heightBake && _initialHeightCheck)
+            if (keepHeights)
             {
-                _initialHeightCheck = false;
-                if (hasHeightWork && KeepsHeights(heightPlan!))
-                {
-                    hasHeightWork = false;
-                    KeepHeights();
-                }
+                hasHeightWork = false;
+                KeepHeights();
             }
 
             // ── Palette: the layers and decorators this terrain renders are whatever its stamps reference ──
@@ -780,6 +798,12 @@ namespace Freefall.Components
             // Debounced readback into the CPU store (Terrain.Pages) — only when baking has settled (not while a stamp is dragged)
             if (_needHeightFieldReadback && !Terrain.NeedsUpdate(TerrainDirtyFlags.HeightBake))
                 ReadBackHeights();
+
+            // The brushes the last bake held go once its list has run and its heights are read back (the readback's scratch
+            // bakes read them too); their GPU copies go into the idle list or after the frames in flight
+            if (_heldBrushes.Count > 0 && !_needHeightFieldReadback && !Terrain.NeedsUpdate(TerrainDirtyFlags.HeightBake)
+                && System.Threading.Volatile.Read(ref _heightBakesPending) == 0)
+                LetGoOfBrushes();
 
             // ── Paint: the splat stamps laid out once, baked into the paint pool page by page (TERRAIN_PAGES_PLAN.md 5b) ──
             // An edit marks the pages over its region dirty; new heights or another palette mark every page (they may move
@@ -3302,7 +3326,20 @@ namespace Freefall.Components
         {
             if (Terrain == null) return;
             var plan = _baker.PrepareHeight(Terrain, this);
-            var (inPlace, bDiffers, cDiffers, borderDiffers, maxStep, aMs, bMs) = _baker.CheckPageBake(Terrain, plan);
+            // Every page bakes: every brush, held until the bakes are done (they block)
+            var brushes = plan.BrushesForBox(null);
+            foreach (var brush in brushes) brush.Acquire();
+            (long inPlace, long bDiffers, long cDiffers, long borderDiffers, int maxStep, double aMs, double bMs) result;
+            try
+            {
+                OnDemandTextures.WaitGpuReady(brushes);
+                result = _baker.CheckPageBake(Terrain, plan);
+            }
+            finally
+            {
+                foreach (var brush in brushes) brush.Release();
+            }
+            var (inPlace, bDiffers, cDiffers, borderDiffers, maxStep, aMs, bMs) = result;
             int pages = plan.Pages * plan.Pages;
             PageBakeCheck = (inPlace == 0 && bDiffers == 0 && cDiffers == 0 && borderDiffers == 0 ? "equal" : "DIFFERENT") +
                             $": {pages} pages; against every stamp on every page, {inPlace} texels of the pool in place " +
@@ -3500,6 +3537,47 @@ namespace Freefall.Components
             if (why != null)
                 Debug.LogAlways($"[Terrain] '{Terrain.Name}': heights baked, not kept: {why}");
             return why == null;
+        }
+
+        // The brushes (on-demand heightmaps) the coming or last height bake reads: held from before it is recorded until its
+        // list has run and its heights are read back. Brushes that are not on demand count as held always.
+        private List<Texture> _heldBrushes = new();
+
+        /// <summary>The pages the height bake laid out now would go over: where stamps changed since the last bake was
+        /// laid out, or all of them (null), as the bake below takes them.</summary>
+        private (int px0, int py0, int px1, int py1)? PendingHeightPages(TerrainBaker.HeightPlan plan)
+            => _heightRegionMarked && !_heightBakeAll && _heightBakeMax.X >= _heightBakeMin.X
+                ? plan.PagesOf(_heightBakeMin, _heightBakeMax)
+                : null;
+
+        /// <summary>
+        /// Hold the brushes a bake of this plan over these pages reads (every page when the pool is new or the grid
+        /// changed: <see cref="TerrainBaker.BakeBox"/>), letting go of those held before (a brush in both stays). True when
+        /// all of them are on the GPU, so the bake may be recorded now.
+        /// </summary>
+        private bool HoldBrushes(TerrainBaker.HeightPlan plan, (int px0, int py0, int px1, int py1)? pages)
+        {
+            var brushes = plan.BrushesForBox(_baker.BakeBox(plan, pages));
+            foreach (var brush in brushes) brush.Acquire();
+            foreach (var brush in _heldBrushes) brush.Release();
+            _heldBrushes = brushes;
+            bool ready = true;
+            foreach (var brush in brushes) ready &= brush.GpuReady;
+
+            // A read and an upload take a few frames; one that never comes would hold the heights back unseen
+            _brushWaitFrames = ready ? 0 : _brushWaitFrames + 1;
+            if (_brushWaitFrames == 600)
+                Debug.LogWarning("[Terrain]", $"'{Terrain.Name}': the height bake has waited 600 frames for its brushes: " +
+                                 string.Join(", ", brushes.Where(b => !b.GpuReady).Select(b => b.Name)));
+            return ready;
+        }
+
+        private int _brushWaitFrames;
+
+        private void LetGoOfBrushes()
+        {
+            foreach (var brush in _heldBrushes) brush.Release();
+            _heldBrushes = new List<Texture>();
         }
 
         /// <summary>

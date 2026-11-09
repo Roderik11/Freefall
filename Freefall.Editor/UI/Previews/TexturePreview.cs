@@ -65,10 +65,24 @@ namespace Freefall.Editor
             Controls.Add(lblInfo);
         }
 
+        // The on-demand texture this preview holds (Texture.OnDemand): its GPU copy is made for the preview
+        private Texture _held;
+
+        private void Hold(Texture texture)
+        {
+            if (ReferenceEquals(_held, texture)) return;
+            texture?.Acquire();
+            _held?.Release();
+            _held = texture;
+            if (texture is { OnDemand: true })
+                texture.WaitGpuReady();
+        }
+
         public void Bind(Texture texture, InspectorControl inspector)
         {
             _texture = texture;
             _inspector = inspector;
+            Hold(texture);
 
             if (texture?.Native != null)
             {
@@ -88,11 +102,14 @@ namespace Freefall.Editor
         public void OnEnable()
         {
             if (_inspector == null) return;
+            Hold(_texture);
             _inspector.PreviewView.OnRender = OnRender;
         }
 
         public void OnDisable()
         {
+            // Another texture's inspector binds this preview before the old one is disabled: OnEnable holds it again
+            Hold(null);
             if (_inspector == null) return;
             _inspector.PreviewView.OnRender = null;
         }
@@ -102,7 +119,9 @@ namespace Freefall.Editor
         private void OnRender(RenderView view)
         {
             if (_texture == null) return;
-            
+            // An on-demand texture loaded again (reimported) is uploaded by asking
+            if (_texture.OnDemand && !_texture.GpuReady) return;
+
             var cmd = RenderView.Primary?.CommandList?.Native;
             if (cmd == null) return;
 
