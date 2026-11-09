@@ -232,7 +232,10 @@ float StampWeightAt(
     if (dist <= radius)
         return fade;
 
-    float t = (dist - radius) / max(falloff, 0.001);
+    // 'falloff' is terrain UV, so the guard must be tiny (1e-7: 1.6 mm on 16 km). It was 0.001, 16.4 m on TestWorld and
+    // 4 m on Eldermoor: every falloff shorter than that was spread over it and then cut at radius + falloff, so a
+    // road's 4 m bank kept 0.9 of its height to 1 m short of the edge and dropped there in a wall (2026-11-10)
+    float t = (dist - radius) / max(falloff, 1e-7);
     return (1.0 - t * t * (3.0 - 2.0 * t)) * fade;
 }
 
