@@ -227,8 +227,17 @@ namespace Freefall
 
             // Initialize Rendering Foundation — view auto-registers in RenderView.All
             var view = new RenderView(handle, width, height, Device);
-            view.Pipeline = new DeferredRenderer();
-            view.Pipeline.Initialize(width, height);
+
+            // A game draws its scene through the window's view. The editor draws only its UI there (Program.RenderGui),
+            // the scene viewport having a renderer of its own (ViewportControl): a renderer here would be the G-buffer,
+            // post targets, cascades, point-light atlas and Hi-Z at the window's size, 475 MiB at 3440×1369, allocated
+            // and never drawn with (performance/vram.md)
+            if (!editor)
+            {
+                var renderer = new DeferredRenderer();
+                renderer.Initialize(width, height);
+                view.Pipeline = renderer;
+            }
 
             Input.Init(handle);
 

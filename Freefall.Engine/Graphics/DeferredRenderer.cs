@@ -15,6 +15,10 @@ namespace Freefall.Graphics
     {
         private const int FrameCount = 3;
         
+        /// <summary>
+        /// The renderer drawing now, inside its <see cref="Render"/>; between frames the first one made: the window's in a
+        /// game, the scene viewport's in the editor (whose window view has none), null before it exists.
+        /// </summary>
         public static DeferredRenderer Current { get; private set; } = null!;
 
         public RenderTexture2D Albedo;

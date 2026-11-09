@@ -37,7 +37,11 @@ namespace Freefall.Graphics
         // Command recording - Buffered per frame
         private CommandList[] _commandLists;
         public CommandList CommandList => _commandLists?[_frameIndex];
-        public RenderPipeline Pipeline { get; set; } = null!;
+        /// <summary>
+        /// What draws a camera aimed at this view, or null: the editor's window view has none (it draws only the UI;
+        /// the scene viewport's headless view has the renderer).
+        /// </summary>
+        public RenderPipeline? Pipeline { get; set; }
 
         private bool _tearingSupported;
         private IntPtr _frameLatencyWaitableObject;
