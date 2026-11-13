@@ -119,6 +119,17 @@ namespace Freefall.Assets
             }
         }
 
+        /// <summary>Every loaded asset of class T (each instance once, whatever keys it is cached under).</summary>
+        public List<T> Loaded<T>() where T : Asset
+        {
+            var seen = new HashSet<Asset>(ReferenceEqualityComparer.Instance);
+            var list = new List<T>();
+            foreach (var asset in _assets.Values)
+                if (asset is T t && seen.Add(asset))
+                    list.Add(t);
+            return list;
+        }
+
         /// <summary>
         /// Evict every cached asset whose class the predicate selects. Script hot reload calls this for the
         /// asset classes defined in the script assemblies it unloads: a cached instance keeps its whole

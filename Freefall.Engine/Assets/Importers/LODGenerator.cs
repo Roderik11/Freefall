@@ -20,7 +20,7 @@ namespace Freefall.Assets.Importers
     /// over (meshoptimizer's error estimate, which runs well above what shows: on the pack rocks levels of
     /// 3-4 px looked the same as LOD 0, 8-10 px held up at their switch size, 24 px broke the silhouette).
     /// </summary>
-    internal static unsafe class LODGenerator
+    public static unsafe class LODGenerator
     {
         // How much a change of the vertex normals counts against a change of shape (meshoptimizer's attribute
         // weight; 1 makes a normal change of 1 count like a move across the whole mesh). Low on purpose: on the
@@ -59,6 +59,49 @@ namespace Freefall.Assets.Importers
         /// Largest shape change of a level, in pixels of a 1080p screen at the size where the level takes over. A level
         /// that cannot reach its ratio within it keeps more triangles. 0 = no limit.
         /// </param>
+        /// <summary>
+        /// Simplify a triangle list as far as an absolute error allows (metres, in the positions' space), keeping its open
+        /// borders and its attribute seams (vertices with the same position but other normals stay apart). For generated
+        /// meshes made on an even grid (the project's Cliff): flat stretches merge into a few large triangles while the
+        /// shape stays within <paramref name="maxError"/>. Returns the indices unchanged if meshoptimizer is missing or
+        /// nothing could be removed. The indices keep referencing the same vertices.
+        /// </summary>
+        public static uint[] Simplify(IReadOnlyList<Vector3> positions, IReadOnlyList<Vector3> normals, uint[] indices, float maxError)
+        {
+            if (_libraryMissing || indices.Length < 3 || positions.Count == 0 || normals.Count != positions.Count) return indices;
+            var pos = new Vector3[positions.Count];
+            var nrm = new Vector3[normals.Count];
+            for (int i = 0; i < pos.Length; i++) { pos[i] = positions[i]; nrm[i] = normals[i]; }
+
+            try
+            {
+                var result = new uint[indices.Length];
+                float error = 0f;
+                nuint count;
+                float* weights = stackalloc float[3] { NormalWeight, NormalWeight, NormalWeight };
+                fixed (uint* dst = result)
+                fixed (uint* idx = indices)
+                fixed (Vector3* p = pos)
+                fixed (Vector3* n = nrm)
+                {
+                    count = meshopt_simplifyWithAttributes(dst, idx, (nuint)indices.Length,
+                        (float*)p, (nuint)pos.Length, (nuint)sizeof(Vector3),
+                        (float*)n, (nuint)sizeof(Vector3), weights, 3,
+                        null, 0, maxError, SimplifyLockBorder | SimplifyErrorAbsolute, &error);
+                    if (count >= 3 && (int)count < indices.Length)
+                        meshopt_optimizeVertexCache(dst, dst, count, (nuint)pos.Length);
+                }
+                if (count < 3 || (int)count >= indices.Length) return indices;
+                Array.Resize(ref result, (int)count);
+                return result;
+            }
+            catch (DllNotFoundException)
+            {
+                _libraryMissing = true;
+                return indices;
+            }
+        }
+
         public static List<MeshLOD> Generate(List<MeshPart> parts, List<Vector3> positions, List<Vector3> normals, List<uint> indices,
             IReadOnlyList<float> ratios, int minTriangles, float pixelError, string meshName)
         {

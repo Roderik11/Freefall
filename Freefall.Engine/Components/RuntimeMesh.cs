@@ -779,8 +779,12 @@ namespace Freefall.Components
                 case RuntimeMeshHeightMode.Surface:
                     var terrain = EntityManager.FindComponent<TerrainRenderer>() as IHeightProvider;
                     if (terrain == null) break;
-                    var worldMatrix = Transform?.Matrix ?? Matrix4x4.Identity;
-                    float localY = Transform?.Position.Y ?? 0;
+                    // The world transform, not the local one: under a parent that stands somewhere (a place's group)
+                    // the local matrix sampled the terrain at the entity's coordinates in its parent's space, and
+                    // the local Y left the mesh the parent's height too high (TestWorld's Spurwatch walls stood at
+                    // y 225 over ground at 125).
+                    var worldMatrix = Transform?.WorldMatrix ?? Matrix4x4.Identity;
+                    float localY = Transform?.WorldPosition.Y ?? 0;
                     for (int i = 0; i < points.Length; i++)
                     {
                         var worldPos = Vector3.Transform(points[i], worldMatrix);

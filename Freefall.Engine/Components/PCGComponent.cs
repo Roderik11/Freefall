@@ -35,6 +35,13 @@ namespace Freefall.Components
         public bool ExecuteOnAwake = true;
 
         /// <summary>
+        /// Varies this entity's output from others using the same graph (0 = the graph's own seed): two banks
+        /// dressed by one graph get different rocks.
+        /// </summary>
+        [System.ComponentModel.Description("Varies this entity's output from others using the same graph; 0 = the graph's own")]
+        public int Seed;
+
+        /// <summary>
         /// Child entity that holds all spawned output.
         /// Destroyed and recreated on each Execute() call.
         /// </summary>
@@ -101,7 +108,7 @@ namespace Freefall.Components
 
             // 4. Execute graph
             using (_graphMarker.Auto())
-                Graph.Execute();
+                Graph.Execute(Seed);
 
             int childCount = OutputEntity.Transform.GetChildCount();
             Debug.Log($"[PCG] '{Entity?.Name}' ran '{Graph.Name}' (tick {Engine.TickCount}): {Graph.Nodes.Count} nodes, {childCount} children spawned." +
@@ -295,7 +302,7 @@ namespace Freefall.Components
                 return;
 
             foreach (var node in Graph.Nodes)
-                if (node is TerrainProjection or MeshProjection { IncludeTerrain: true }) { Invalidate(); return; }
+                if (node is TerrainProjection or BankFrame or SeatOnGround or MeshProjection { IncludeTerrain: true }) { Invalidate(); return; }
         }
 
         // A splat stamp moved, changed or went: graphs that keep clear of painted ground (ExcludeStamps) around it

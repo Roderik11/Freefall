@@ -895,7 +895,12 @@ namespace Freefall.PCG
 
             for (int i = 0; i < points.Count; i++)
             {
+                // A point that names its prefab ("prefab=N", an index into Entities: BankWall) gets that one
                 var prefab = PickWeighted(rng, totalWeight);
+                if (points.tags != null && i < points.tags.Length && points.tags[i] is { } t && t.StartsWith("prefab=")
+                    && int.TryParse(t.AsSpan(7), out int chosen) && chosen >= 0 && chosen < Entities.Count
+                    && Entities[chosen]?.Prefab != null)
+                    prefab = Entities[chosen].Prefab;
                 if (prefab == null) continue;
 
                 var instance = prefab.Instantiate();

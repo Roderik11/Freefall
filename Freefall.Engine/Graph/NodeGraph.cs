@@ -141,7 +141,7 @@ namespace Freefall.Graph
         /// Execute the graph: clear caches, assign deterministic seeds,
         /// topologically sort, then Process() each node in order.
         /// </summary>
-        public void Execute()
+        public void Execute(int seedOffset = 0)
         {
             // 1. Clear all caches
             foreach (var node in Nodes)
@@ -149,7 +149,7 @@ namespace Freefall.Graph
 
             // 2. Assign deterministic per-node seeds
             foreach (var node in Nodes)
-                node.Seed = HashCombine(Seed, node.ID);
+                node.Seed = HashCombine(seedOffset == 0 ? Seed : HashCombine(Seed, seedOffset), node.ID);
 
             // 3. Sort and execute
             var sorted = TopologicalSort();

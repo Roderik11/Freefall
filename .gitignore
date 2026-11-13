@@ -57,3 +57,4 @@ Tools/TerrainMigration/migrate-to-stamps.mjs
 *.stackdump
 /Tools/PbrMaps
 /Tools/ItemIcons
+/Tools/Megascans

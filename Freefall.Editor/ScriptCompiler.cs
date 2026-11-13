@@ -314,6 +314,9 @@ namespace Freefall.Editor
                 Selector.SelectedObject = null;
             }
 
+            // Loaded graphs with nodes of script types: written out and emptied, read back after the swap
+            var graphs = Freefall.Graph.ScriptNodeGraphs.Capture(oldAssemblies);
+
             // 2. Forget everything keyed by the old types (cached assets of script classes included), then
             //    start unloading their context
             foreach (var asm in oldAssemblies)
@@ -378,6 +381,11 @@ namespace Freefall.Editor
             {
                 int restored = migrator.Restore();
                 Debug.LogAlways($"[ScriptCompiler] Scripts reloaded: migrated {restored} of {migrator.Count} live script component(s)");
+            }
+            if (graphs.Count > 0)
+            {
+                int count = graphs.Count, back = graphs.Restore();
+                Debug.LogAlways($"[ScriptCompiler] Graphs with script nodes read back: {back} of {count}");
             }
 
             MessageDispatcher.Send(Msg.ScriptsReloaded);
