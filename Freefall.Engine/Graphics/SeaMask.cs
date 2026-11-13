@@ -1,4 +1,5 @@
 using System;
+using Freefall.Base;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
 
@@ -65,13 +66,15 @@ namespace Freefall.Graphics
             int size = (res - 1) / step + 1;
             int count = size * size;
 
-            var below = new bool[count];
+            // The flood's scratch in native memory (NativeGrid): 24 MiB of large objects per flood of a 2049² mask as
+            // arrays (ram.md). The cells are the result
+            using var below = new NativeGrid<bool>(count);
             for (int z = 0; z < size; z++)
             for (int x = 0; x < size; x++)
                 below[z * size + x] = heights.Sample01(x * step, z * step) < seaLevel01;
 
             var cells = new byte[count];
-            var queue = new int[count];
+            using var queue = new NativeGrid<int>(count);
             int head = 0, tail = 0;
 
             // The open sea comes in from beyond the terrain: every border cell below sea level is sea
@@ -110,7 +113,7 @@ namespace Freefall.Graphics
             // ground the sea did not reach
             int reach = Math.Clamp((int)MathF.Ceiling(BeachReach / Math.Max(sampleSpacing * step, 0.01f)), 1, 255);
             float reachTop01 = seaLevel01 + BeachReachHeight / Math.Max(maxHeight, 0.001f);
-            var distance = new byte[count];
+            using var distance = new NativeGrid<byte>(count);
             head = 0;
             tail = 0;
             for (int i = 0; i < count; i++)

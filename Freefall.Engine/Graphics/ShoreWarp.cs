@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using Freefall.Base;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
 
@@ -88,9 +89,11 @@ namespace Freefall.Graphics
             int count = n * n;
             float hx = terrainSize.X / (n - 1), hz = terrainSize.Y / (n - 1);
 
-            var depth = new float[count];
-            var sea = new bool[count];
-            var borderDist = new float[count];
+            // The bake's scratch lives in native memory (NativeGrid): as arrays it sent ~470 MiB of large objects through
+            // the managed heap per bake of a 1025² warp (ram.md). Only the result is managed
+            using var depth = new NativeGrid<float>(count);
+            using var sea = new NativeGrid<bool>(count);
+            using var borderDist = new NativeGrid<float>(count);
             for (int z = 0; z < n; z++)
             for (int x = 0; x < n; x++)
             {
@@ -119,9 +122,11 @@ namespace Freefall.Graphics
             for (int s = slices; s < MaxBands; s++)
                 FillIdentity(result, s, count);
 
-            var hollow = BeachHollows(n, depth, sea);
+            // One queue for every march of the bake: it grows once
+            var queue = new PriorityQueue<int, float>();
+            using var hollow = BeachHollows(n, depth, sea, queue);
             for (int s = 0; s < slices; s++)
-                BakeBand(result, s, bands[s], n, hx, hz, origin, depth, sea, borderDist, hollow);
+                BakeBand(result, s, bands[s], n, hx, hz, origin, depth, sea, borderDist, hollow, queue);
 
             result.Milliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds;
             return result;
@@ -132,11 +137,11 @@ namespace Freefall.Graphics
         // swash reaches the cell, over any path; minus the cell's own height. ocean.fx keeps a hollow dry until the run-up
         // tops its ridge. (Carried along the marched rays instead, the 4-neighbour grid lifted plain slope cells to a
         // neighbour's height and the waterline frayed into grid stairs.)
-        private static float[] BeachHollows(int n, float[] depth, bool[] sea)
+        private static NativeGrid<float> BeachHollows(int n, NativeGrid<float> depth, NativeGrid<bool> sea, PriorityQueue<int, float> queue)
         {
             int count = n * n;
-            var spill = new float[count];
-            var queue = new PriorityQueue<int, float>();
+            using var spill = new NativeGrid<float>(count);
+            queue.Clear();
             for (int i = 0; i < count; i++)
             {
                 spill[i] = float.PositiveInfinity;
@@ -157,7 +162,7 @@ namespace Freefall.Graphics
                     if (l < spill[j]) { spill[j] = l; queue.Enqueue(j, l); }
                 }
             }
-            var hollow = new float[count];
+            var hollow = new NativeGrid<float>(count);
             for (int i = 0; i < count; i++)
                 if (sea[i] && depth[i] <= 0f && spill[i] < float.PositiveInfinity)
                     hollow[i] = MathF.Max(spill[i] + depth[i], 0f);
@@ -196,7 +201,8 @@ namespace Freefall.Graphics
             kh > 10f ? 0.5f : 0.5f * (1f + 2f * kh / MathF.Sinh(2f * kh));
 
         private static void BakeBand(Result r, int slice, Band band, int n, float hx, float hz, Vector2 origin,
-                                     float[] depth, bool[] sea, float[] borderDist, float[] hollow)
+                                     NativeGrid<float> depth, NativeGrid<bool> sea, NativeGrid<float> borderDist,
+                                     NativeGrid<float> hollow, PriorityQueue<int, float> queue)
         {
             int count = n * n;
             float omega = MathF.Max(band.Omega, 0.05f);
@@ -211,12 +217,12 @@ namespace Freefall.Graphics
             // Per cell: the travel time, the ray's along-crest coordinate where it left the deep sea (the deep heading turned
             // left, d⊥·x there) and the exposure
             var dPerp = new Vector2(-dir.Y, dir.X);
-            var slowness = new float[count];
-            var tau = new float[count];
-            var side = new float[count];
-            var exposure = new float[count];
-            var state = new byte[count];          // 0 far, 1 trial, 2 known
-            var source = new bool[count];
+            using var slowness = new NativeGrid<float>(count);
+            using var tau = new NativeGrid<float>(count);
+            using var side = new NativeGrid<float>(count);
+            using var exposure = new NativeGrid<float>(count);
+            using var state = new NativeGrid<byte>(count);          // 0 far, 1 trial, 2 known
+            using var source = new NativeGrid<bool>(count);
 
             for (int z = 0; z < n; z++)
             for (int x = 0; x < n; x++)
@@ -245,7 +251,7 @@ namespace Freefall.Graphics
             // Fast marching: cells become known in order of arrival time, each from its known neighbours (first-order
             // upwind). Along with the time each cell takes from where its ray came: the ray's along-crest coordinate (it
             // keeps it all the way) and the exposure
-            var queue = new PriorityQueue<int, float>();
+            queue.Clear();
 
             bool Relax(int i)
             {
@@ -327,7 +333,7 @@ namespace Freefall.Graphics
             }
 
             // From every known cell to its neighbours in the phase's cells, then march until none is left
-            void PushNeighbours(int i, bool[] allowed)
+            void PushNeighbours(int i, NativeGrid<bool> allowed)
             {
                 int x = i % n, z = i / n;
                 if (x > 0 && allowed[i - 1] && state[i - 1] != 2) Push(i - 1);
@@ -335,7 +341,7 @@ namespace Freefall.Graphics
                 if (z > 0 && allowed[i - n] && state[i - n] != 2) Push(i - n);
                 if (z < n - 1 && allowed[i + n] && state[i + n] != 2) Push(i + n);
             }
-            void March(bool[] allowed)
+            void March(NativeGrid<bool> allowed)
             {
                 for (int i = 0; i < count; i++)
                     if (state[i] == 2) PushNeighbours(i, allowed);
@@ -351,8 +357,8 @@ namespace Freefall.Graphics
             // waterline's phase there), and marched together with the water that fast strip carried the waves along the
             // sand ahead of the shallows and back into them: foam surging out to sea against the incoming waves and white
             // hooks racing along the shore (user, 2026-10-19). Marched after the water, the beach only takes from it
-            var water = new bool[count];
-            var beach = new bool[count];
+            using var water = new NativeGrid<bool>(count);
+            using var beach = new NativeGrid<bool>(count);
             for (int i = 0; i < count; i++)
             {
                 water[i] = sea[i] && depth[i] > 0f;
@@ -361,7 +367,7 @@ namespace Freefall.Graphics
             March(water);
             March(beach);
 
-            var known = new bool[count];
+            using var known = new NativeGrid<bool>(count);
             for (int i = 0; i < count; i++) known[i] = sea[i] && state[i] == 2;
 
             // Smooth what first-order marching leaves: the travel time's corners where the rays from two sides meet (a crease
@@ -380,9 +386,9 @@ namespace Freefall.Graphics
             // the energy flux between two rays is kept, det(∂(c0τ, side)/∂x) = c0·(∇τ × ∇side) = (c0/c)·(b0/b), so
             // H/H0 = √(det · ½ / n), n the group over phase speed. Then the blend back to no warp toward deep water and the
             // terrain's border
-            var jac = new float[count * 4];
-            var amp = new float[count];
-            var blend = new float[count];
+            using var jac = new NativeGrid<float>(count * 4);
+            using var amp = new NativeGrid<float>(count);
+            using var blend = new NativeGrid<float>(count);
             for (int z = 0; z < n; z++)
             for (int x = 0; x < n; x++)
             {
@@ -458,7 +464,7 @@ namespace Freefall.Graphics
         // writes per slice the crest lines the shader sees (cos of the deep phase at u), the amplitude, the exposure and
         // the depth as 512² PGMs (+Z up). How the bake was checked against the seabed (surf_plan.md)
         private static void DebugDump(Result r, int o, int slice, int n, float hx, float hz, Vector2 origin, float k0,
-                                      Vector2 dir, bool[] sea, float[] exposure, float[] depth)
+                                      Vector2 dir, NativeGrid<bool> sea, NativeGrid<float> exposure, NativeGrid<float> depth)
         {
             string? folder = Environment.GetEnvironmentVariable("FREEFALL_SHOREWARP_DUMP");
             if (string.IsNullOrEmpty(folder)) return;
@@ -496,9 +502,9 @@ namespace Freefall.Graphics
         }
 
         // 3×3 box over the sea cells only
-        private static void BoxBlur(float[] data, int stride, int n, bool[] sea)
+        private static void BoxBlur(NativeGrid<float> data, int stride, int n, NativeGrid<bool> sea)
         {
-            var copy = (float[])data.Clone();
+            using var copy = new NativeGrid<float>(data);
             for (int z = 0; z < n; z++)
             for (int x = 0; x < n; x++)
             {
@@ -524,9 +530,9 @@ namespace Freefall.Graphics
         // Average over ±r cells along rows, then columns, only where the whole window is usable (else the cell keeps its
         // value): symmetric windows leave a straight slope as it is, so a steep field like the travel time near the
         // coast is not pulled toward its land side
-        private static void SmoothSymmetric(float[] data, int n, bool[] ok, int r)
+        private static void SmoothSymmetric(NativeGrid<float> data, int n, NativeGrid<bool> ok, int r)
         {
-            var tmp = (float[])data.Clone();
+            using var tmp = new NativeGrid<float>(data);
             for (int pass = 0; pass < 2; pass++)
             {
                 bool rows = pass == 0;
@@ -552,9 +558,9 @@ namespace Freefall.Graphics
         }
 
         // A (2r+1)² box over the sea cells only, separable with running sums
-        private static void BoxBlurWide(float[] data, int n, bool[] sea, int r)
+        private static void BoxBlurWide(NativeGrid<float> data, int n, NativeGrid<bool> sea, int r)
         {
-            var tmp = new float[data.Length];
+            using var tmp = new NativeGrid<float>(data.Length);
             for (int pass = 0; pass < 2; pass++)
             {
                 bool rows = pass == 0;
@@ -581,20 +587,27 @@ namespace Freefall.Graphics
             }
         }
 
-        private static void DilateIntoLand(Result r, int o, int n, bool[] sea, byte[] state)
+        private static void DilateIntoLand(Result r, int o, int n, NativeGrid<bool> sea, NativeGrid<byte> state)
         {
             int count = n * n;
-            var filled = new bool[count];
+            // This pass's and the next's filled cells, swapped after each pass (the next one starts as a copy, as the clone
+            // did); the sums in stack memory (they were two new float[4] per land cell and pass)
+            using var a = new NativeGrid<bool>(count);
+            using var b = new NativeGrid<bool>(count);
+            var filled = a;
+            var next = b;
+            Span<float> w = stackalloc float[4];
+            Span<float> j4 = stackalloc float[4];
             for (int i = 0; i < count; i++) filled[i] = sea[i] && state[i] == 2;
             for (int pass = 0; pass < 3; pass++)
             {
-                var next = (bool[])filled.Clone();
+                filled.CopyTo(next);
                 for (int z = 0; z < n; z++)
                 for (int x = 0; x < n; x++)
                 {
                     int i = z * n + x;
                     if (filled[i]) continue;
-                    var w = new float[4]; var j4 = new float[4]; int cnt = 0;
+                    w.Clear(); j4.Clear(); int cnt = 0;
                     for (int dz = -1; dz <= 1; dz++)
                     for (int dx = -1; dx <= 1; dx++)
                     {
@@ -613,7 +626,7 @@ namespace Freefall.Graphics
                     }
                     next[i] = true;
                 }
-                filled = next;
+                (filled, next) = (next, filled);
             }
         }
 

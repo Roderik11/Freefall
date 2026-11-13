@@ -276,6 +276,8 @@ namespace Freefall.Components
         private SeaMask.Result? _builtSeaMask;   // finished on a worker, waiting for Draw to upload it
         private int _seaMaskRequest;
         private float _seaMaskLevel = float.NaN;
+        private bool _seaMaskOwed;               // asked for while a bake ran or a load runs: started once none runs (main thread)
+        private SceneLoad? _bakeForLoad;         // the load whose waiting step bakes the owed one (BakeForLoad)
 
         // The surf (ShoreWarp): baked on the sea mask's worker right after it, and on its own when a warped band's heading
         // or frequency moves (the weather); the newest bake wins, and a band change waits for the running bake to finish
@@ -411,14 +413,66 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Flood the terrain's current heights into a new sea mask on a worker; Draw uploads it. A request made while
-        /// an older one runs wins: the older result is dropped.
+        /// Flood the terrain's current heights into a new sea mask on a worker, then bake the shore warp from it; Draw
+        /// uploads both. A request made while a bake runs is owed and started by Draw once it is done, from the heights
+        /// and sea level of then: one bake after a burst of changes, not one each. During a scene load every request is
+        /// owed to the load's waiting step (<see cref="BakeForLoad"/>), when the heights are final. TestWorld's load
+        /// baked three times before (the saved pages, the stamps baked since, the generators), ~1 s and ~550 MiB of
+        /// scratch each (ram.md).
         /// </summary>
         private void RequestSeaMask()
         {
             var terrain = _terrain?.Terrain;
             var heights = terrain?.Pages;
             if (terrain == null || heights is not { HasHeights: true } || heights.Resolution < 2) return;
+            if (SceneManager.Loading is { IsDone: false } load)
+            {
+                // Started as soon as the heights are in (alongside generating); the waiting step bakes again only if they
+                // changed after that, and holds the load until the last bake is done
+                _seaMaskOwed = true;
+                bool heightsIn = load.Current >= SceneLoad.Step.Generating;
+                if (_bakeForLoad != load)
+                {
+                    _bakeForLoad = load;
+                    load.WaitFor(_ => BakeForLoad(), "Sea mask and surf");
+                    if (!heightsIn) load.HeightsIn += _ => StartOwedSeaMask();
+                }
+                if (heightsIn) StartOwedSeaMask();
+                return;
+            }
+            if (Volatile.Read(ref _warpRunning) > 0)
+            {
+                _seaMaskOwed = true;
+                return;
+            }
+            StartSeaMask(terrain, heights);
+        }
+
+        /// <summary>
+        /// A load's waiting step (SceneLoad.WaitFor), slice after slice: once no bake runs, the owed one from the final
+        /// heights, and the load waits until it is done, so the world shows with its sea mask and surf. A request that
+        /// comes while it runs (a generator's height change) is baked after it the same way.
+        /// </summary>
+        private bool BakeForLoad()
+        {
+            if (Volatile.Read(ref _warpRunning) > 0) return false;
+            return !StartOwedSeaMask();
+        }
+
+        // The owed bake, if one is owed and none runs; false when nothing was started
+        private bool StartOwedSeaMask()
+        {
+            if (!_seaMaskOwed || Volatile.Read(ref _warpRunning) > 0) return false;
+            var terrain = _terrain?.Terrain;
+            var heights = terrain?.Pages;
+            if (terrain == null || heights is not { HasHeights: true } || heights.Resolution < 2) return false;
+            StartSeaMask(terrain, heights);
+            return true;
+        }
+
+        private void StartSeaMask(Assets.Terrain terrain, Assets.TerrainPages heights)
+        {
+            _seaMaskOwed = false;
 
             float seaLevel = Transform.WorldPosition.Y;
             float baseY = _terrain!.Transform?.WorldPosition.Y ?? 0f;
@@ -891,6 +945,8 @@ namespace Freefall.Components
                 _seaMask.Upload(seaMask);
             if (Interlocked.Exchange(ref _builtShoreWarp, null) is { } shoreWarp)
                 _shoreWarp.Upload(shoreWarp);
+            if (_seaMaskOwed && Volatile.Read(ref _warpRunning) == 0 && !SceneManager.IsLoading)
+                RequestSeaMask();
             UpdateShoreWarpBands();
 
             // The uploaded warp's slices: which band each carries and its deep heading
