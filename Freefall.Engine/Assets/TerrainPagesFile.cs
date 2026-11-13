@@ -1,6 +1,8 @@
 using System;
+using System.Buffers;
 using System.IO;
 using System.IO.Compression;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 
 namespace Freefall.Assets
@@ -114,27 +116,44 @@ namespace Freefall.Assets
                 holeLengths[i] = r.ReadInt32();
             }
 
-            // The blobs lie one after the other: read them in one go, then take them apart in parallel
+            // The blobs lie one after the other: read them in one go into native memory, then take them apart in parallel.
+            // A managed array of them was one large object of the whole file (128 MiB for TestWorld) and garbage at once
             long first = HeaderBytes + (long)count * EntryBytes;
             long end = count > 0 ? offsets[count - 1] + heightLengths[count - 1] + holeLengths[count - 1] : first;
-            var blobs = new byte[end - first];
-            stream.Position = first;
-            stream.ReadExactly(blobs);
-
+            long blobBytes = end - first;
             var heights = new ushort[]?[count];
             var holes = new byte[]?[count];
-            Parallel.For(0, count, i =>
+            unsafe
             {
-                int at = (int)(offsets[i] - first);
-                if (heightLengths[i] > 0)
-                    heights[i] = DecodeHeights(blobs.AsSpan(at, heightLengths[i]));
-                if (holeLengths[i] > 0)
+                var blobs = (IntPtr)NativeMemory.Alloc((nuint)Math.Max(1, blobBytes));
+                try
                 {
-                    var page = new byte[TerrainPages.PageLength];
-                    Inflate(blobs.AsSpan(at + heightLengths[i], holeLengths[i]), page);
-                    holes[i] = page;
+                    stream.Position = first;
+                    for (long read = 0; read < blobBytes;)
+                    {
+                        int chunk = (int)Math.Min(blobBytes - read, 1 << 30);
+                        stream.ReadExactly(new Span<byte>((byte*)blobs + read, chunk));
+                        read += chunk;
+                    }
+
+                    Parallel.For(0, count, i =>
+                    {
+                        byte* at = (byte*)blobs + (offsets[i] - first);
+                        if (heightLengths[i] > 0)
+                            heights[i] = DecodeHeights(at, heightLengths[i]);
+                        if (holeLengths[i] > 0)
+                        {
+                            var page = new byte[TerrainPages.PageLength];
+                            Inflate(at + heightLengths[i], holeLengths[i], page);
+                            holes[i] = page;
+                        }
+                    });
                 }
-            });
+                finally
+                {
+                    NativeMemory.Free((void*)blobs);
+                }
+            }
             return TerrainPages.FromPages(resolution, hasHeights, heights, holes);
         }
 
@@ -151,35 +170,53 @@ namespace Freefall.Assets
             return (ushort)(s[i - 1] + s[i - N] - s[i - N - 1]);
         }
 
+        // A page's two byte planes (2 × 257² = 132,098 bytes) are over the large object heap's 85,000: one new array per
+        // page made 4,096 large objects of garbage per load or save of a 16 km terrain. Each thread borrows one instead
+        private const int PlanesBytes = 2 * TerrainPages.PageLength;
+
         private static byte[] EncodeHeights(ReadOnlySpan<ushort> page)
         {
-            var planes = new byte[2 * TerrainPages.PageLength];
-            for (int z = 0; z < N; z++)
-                for (int x = 0; x < N; x++)
-                {
-                    int i = z * N + x;
-                    short d = (short)(page[i] - Predict(page, x, z));
-                    ushort zig = (ushort)((d << 1) ^ (d >> 15));
-                    planes[i] = (byte)zig;
-                    planes[TerrainPages.PageLength + i] = (byte)(zig >> 8);
-                }
-            return Deflate(planes);
+            var planes = ArrayPool<byte>.Shared.Rent(PlanesBytes);
+            try
+            {
+                for (int z = 0; z < N; z++)
+                    for (int x = 0; x < N; x++)
+                    {
+                        int i = z * N + x;
+                        short d = (short)(page[i] - Predict(page, x, z));
+                        ushort zig = (ushort)((d << 1) ^ (d >> 15));
+                        planes[i] = (byte)zig;
+                        planes[TerrainPages.PageLength + i] = (byte)(zig >> 8);
+                    }
+                return Deflate(planes.AsSpan(0, PlanesBytes));
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(planes);
+            }
         }
 
-        private static ushort[] DecodeHeights(ReadOnlySpan<byte> blob)
+        private static unsafe ushort[] DecodeHeights(byte* blob, int length)
         {
-            var planes = new byte[2 * TerrainPages.PageLength];
-            Inflate(blob, planes);
-            var page = new ushort[TerrainPages.PageLength];
-            for (int z = 0; z < N; z++)
-                for (int x = 0; x < N; x++)
-                {
-                    int i = z * N + x;
-                    int zig = planes[i] | (planes[TerrainPages.PageLength + i] << 8);
-                    ushort d = (ushort)((zig >> 1) ^ -(zig & 1));
-                    page[i] = (ushort)(Predict(page, x, z) + d);
-                }
-            return page;
+            var planes = ArrayPool<byte>.Shared.Rent(PlanesBytes);
+            try
+            {
+                Inflate(blob, length, planes.AsSpan(0, PlanesBytes));
+                var page = new ushort[TerrainPages.PageLength];
+                for (int z = 0; z < N; z++)
+                    for (int x = 0; x < N; x++)
+                    {
+                        int i = z * N + x;
+                        int zig = planes[i] | (planes[TerrainPages.PageLength + i] << 8);
+                        ushort d = (ushort)((zig >> 1) ^ -(zig & 1));
+                        page[i] = (ushort)(Predict(page, x, z) + d);
+                    }
+                return page;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(planes);
+            }
         }
 
         // ── zlib ──
@@ -192,9 +229,11 @@ namespace Freefall.Assets
             return output.ToArray();
         }
 
-        private static void Inflate(ReadOnlySpan<byte> blob, Span<byte> into)
+        // Read in place: the blob was copied into an array for a MemoryStream before
+        private static unsafe void Inflate(byte* blob, int length, Span<byte> into)
         {
-            using var z = new ZLibStream(new MemoryStream(blob.ToArray()), CompressionMode.Decompress);
+            using var source = new UnmanagedMemoryStream(blob, length);
+            using var z = new ZLibStream(source, CompressionMode.Decompress);
             z.ReadExactly(into);
         }
     }
