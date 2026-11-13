@@ -92,33 +92,27 @@ namespace Freefall.Graphics
                 }
             }
             
+            // Throws UploadBatchFullException before anything is copied: the upload is recorded again in the next batch,
+            // so the pixels stay until the copy below has run
             long offset = heap.Allocate((long)totalSize, 512);
-            
+
             unsafe
             {
                 byte* pBase = (byte*)heap.BaseCpuPointer + offset;
-                fixed (byte* pPixelData = data.PixelData)
+                if (data.Native is { } native)
                 {
-                    byte* pSrcBase = pPixelData;
-                    for (int i = 0; i < numSubresources; i++)
-                    {
-                        var layout = layouts[i];
-                        byte* pDestSub = pBase + layout.Offset;
-                        
-                        long srcOffset = data.Mips[i].Offset; 
-                        int rows = (int)numRows[i];
-                        int rowPitch = (int)layout.Footprint.RowPitch;
-                        int srcPitch = data.Mips[i].RowPitch;
-                        int copySize = Math.Min(rowPitch, srcPitch);
-                        
-                        byte* pSrcSub = pSrcBase + srcOffset;
-                        for (int r = 0; r < rows; r++)
-                        {
-                            Buffer.MemoryCopy(pSrcSub, pDestSub, rowPitch, copySize);
-                            pSrcSub += srcPitch;
-                            pDestSub += rowPitch;
-                        }
-                    }
+                    CopySubresources(pBase, native.Data, data, layouts, numRows, numSubresources);
+
+                    // In the ring now: the read's native block is not needed again (TextureLoader.ReadCpuData)
+                    data.Native = null;
+                    native.Dispose();
+                }
+                else
+                {
+                    if (data.PixelData == null)
+                        throw new InvalidOperationException($"Texture upload '{data.Path}' has no pixels (uploaded twice?)");
+                    fixed (byte* pPixelData = data.PixelData)
+                        CopySubresources(pBase, pPixelData, data, layouts, numRows, numSubresources);
                 }
             }
             
@@ -132,6 +126,30 @@ namespace Freefall.Graphics
             }
             
             Interlocked.Add(ref _bytesUploaded, (long)totalSize);
+        }
+
+        // Each subresource's rows from the tightly packed source into the ring's 256-byte pitched footprint
+        private static unsafe void CopySubresources(byte* pBase, byte* pSrcBase, CpuTextureData data, PlacedSubresourceFootPrint[] layouts, uint[] numRows, int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                var layout = layouts[i];
+                byte* pDestSub = pBase + layout.Offset;
+
+                long srcOffset = data.Mips[i].Offset;
+                int rows = (int)numRows[i];
+                int rowPitch = (int)layout.Footprint.RowPitch;
+                int srcPitch = data.Mips[i].RowPitch;
+                int copySize = Math.Min(rowPitch, srcPitch);
+
+                byte* pSrcSub = pSrcBase + srcOffset;
+                for (int r = 0; r < rows; r++)
+                {
+                    Buffer.MemoryCopy(pSrcSub, pDestSub, rowPitch, copySize);
+                    pSrcSub += srcPitch;
+                    pDestSub += rowPitch;
+                }
+            }
         }
 
         private void RecordBufferUpload<T>(ID3D12GraphicsCommandList cmdList, UploadHeap heap, ID3D12Resource targetBuffer, T[] data) where T : unmanaged

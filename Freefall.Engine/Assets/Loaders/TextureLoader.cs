@@ -1,4 +1,7 @@
+using System;
+using System.Buffers.Binary;
 using System.IO;
+using System.Runtime.InteropServices;
 using Freefall.Assets;
 using Freefall.Assets.Packers;
 using Freefall.Graphics;
@@ -56,14 +59,33 @@ namespace Freefall.Assets.Loaders
             finally { t_forMaterial = was; }
         }
 
-        /// <summary>The texture's pixels from its cache file, parsed. Any thread.</summary>
-        public static CpuTextureData ReadCpuData(string cachePath, string name)
-        {
-            DdsTextureData ddsData;
-            using (var stream = Artifacts.Open(cachePath))
-                ddsData = new DdsTexturePacker().Read(stream);
+        private static readonly int PackerVersion = new DdsTexturePacker().Version;
 
-            var cpuData = Texture.ParseDDSFromBytes(ddsData.Bytes);
+        /// <summary>
+        /// The texture's pixels from its cache file, parsed. The DDS file goes straight from the stream into native memory
+        /// (<see cref="CpuTextureData.Native"/>, freed by the upload): no array on the managed heap, where every texture of
+        /// 1024² and up was a large object that was garbage once uploaded. Any thread.
+        /// </summary>
+        public static unsafe CpuTextureData ReadCpuData(string cachePath, string name)
+        {
+            IntPtr block;
+            int length;
+            using (var stream = Artifacts.Open(cachePath))
+            {
+                // DdsTexturePacker's layout: the packer's version, the DDS file's length, the DDS file
+                Span<byte> head = stackalloc byte[8];
+                stream.ReadExactly(head);
+                int version = BinaryPrimitives.ReadInt32LittleEndian(head);
+                length = BinaryPrimitives.ReadInt32LittleEndian(head[4..]);
+                if (version != PackerVersion || length <= 0)
+                    throw new InvalidDataException($"Texture cache file '{cachePath}': packer version {version}, length {length}");
+
+                block = (IntPtr)NativeMemory.Alloc((nuint)length);
+                try { stream.ReadExactly(new Span<byte>((void*)block, length)); }
+                catch { NativeMemory.Free((void*)block); throw; }
+            }
+
+            var cpuData = Texture.ParseDDSNative(block, length);
             cpuData.Path = name;
             return cpuData;
         }

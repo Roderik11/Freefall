@@ -617,30 +617,7 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
                 fixed (byte* pBytes = bytes)
                 {
                     DDSTextureLoader.Parse((IntPtr)pBytes, bytes.Length, out var format, out int width, out int height, out int depth, out int mipLevels, out int arraySize, out bool isCubeMap, out IntPtr dataPtr, out int dataSize);
-
-                    // Build mip layouts
-                    var mips = new Freefall.Assets.MipLayout[mipLevels];
-                    bool compressed = IsCompressedStatic(format);
-                    int offset = 0;
-
-                    for (int mip = 0; mip < mipLevels; mip++)
-                    {
-                        int mipW = Math.Max(1, width >> mip);
-                        int mipH = Math.Max(1, height >> mip);
-                        int srcPitch = ComputePitchStatic(format, mipW);
-                        int numRows = compressed ? Math.Max(1, (mipH + 3) / 4) : mipH;
-
-                        mips[mip] = new Freefall.Assets.MipLayout
-                        {
-                            Offset = offset,
-                            RowPitch = srcPitch,
-                            NumRows = numRows,
-                            Width = mipW,
-                            Height = mipH
-                        };
-
-                        offset += srcPitch * numRows;
-                    }
+                    var mips = MipLayouts(format, width, height, mipLevels, out bool compressed, out int offset);
 
                     // Copy pixel data to managed array
                     byte[] pixelData = new byte[offset];
@@ -661,6 +638,61 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
             }
         }
         
+        /// <summary>
+        /// A DDS file in native memory (<paramref name="block"/>, from NativeMemory.Alloc; taken over, freed on failure)
+        /// parsed in place: the pixels stay where the read put them (<see cref="Freefall.Assets.CpuTextureData.Native"/>),
+        /// so nothing of the texture lands on the managed heap. Any thread.
+        /// </summary>
+        internal static unsafe Freefall.Assets.CpuTextureData ParseDDSNative(IntPtr block, int length)
+        {
+            try
+            {
+                DDSTextureLoader.Parse(block, length, out var format, out int width, out int height, out _, out int mipLevels, out int arraySize, out _, out IntPtr dataPtr, out int dataSize);
+                var mips = MipLayouts(format, width, height, mipLevels, out bool compressed, out int total);
+
+                // A file shorter than its mip chain: the managed copy pads it with zeros, as it always has
+                if (total > dataSize)
+                    return ParseDDSFromBytes(new ReadOnlySpan<byte>((void*)block, length).ToArray());
+
+                var cpu = new Freefall.Assets.CpuTextureData
+                {
+                    Native = new Freefall.Assets.NativePixels(block, length, (byte*)dataPtr, dataSize),
+                    Width = width,
+                    Height = height,
+                    MipLevels = mipLevels,
+                    ArraySize = arraySize,
+                    Format = format,
+                    IsCompressed = compressed,
+                    Mips = mips
+                };
+                block = IntPtr.Zero;   // the NativePixels own it now
+                return cpu;
+            }
+            finally
+            {
+                if (block != IntPtr.Zero) System.Runtime.InteropServices.NativeMemory.Free((void*)block);
+            }
+        }
+
+        // Each mip's offset, pitch and rows in a DDS file's tightly packed chain; total = the chain's bytes
+        private static Freefall.Assets.MipLayout[] MipLayouts(Format format, int width, int height, int mipLevels, out bool compressed, out int total)
+        {
+            var mips = new Freefall.Assets.MipLayout[mipLevels];
+            compressed = IsCompressedStatic(format);
+            int offset = 0;
+            for (int mip = 0; mip < mipLevels; mip++)
+            {
+                int mipW = Math.Max(1, width >> mip);
+                int mipH = Math.Max(1, height >> mip);
+                int srcPitch = ComputePitchStatic(format, mipW);
+                int numRows = compressed ? Math.Max(1, (mipH + 3) / 4) : mipH;
+                mips[mip] = new Freefall.Assets.MipLayout { Offset = offset, RowPitch = srcPitch, NumRows = numRows, Width = mipW, Height = mipH };
+                offset += srcPitch * numRows;
+            }
+            total = offset;
+            return mips;
+        }
+
         private static int ComputePitchStatic(Format fmt, int width)
         {
             if (IsCompressedStatic(fmt))
