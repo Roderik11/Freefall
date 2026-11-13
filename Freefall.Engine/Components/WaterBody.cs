@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Description = System.ComponentModel.DescriptionAttribute;
@@ -742,8 +743,9 @@ namespace Freefall.Components
                 parts.Add(SurfacePart(partStart, indices.Count - partStart));
 
             _surfacePoints = verts.ToArray();
-            _surfaceSteep = flow.ConvertAll(f => f.Y).ToArray();
-            _surfaceTriangles = indices.ConvertAll(i => (int)i).ToArray();
+            _surfaceSteep = new float[flow.Count];
+            for (int i = 0; i < flow.Count; i++) _surfaceSteep[i] = flow[i].Y;
+            _surfaceTriangles = ToInts(indices);
             return BuildSurface(verts, flow, uvs, indices, parts);
         }
 
@@ -802,28 +804,337 @@ namespace Freefall.Components
             // The ice and the shore field take the outline's triangles as they are
             _surfacePoints = verts.ToArray();
             _surfaceSteep = new float[verts.Count];
-            _surfaceTriangles = indices.ConvertAll(i => (int)i).ToArray();
+            _surfaceTriangles = ToInts(indices);
 
-            // The drawn surface: the ear clipping's slivers reach across the whole lake, so split them into triangles no
-            // edge of which is longer than half a chunk (the same planes, so the same surface), then one part per grid cell
+            // A level outline (a lake's spline points all at the entity's height): the ear clipping cut by the chunk grid
+            float low = float.MaxValue, high = float.MinValue;
+            foreach (float h in heights) { low = MathF.Min(low, h); high = MathF.Max(high, h); }
+            if (high - low <= 1e-4f)
+                return BuildLevelSurface(polygon, triangles, low + Depth);
+
+            // Else the drawn surface: the ear clipping's slivers reach across the whole lake, so split them into triangles no
+            // edge of which is longer than half a chunk (the same planes, so the same surface), then one part per grid cell:
+            // the cells in the order their first triangle comes, each cell's triangles in their order. Counted first and
+            // then placed, in one list (a list per cell grew a second copy of the indices, ~1 GB per TestWorld load with
+            // the rest of the surfaces' garbage: ram.md)
             SplitLongEdges(verts, normals, uvs, indices, ChunkSize * 0.5f);
-            var cells = new Dictionary<(int, int), List<uint>>();
+            var cellOf = new Dictionary<(int, int), int>();
+            var cellSizes = new List<int>();
             for (int t = 0; t + 2 < indices.Count; t += 3)
             {
-                var centre = (verts[(int)indices[t]] + verts[(int)indices[t + 1]] + verts[(int)indices[t + 2]]) / 3f;
-                var cell = ((int)MathF.Floor(centre.X / ChunkSize), (int)MathF.Floor(centre.Z / ChunkSize));
-                if (!cells.TryGetValue(cell, out var list))
-                    cells[cell] = list = new List<uint>();
-                list.Add(indices[t]); list.Add(indices[t + 1]); list.Add(indices[t + 2]);
+                var cell = CellOf(verts, indices, t);
+                if (!cellOf.TryGetValue(cell, out int slot))
+                {
+                    cellOf[cell] = slot = cellSizes.Count;
+                    cellSizes.Add(0);
+                }
+                cellSizes[slot] += 3;
+            }
+            var parts = new List<MeshPart>(cellSizes.Count);
+            var cellAt = new int[cellSizes.Count];
+            for (int s = 0, at = 0; s < cellSizes.Count; s++)
+            {
+                parts.Add(SurfacePart(at, cellSizes[s]));
+                cellAt[s] = at;
+                at += cellSizes[s];
             }
             var grouped = new List<uint>(indices.Count);
-            var parts = new List<MeshPart>(cells.Count);
-            foreach (var list in cells.Values)
+            CollectionsMarshal.SetCount(grouped, indices.Count);
+            var into = CollectionsMarshal.AsSpan(grouped);
+            for (int t = 0; t + 2 < indices.Count; t += 3)
             {
-                parts.Add(SurfacePart(grouped.Count, list.Count));
-                grouped.AddRange(list);
+                int slot = cellOf[CellOf(verts, indices, t)];
+                int at = cellAt[slot];
+                into[at] = indices[t]; into[at + 1] = indices[t + 1]; into[at + 2] = indices[t + 2];
+                cellAt[slot] = at + 3;
             }
             return BuildSurface(verts, normals, uvs, grouped, parts);
+        }
+
+        /// <summary>
+        /// A level lake's drawn surface: each triangle of the outline's ear clipping cut by the chunk grid into convex
+        /// pieces, one part per cell, so no part reaches past its cell. Every vertex is an outline point, the point where an
+        /// edge of the ear clipping crosses a grid line, or a grid corner, made once by what it is and shared by every
+        /// piece that has it: neighbouring pieces meet without T-junctions, across cells and across triangles. A cell the
+        /// outline does not touch is drawn whole instead (two triangles, or a fan from its centre over the points it shares
+        /// with a shore cell's pieces). Splitting the slivers in halves until no edge was longer than half a chunk
+        /// (SplitLongEdges, still used for an outline that is not level) made TestWorld's Moon Lake 359,204 triangles for
+        /// 0.9 km² of flat water, cutting them by the cells 35,312 (ram.md).
+        /// </summary>
+        private static Mesh BuildLevelSurface(List<Vector2> polygon, List<int> triangles, float y)
+        {
+            var verts = new List<Vector3>();
+            var uvs = new List<Vector2>();
+            var made = new Dictionary<VertexOf, uint>();
+            var byCell = new Dictionary<(int, int), List<uint>>();
+
+            // Where a vertex lies, from what it is: the same arithmetic wherever it comes up
+            Vector2 Position(VertexOf v)
+            {
+                switch (v.Kind)
+                {
+                    case VertexKind.Outline: return polygon[v.A];
+                    case VertexKind.CutX:
+                    {
+                        Vector2 a = polygon[v.A], b = polygon[v.B];
+                        float x = v.C * ChunkSize;
+                        return new Vector2(x, a.Y + (b.Y - a.Y) * ((x - a.X) / (b.X - a.X)));
+                    }
+                    case VertexKind.CutZ:
+                    {
+                        Vector2 a = polygon[v.A], b = polygon[v.B];
+                        float z = v.C * ChunkSize;
+                        return new Vector2(a.X + (b.X - a.X) * ((z - a.Y) / (b.Y - a.Y)), z);
+                    }
+                    case VertexKind.Centre: return new Vector2((v.A + 0.5f) * ChunkSize, (v.B + 0.5f) * ChunkSize);
+                    default: return new Vector2(v.A * ChunkSize, v.B * ChunkSize);
+                }
+            }
+            uint Index(VertexOf v)
+            {
+                if (made.TryGetValue(v, out uint i)) return i;
+                i = (uint)verts.Count;
+                var p = Position(v);
+                verts.Add(new Vector3(p.X, y, p.Y));
+                uvs.Add(p);
+                made[v] = i;
+                return i;
+            }
+
+            Func<VertexOf, Vector2> position = Position;
+            var piece = new List<(VertexOf At, Carrier Along)>();
+            var clipped = new List<(VertexOf At, Carrier Along)>();
+            var pieceAt = new List<VertexOf>();                                      // every piece's points, one after the other
+            var cellPieces = new Dictionary<(int, int), List<(int Start, int Count)>>();
+            for (int t = 0; t + 2 < triangles.Count; t += 3)
+            {
+                int a = triangles[t], b = triangles[t + 1], c = triangles[t + 2];   // counter-clockwise in (x, z)
+                Vector2 pa = polygon[a], pb = polygon[b], pc = polygon[c];
+                var min = Vector2.Min(pa, Vector2.Min(pb, pc));
+                var max = Vector2.Max(pa, Vector2.Max(pb, pc));
+                int x0 = (int)MathF.Floor(min.X / ChunkSize), x1 = (int)MathF.Floor(max.X / ChunkSize);
+                int z0 = (int)MathF.Floor(min.Y / ChunkSize), z1 = (int)MathF.Floor(max.Y / ChunkSize);
+                for (int cz = z0; cz <= z1; cz++)
+                for (int cx = x0; cx <= x1; cx++)
+                {
+                    piece.Clear();
+                    piece.Add((VertexOf.Outline(a), Carrier.Edge(a, b)));
+                    piece.Add((VertexOf.Outline(b), Carrier.Edge(b, c)));
+                    piece.Add((VertexOf.Outline(c), Carrier.Edge(c, a)));
+                    Clip(piece, clipped, Carrier.LineX(cx), +1f, position);
+                    Clip(clipped, piece, Carrier.LineX(cx + 1), -1f, position);
+                    Clip(piece, clipped, Carrier.LineZ(cz), +1f, position);
+                    Clip(clipped, piece, Carrier.LineZ(cz + 1), -1f, position);
+                    if (piece.Count < 3) continue;
+
+                    // Kept until every piece is in: only then is it known whether its cell is drawn by its pieces or whole
+                    int start = pieceAt.Count;
+                    foreach (var (at, _) in piece) pieceAt.Add(at);
+                    if (PieceArea(pieceAt, start, piece.Count, position) <= 1e-6f)
+                    {
+                        pieceAt.RemoveRange(start, piece.Count);   // a sliver of nothing where a corner lies on a grid line
+                        continue;
+                    }
+                    if (!cellPieces.TryGetValue((cx, cz), out var ranges))
+                        cellPieces[(cx, cz)] = ranges = new List<(int Start, int Count)>();
+                    ranges.Add((start, piece.Count));
+                }
+            }
+
+            // The cells the outline touches (each segment's box, a millimetre wider, so a point on a grid line marks both
+            // sides) keep their pieces. A cell with pieces the outline does not touch lies wholly inside the lake: drawn
+            // whole, two triangles, where its pieces were a share of every sliver that crosses it
+            var shore = new HashSet<(int, int)>();
+            for (int i = 0; i < polygon.Count; i++)
+            {
+                Vector2 p = polygon[i], q = polygon[(i + 1) % polygon.Count];
+                int sx0 = (int)MathF.Floor((MathF.Min(p.X, q.X) - 1e-3f) / ChunkSize), sx1 = (int)MathF.Floor((MathF.Max(p.X, q.X) + 1e-3f) / ChunkSize);
+                int sz0 = (int)MathF.Floor((MathF.Min(p.Y, q.Y) - 1e-3f) / ChunkSize), sz1 = (int)MathF.Floor((MathF.Max(p.Y, q.Y) + 1e-3f) / ChunkSize);
+                for (int z = sz0; z <= sz1; z++)
+                for (int x = sx0; x <= sx1; x++)
+                    shore.Add((x, z));
+            }
+            bool Whole((int, int) cell) => cellPieces.ContainsKey(cell) && !shore.Contains(cell);
+
+            foreach (var (cell, ranges) in cellPieces)
+            {
+                var list = new List<uint>();
+                if (Whole(cell))
+                    WholeCell(cell, ranges, list);
+                else
+                {
+                    // Each piece a fan, wound as the old surface was (the ear clipping's reversed: faces up)
+                    foreach (var (start, count) in ranges)
+                    {
+                        var p0 = Position(pieceAt[start]);
+                        for (int k = 1; k + 1 < count; k++)
+                        {
+                            var p1 = Position(pieceAt[start + k]);
+                            var p2 = Position(pieceAt[start + k + 1]);
+                            if ((p1.X - p0.X) * (p2.Y - p0.Y) - (p1.Y - p0.Y) * (p2.X - p0.X) <= 1e-6f) continue;
+                            list.Add(Index(pieceAt[start]));
+                            list.Add(Index(pieceAt[start + k + 1]));
+                            list.Add(Index(pieceAt[start + k]));
+                        }
+                    }
+                }
+                if (list.Count > 0) byCell[cell] = list;
+            }
+            if (verts.Count == 0) return null!;
+
+            // A whole cell: its corners, and on each side it shares with a shore cell the points that cell's pieces have
+            // there (on a side shared with another whole cell neither keeps them). With none, two triangles; with some, a
+            // fan from the cell's centre (a fan from a corner would leave out the points on that corner's own sides)
+            void WholeCell((int X, int Z) cell, List<(int Start, int Count)> ranges, List<uint> list)
+            {
+                var (cx, cz) = cell;
+                bool keepLeft = !Whole((cx - 1, cz)), keepRight = !Whole((cx + 1, cz));
+                bool keepBottom = !Whole((cx, cz - 1)), keepTop = !Whole((cx, cz + 1));
+                var left = new HashSet<VertexOf>(); var right = new HashSet<VertexOf>();
+                var bottom = new HashSet<VertexOf>(); var top = new HashSet<VertexOf>();
+                foreach (var (start, count) in ranges)
+                    for (int k = 0; k < count; k++)
+                    {
+                        var v = pieceAt[start + k];
+                        if (v.Kind == VertexKind.CutX)
+                        {
+                            if (v.C == cx && keepLeft) left.Add(v);
+                            else if (v.C == cx + 1 && keepRight) right.Add(v);
+                        }
+                        else if (v.Kind == VertexKind.CutZ)
+                        {
+                            if (v.C == cz && keepBottom) bottom.Add(v);
+                            else if (v.C == cz + 1 && keepTop) top.Add(v);
+                        }
+                    }
+
+                // Counter-clockwise in (x, z) round the cell, as the pieces were
+                var loop = new List<VertexOf> { VertexOf.Corner(cx, cz) };
+                loop.AddRange(bottom.OrderBy(v => Position(v).X));
+                loop.Add(VertexOf.Corner(cx + 1, cz));
+                loop.AddRange(right.OrderBy(v => Position(v).Y));
+                loop.Add(VertexOf.Corner(cx + 1, cz + 1));
+                loop.AddRange(top.OrderByDescending(v => Position(v).X));
+                loop.Add(VertexOf.Corner(cx, cz + 1));
+                loop.AddRange(left.OrderByDescending(v => Position(v).Y));
+
+                if (loop.Count == 4)
+                {
+                    list.Add(Index(loop[0])); list.Add(Index(loop[2])); list.Add(Index(loop[1]));
+                    list.Add(Index(loop[0])); list.Add(Index(loop[3])); list.Add(Index(loop[2]));
+                    return;
+                }
+                var centre = new VertexOf(VertexKind.Centre, cx, cz, 0);
+                var pc = Position(centre);
+                for (int k = 0; k < loop.Count; k++)
+                {
+                    var a = loop[k];
+                    var b = loop[(k + 1) % loop.Count];
+                    Vector2 pa = Position(a), pb = Position(b);
+                    if ((pa.X - pc.X) * (pb.Y - pc.Y) - (pa.Y - pc.Y) * (pb.X - pc.X) <= 1e-6f) continue;   // two points at one place
+                    list.Add(Index(centre)); list.Add(Index(b)); list.Add(Index(a));
+                }
+            }
+
+            // One part per cell, row by row
+            var indices = new List<uint>();
+            var parts = new List<MeshPart>(byCell.Count);
+            foreach (var cell in byCell.Keys.OrderBy(k => k.Item2).ThenBy(k => k.Item1))
+            {
+                var list = byCell[cell];
+                parts.Add(SurfacePart(indices.Count, list.Count));
+                indices.AddRange(list);
+            }
+            var normals = new List<Vector3>(verts.Count);
+            for (int i = 0; i < verts.Count; i++) normals.Add(Vector3.UnitY);
+            return BuildSurface(verts, normals, uvs, indices, parts);
+        }
+
+        // Twice a convex piece's area, counter-clockwise positive
+        private static float PieceArea(List<VertexOf> at, int start, int count, Func<VertexOf, Vector2> position)
+        {
+            var p0 = position(at[start]);
+            float sum = 0f;
+            for (int k = 1; k + 1 < count; k++)
+            {
+                var p1 = position(at[start + k]);
+                var p2 = position(at[start + k + 1]);
+                sum += (p1.X - p0.X) * (p2.Y - p0.Y) - (p1.Y - p0.Y) * (p2.X - p0.X);
+            }
+            return sum;
+        }
+
+        private enum VertexKind : byte { Outline, CutX, CutZ, Corner, Centre }
+
+        /// <summary>A vertex of a level lake's surface by what it is (BuildLevelSurface): its identity, so it is made once.</summary>
+        private readonly record struct VertexOf(VertexKind Kind, int A, int B, int C)
+        {
+            public static VertexOf Outline(int p) => new(VertexKind.Outline, p, 0, 0);
+            public static VertexOf Corner(int x, int z) => new(VertexKind.Corner, x, z, 0);
+        }
+
+        private enum CarrierKind : byte { Edge, LineX, LineZ }
+
+        /// <summary>What an edge of a piece lies along: an edge of the ear clipping (A &lt; B) or the grid line x or z = A·ChunkSize.</summary>
+        private readonly record struct Carrier(CarrierKind Kind, int A, int B)
+        {
+            public static Carrier Edge(int a, int b) => new(CarrierKind.Edge, Math.Min(a, b), Math.Max(a, b));
+            public static Carrier LineX(int x) => new(CarrierKind.LineX, x, 0);
+            public static Carrier LineZ(int z) => new(CarrierKind.LineZ, z, 0);
+        }
+
+        // Sutherland–Hodgman against one grid line, keeping what each new vertex is and what each edge lies along: a cut
+        // of an ear clipping's edge is that edge's crossing, a cut of a grid line is a grid corner. sign +1 keeps the side
+        // of larger x (z), -1 the side of smaller; a point on the line is kept on both sides
+        private static void Clip(List<(VertexOf At, Carrier Along)> src, List<(VertexOf At, Carrier Along)> dst,
+            Carrier line, float sign, Func<VertexOf, Vector2> position)
+        {
+            dst.Clear();
+            int n = src.Count;
+            if (n < 3) return;
+            float at = line.A * ChunkSize;
+            float Side(VertexOf v)
+            {
+                var p = position(v);
+                return sign * ((line.Kind == CarrierKind.LineX ? p.X : p.Y) - at);
+            }
+            VertexOf Cut(Carrier along) => along.Kind switch
+            {
+                CarrierKind.Edge => new VertexOf(line.Kind == CarrierKind.LineX ? VertexKind.CutX : VertexKind.CutZ, along.A, along.B, line.A),
+                CarrierKind.LineX => VertexOf.Corner(along.A, line.A),
+                _ => VertexOf.Corner(line.A, along.A),
+            };
+            for (int i = 0; i < n; i++)
+            {
+                var (from, along) = src[i];
+                var to = src[(i + 1) % n].At;
+                float d0 = Side(from), d1 = Side(to);
+                if (d0 >= 0f)
+                {
+                    if (d1 >= 0f) dst.Add((from, along));
+                    else if (d0 == 0f) dst.Add((from, line));
+                    else
+                    {
+                        dst.Add((from, along));
+                        dst.Add((Cut(along), line));
+                    }
+                }
+                else if (d1 > 0f) dst.Add((Cut(along), along));
+            }
+        }
+
+        // The chunk-sized grid cell a triangle's centre lies in
+        private static (int, int) CellOf(List<Vector3> verts, List<uint> indices, int t)
+        {
+            var centre = (verts[(int)indices[t]] + verts[(int)indices[t + 1]] + verts[(int)indices[t + 2]]) / 3f;
+            return ((int)MathF.Floor(centre.X / ChunkSize), (int)MathF.Floor(centre.Z / ChunkSize));
+        }
+
+        private static int[] ToInts(List<uint> indices)
+        {
+            var ints = new int[indices.Count];
+            for (int i = 0; i < ints.Length; i++) ints[i] = (int)indices[i];
+            return ints;
         }
 
         /// <summary>A counter-clockwise outline moved <paramref name="by"/> metres outward along its vertex normals.</summary>
@@ -847,7 +1158,8 @@ namespace Freefall.Components
         private static Mesh BuildSurface(List<Vector3> verts, List<Vector3> normals, List<Vector2> uvs, List<uint> indices,
             List<MeshPart> parts)
         {
-            return RuntimeMesh.BuildMesh(verts, normals, uvs, indices, parts, "WaterBody_", boundsPerPart: true);
+            // water.fx displaces nothing: no push normals
+            return RuntimeMesh.BuildMesh(verts, normals, uvs, indices, parts, "WaterBody_", boundsPerPart: true, pushNormals: false);
         }
 
         // Splits every edge longer than maxEdge at its middle until none is, each edge once for both its triangles (so
@@ -857,34 +1169,39 @@ namespace Freefall.Components
             float maxEdge)
         {
             float maxSq = maxEdge * maxEdge;
+            // One table of middles and one list of the next pass's triangles for all passes (each pass made both anew,
+            // and every split triangle an array of its new indices)
+            var middles = new Dictionary<(uint, uint), uint>();
+            var next = new List<uint>(indices.Count * 2);
+            uint Middle(uint a, uint b)
+            {
+                var key = a < b ? (a, b) : (b, a);
+                if (Vector3.DistanceSquared(verts[(int)a], verts[(int)b]) <= maxSq) return uint.MaxValue;
+                if (!middles.TryGetValue(key, out uint m))
+                {
+                    m = (uint)verts.Count;
+                    verts.Add((verts[(int)a] + verts[(int)b]) * 0.5f);
+                    normals.Add(Vector3.Normalize(normals[(int)a] + normals[(int)b]));
+                    uvs.Add((uvs[(int)a] + uvs[(int)b]) * 0.5f);
+                    middles[key] = m;
+                }
+                return m;
+            }
+            void Tri(uint a, uint b, uint c) { next.Add(a); next.Add(b); next.Add(c); }
+
             for (int pass = 0; pass < 16; pass++)
             {
-                var middles = new Dictionary<(uint, uint), uint>();
-                uint Middle(uint a, uint b)
-                {
-                    var key = a < b ? (a, b) : (b, a);
-                    if (Vector3.DistanceSquared(verts[(int)a], verts[(int)b]) <= maxSq) return uint.MaxValue;
-                    if (!middles.TryGetValue(key, out uint m))
-                    {
-                        m = (uint)verts.Count;
-                        verts.Add((verts[(int)a] + verts[(int)b]) * 0.5f);
-                        normals.Add(Vector3.Normalize(normals[(int)a] + normals[(int)b]));
-                        uvs.Add((uvs[(int)a] + uvs[(int)b]) * 0.5f);
-                        middles[key] = m;
-                    }
-                    return m;
-                }
-
-                var next = new List<uint>(indices.Count * 2);
+                middles.Clear();
+                next.Clear();
                 for (int t = 0; t + 2 < indices.Count; t += 3)
                 {
                     uint a = indices[t], b = indices[t + 1], c = indices[t + 2];
                     uint ab = Middle(a, b), bc = Middle(b, c), ca = Middle(c, a);
                     int split = (ab != uint.MaxValue ? 1 : 0) + (bc != uint.MaxValue ? 1 : 0) + (ca != uint.MaxValue ? 1 : 0);
-                    if (split == 0) { next.Add(a); next.Add(b); next.Add(c); continue; }
+                    if (split == 0) { Tri(a, b, c); continue; }
                     if (split == 3)
                     {
-                        next.AddRange(new[] { a, ab, ca, ab, b, bc, ca, bc, c, ab, bc, ca });
+                        Tri(a, ab, ca); Tri(ab, b, bc); Tri(ca, bc, c); Tri(ab, bc, ca);
                         continue;
                     }
                     // One or two split edges: turn the triangle so the first split edge is a-b, then fan from its middle
@@ -895,15 +1212,15 @@ namespace Freefall.Components
                     }
                     if (split == 1)
                     {
-                        next.AddRange(new[] { a, ab, c, ab, b, c });
+                        Tri(a, ab, c); Tri(ab, b, c);
                     }
                     else if (bc != uint.MaxValue)
                     {
-                        next.AddRange(new[] { a, ab, c, ab, bc, c, ab, b, bc });
+                        Tri(a, ab, c); Tri(ab, bc, c); Tri(ab, b, bc);
                     }
                     else
                     {
-                        next.AddRange(new[] { a, ab, ca, ab, b, c, ab, c, ca });
+                        Tri(a, ab, ca); Tri(ab, b, c); Tri(ab, c, ca);
                     }
                 }
                 bool changed = middles.Count > 0;

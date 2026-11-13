@@ -57,6 +57,8 @@ namespace Freefall.Components
             MessageDispatcher.RemoveListener(EngineMsg.StampChanged, OnStampChanged);
             MessageDispatcher.RemoveListener(EngineMsg.TerrainHeightsChanged, OnTerrainHeightsChanged);
             TerrainRenderer.DecoratorsRebuilt -= OnDecoratorsRebuilt;
+            _destroyed = true;
+            _owed.Remove(this);
             base.Destroy();
             // Frames in flight still draw it
             Engine.Device.DeferDispose(_mesh);
@@ -109,7 +111,55 @@ namespace Freefall.Components
         /// The canopy as the field's stamp, spline and decorator and the ground under it have it now: a new mesh, and
         /// the values crop_canopy.fx reads (its struct Instance).
         /// </summary>
+        // Canopies owed a build by the running scene load (Rebuild)
+        private static readonly List<CropCanopy> _owed = new();
+        private static SceneLoad? _owedLoad;
+        private static bool _owedWaiting;
+        private bool _destroyed;
+
+        static CropCanopy()
+        {
+            // A load that ended before its waiting step (failed): what it owed is built now
+            SceneManager.Ready += _ => BuildOwed(long.MaxValue);
+        }
+
+        /// <summary>
+        /// Build the canopy anew. While a scene load is still waking, baking the terrain or generating, the heights, the
+        /// stamps and the decorators change several times before they are final (TestWorld built every canopy four times,
+        /// ~9 MiB of garbage each: ram.md): the build is owed to the load's waiting step instead (<see cref="BuildOwed"/>).
+        /// Outside a load, and from the waiting step on, it is built at once.
+        /// </summary>
         private void Rebuild()
+        {
+            if (SceneManager.Loading is { IsDone: false } load && load.Current <= SceneLoad.Step.Generating)
+            {
+                if (!_owed.Contains(this)) _owed.Add(this);
+                if (_owedLoad != load || !_owedWaiting)
+                {
+                    _owedLoad = load;
+                    _owedWaiting = true;
+                    load.WaitFor(BuildOwed, "Crop canopies");
+                }
+                return;
+            }
+            RebuildNow();
+        }
+
+        // The owed canopies, until the slice's deadline (a Stopwatch timestamp); true once none is left
+        private static bool BuildOwed(long deadline)
+        {
+            while (_owed.Count > 0)
+            {
+                var canopy = _owed[0];
+                _owed.RemoveAt(0);
+                if (!canopy._destroyed) canopy.RebuildNow();
+                if (_owed.Count > 0 && System.Diagnostics.Stopwatch.GetTimestamp() >= deadline) return false;
+            }
+            _owedWaiting = false;
+            return true;
+        }
+
+        private void RebuildNow()
         {
             var old = _mesh;
             _mesh = Build();
@@ -236,6 +286,11 @@ namespace Freefall.Components
             // solid; above it only where a tuft reaches that high: crop_canopy.fx), so near enough it has depth instead of
             // a skin
             int topCount = verts.Count;
+            // The shells' room at once (the lists doubled their way up to Shells times the top before)
+            verts.EnsureCapacity(topCount * Shells);
+            norms.EnsureCapacity(topCount * Shells);
+            uvs.EnsureCapacity(topCount * Shells);
+            indices.EnsureCapacity(topIndices.Count * Shells);
             indices.AddRange(topIndices);
             for (int shell = 1; shell < Shells; shell++)
             {
@@ -250,7 +305,8 @@ namespace Freefall.Components
             }
 
             var parts = new List<MeshPart> { new MeshPart { Name = "Canopy", NumIndices = indices.Count, MaterialSlot = 0 } };
-            var mesh = RuntimeMesh.BuildMesh(verts, norms, uvs, indices, parts, "CropCanopy_");
+            // crop_canopy.fx displaces nothing: no push normals
+            var mesh = RuntimeMesh.BuildMesh(verts, norms, uvs, indices, parts, "CropCanopy_", pushNormals: false);
             if (mesh == null) return null;
 
             var origin = terrain.Transform?.WorldPosition ?? Vector3.Zero;
@@ -321,11 +377,18 @@ namespace Freefall.Components
                     for (int x = 0; x < _width; x++)
                         _floor[z * _width + x] = heights.GetHeight(new Vector3(_x0 + x, 0, _z0 + z));
 
-                var smooth = Filter(Filter(_floor, SmoothReach, 1, false), SmoothReach, _width, false);
-                var above = new float[_floor.Length];
+                // Four grids where each pass made its own (seven): what a pass leaves behind takes the next one's result
+                var smooth = new float[_floor.Length];
+                var t1 = new float[_floor.Length];
+                var t2 = new float[_floor.Length];
+                Filter(_floor, t1, SmoothReach, 1, false);
+                Filter(t1, smooth, SmoothReach, _width, false);
+                var above = t1;
                 for (int i = 0; i < above.Length; i++) above[i] = _floor[i] - smooth[i];
-                var most = Filter(Filter(above, CrestReach, 1, true), CrestReach, _width, true);
-                _crests = new float[_floor.Length];
+                Filter(above, t2, CrestReach, 1, true);
+                var most = t1;
+                Filter(t2, most, CrestReach, _width, true);
+                _crests = t2;
                 for (int i = 0; i < _crests.Length; i++) _crests[i] = MathF.Max(_floor[i], smooth[i] + most[i]);
             }
 
@@ -350,9 +413,8 @@ namespace Freefall.Components
 
             // One pass of a box mean or a running max over ±reach nodes along rows (stride 1) or columns (stride width),
             // clamped at the grid's edges
-            private float[] Filter(float[] src, int reach, int stride, bool max)
+            private void Filter(float[] src, float[] dst, int reach, int stride, bool max)
             {
-                var dst = new float[src.Length];
                 for (int z = 0; z < _height; z++)
                 {
                     for (int x = 0; x < _width; x++)
@@ -369,7 +431,6 @@ namespace Freefall.Components
                         dst[z * _width + x] = max ? most : sum / (2 * reach + 1);
                     }
                 }
-                return dst;
             }
         }
 

@@ -811,13 +811,13 @@ namespace Freefall.Components
         /// and the shadow receivers test each part's sphere); false = every part gets the whole mesh's bounds.</param>
         internal static Mesh BuildMesh(List<Vector3> verts, List<Vector3> norms,
             List<Vector2> uvs, List<uint> indices, List<MeshPart> parts, string namePrefix = "RuntimeMesh_",
-            bool boundsPerPart = false)
+            bool boundsPerPart = false, bool pushNormals = true)
         {
             if (verts.Count == 0 || indices.Count == 0) return null;
 
             Mesh mesh;
             using (_uploadMarker.Auto())
-                mesh = new Mesh(Engine.Device, verts.ToArray(), norms.ToArray(), uvs.ToArray(), indices.ToArray());
+                mesh = new Mesh(Engine.Device, verts.ToArray(), norms.ToArray(), uvs.ToArray(), indices.ToArray(), pushNormals);
 
             mesh.BoundingBox = ComputeBounds(verts);
             mesh.Guid = Guid.NewGuid().ToString("N");

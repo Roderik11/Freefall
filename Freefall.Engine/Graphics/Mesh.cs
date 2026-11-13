@@ -514,8 +514,15 @@ namespace Freefall.Graphics
         public Mesh() { }
 
         public Mesh(GraphicsDevice device, Vector3[] positions, Vector3[] normals, Vector2[] uvs, uint[] indices)
+            : this(device, positions, normals, uvs, indices, pushNormals: true) { }
+
+        /// <param name="pushNormals">
+        /// False for a mesh no effect displaces (only gbuffer.fx reads them: a water body's water.fx, a crop canopy's
+        /// crop_canopy.fx do not): no welding for them, no buffer (PushNormBufferIndex 0).
+        /// </param>
+        public Mesh(GraphicsDevice device, Vector3[] positions, Vector3[] normals, Vector2[] uvs, uint[] indices, bool pushNormals)
         {
-            CreateBuffers(device, positions, normals, null, uvs, indices, null);
+            CreateBuffers(device, positions, normals, null, uvs, indices, pushNormals ? null : Array.Empty<Vector3>());
             MarkReady();
         }
 
