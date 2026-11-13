@@ -472,6 +472,7 @@ namespace Freefall.Base
             if (_texturesAtStart > 0)
                 text.Append($"; {_texturesAtStart} textures waited for over {_textureFrames} frames ({Stopwatch.GetElapsedTime(_textureWaitStart).TotalSeconds:F1} s)");
             _work.Clear();   // a script's work is not kept (the last load stays referenced: SceneManager.LastLoad)
+            if (Error == null && !Superseded) text.Append(CompactHeap());
             var waited = _waits.ConvertAll(w => w.What);
             waited.AddRange(_workDone);
             if (waited.Count > 0) text.Append($"; waited for {string.Join(", ", waited)}");
@@ -482,6 +483,22 @@ namespace Freefall.Base
 
             SceneManager.OnDone(this);
             Completed?.Invoke(this);
+        }
+
+        /// <summary>
+        /// One aggressive collection at the end of a load, still behind the progress popup or loading screen. A load sends
+        /// its transient arrays through the large object heap (TestWorld: ~1.9 GB of texture files, mesh streams and
+        /// generated meshes for ~1.2 GB that stays), which the GC never compacts on its own: the holes stay committed and
+        /// the process keeps its peak (ram.md). Aggressive compacts every generation, the large object heap too, and gives
+        /// the free pages back. Returns the report's part.
+        /// </summary>
+        private static string CompactHeap()
+        {
+            var start = Stopwatch.GetTimestamp();
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+            var ms = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+            var info = GC.GetGCMemoryInfo(GCKind.Any);
+            return $"; heap compacted in {ms:F0} ms to {info.HeapSizeBytes / 1048576.0:F0} MiB, {info.TotalCommittedBytes / 1048576.0:F0} MiB committed";
         }
 
         /// <summary>Once per tick while it runs (SceneManager.Update): the frame's time and profiler sections, for the report.</summary>
