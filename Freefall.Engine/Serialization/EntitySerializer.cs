@@ -136,6 +136,7 @@ namespace Freefall.Serialization
             private Phase _phase = Phase.Parse;
             private int _cursor;
             private int _prefabCount, _uidCount;
+            private bool _noStubs;   // a replay that found every asset loaded: nothing for the asset phase to resolve
             private long _parseTicks, _referencesTicks, _assetsTicks, _prefabsTicks;
 
             /// <summary>The entities, once the parse has run (the first <see cref="Step"/>).</summary>
@@ -192,7 +193,7 @@ namespace Freefall.Serialization
                     Parse();
                     _phase = Phase.Assets;
                     _cursor = 0;
-                    if (Engine.Assets == null) _phase = Phase.Prefabs;
+                    if (Engine.Assets == null || _noStubs) _phase = Phase.Prefabs;
                     if (Stopwatch.GetTimestamp() >= deadline) return false;
                 }
 
@@ -263,8 +264,10 @@ namespace Freefall.Serialization
                 // No LoadByGuid calls during parse = no parser corruption.
                 yaml.DeferAssetLoading = true;
                 yaml.DeferredUniqueIdRefs.Clear();
+                yaml.DeferredRefs.Clear();
                 yaml.DuplicateMode = _owner.DuplicateMode;
                 yaml.DuplicateUidMap.Clear();
+                bool replay = _bytes == null;
 
                 List<object> objects;
                 try
@@ -283,6 +286,11 @@ namespace Freefall.Serialization
                 }
                 _bytes = null;
 
+                // The replay made a stub only for an asset not loaded yet, and every stub it made is in DeferredRefs
+                // (YAMLSerializer.Replay); a parse makes stubs in more ways, so its components are always walked
+                _noStubs = replay && yaml.DeferredRefs.Count == 0;
+                yaml.DeferredRefs.Clear();
+
                 var entities = Entities;
                 Entity current = null;
                 var attachScope = _attachMarker.Auto();
@@ -296,6 +304,9 @@ namespace Freefall.Serialization
                     }
                     else if (obj is Component component && current != null)
                     {
+                        // A replay applied the document to the entity's own transform already (YAMLSerializer.Replay)
+                        if (ReferenceEquals(component, current.Transform)) continue;
+
                         if (component is Transform t)
                         {
                             CopyFields(t, current.Transform);
@@ -344,10 +355,12 @@ namespace Freefall.Serialization
                 var referencesScope = _referencesMarker.Auto();
 
                 // ── Phase 2: Build UID table and resolve IUniqueId references ──
-                var uidLookup = new Dictionary<ulong, IUniqueId>();
+                // (none to resolve, as in a prefab of one entity: no table)
+                var uidLookup = yaml.DeferredUniqueIdRefs.Count > 0 ? new Dictionary<ulong, IUniqueId>() : null;
 
                 foreach (var entity in entities)
                 {
+                    if (uidLookup == null) break;
                     if (entity.UID != 0)
                         uidLookup.TryAdd(entity.UID, entity);
 
@@ -367,7 +380,7 @@ namespace Freefall.Serialization
                         targetUid = newUid;
                     }
 
-                    if (uidLookup.TryGetValue(targetUid, out var resolved))
+                    if (uidLookup!.TryGetValue(targetUid, out var resolved))
                     {
                         try
                         {
@@ -389,7 +402,7 @@ namespace Freefall.Serialization
                 }
 
                 yaml.DeferredUniqueIdRefs.Clear();
-                _uidCount = uidLookup.Count;
+                _uidCount = uidLookup?.Count ?? 0;
 
                 referencesScope.Dispose();
                 long referenced = Stopwatch.GetTimestamp();

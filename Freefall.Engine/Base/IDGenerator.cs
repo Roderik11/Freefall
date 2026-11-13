@@ -4,8 +4,6 @@ namespace Freefall.Base
 {
     public static class IDGenerator
     {
-        private static readonly RandomNumberGenerator _rng = RandomNumberGenerator.Create();
-
         // Starts at a random value: an id kept from an earlier session then almost certainly finds nothing,
         // instead of whatever entity happened to get the same number this time.
         private static int _nextId = RandomNumberGenerator.GetInt32(int.MaxValue);
@@ -26,14 +24,24 @@ namespace Freefall.Base
             return id;
         }
 
+        // UIDs drawn 64 at a time per thread: one call to the system's generator per UID was 74 ns, and every entity and
+        // component of a prefab copy takes one (ram.md "What a spawn takes"). Still the cryptographic generator.
+        [ThreadStatic] private static ulong[]? _uids;
+        [ThreadStatic] private static int _uidsUsed;
+
         /// <summary>
         /// Cryptographically random 64-bit unique ID (for persistent serialization).
         /// </summary>
         public static ulong GetUID()
         {
-            Span<byte> bytes = stackalloc byte[8];
-            _rng.GetBytes(bytes);
-            return BitConverter.ToUInt64(bytes);
+            var uids = _uids;
+            if (uids == null || _uidsUsed == uids.Length)
+            {
+                uids ??= _uids = new ulong[64];
+                RandomNumberGenerator.Fill(System.Runtime.InteropServices.MemoryMarshal.AsBytes(uids.AsSpan()));
+                _uidsUsed = 0;
+            }
+            return uids[_uidsUsed++];
         }
     }
 }

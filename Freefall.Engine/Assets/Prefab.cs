@@ -51,19 +51,34 @@ namespace Freefall.Assets
         /// <summary>Diagnostics: FREEFALL_PREFAB_TEMPLATES=0 before starting parses every instance (to compare scenes with scene_fingerprint).</summary>
         public static readonly bool UseTemplates = Environment.GetEnvironmentVariable("FREEFALL_PREFAB_TEMPLATES") != "0";
 
+        // The serializer the replays use, one per thread and taken while in use (a prefab hydrated inside a replay gets
+        // one of its own). Every load resets what it reads. A new one per copy was a YAML serializer with its map and
+        // lists, made and dropped for every copy (ram.md "What a spawn takes").
+        [ThreadStatic] private static EntitySerializer? _replaySerializer;
+
         /// <summary>The prefab's entities, made anew (fresh UIDs): replays the recorded parse when it still applies.</summary>
         private List<Entity> LoadEntities(bool skipPrefabHydration)
         {
-            var serializer = new EntitySerializer { DuplicateMode = true };
             var yaml = SourceYaml;
-            if (!UseTemplates) return serializer.LoadFromBytes(yaml, skipPrefabHydration);
             var template = _template;
-            if (template != null && ReferenceEquals(template.Yaml, yaml) && template.Recording.IsCurrent)
+            if (UseTemplates && template != null && ReferenceEquals(template.Yaml, yaml) && template.Recording.IsCurrent
+                && !template.Recording.HasFailed)
             {
-                return template.Recording.HasFailed
-                    ? serializer.LoadFromBytes(yaml, skipPrefabHydration)
-                    : serializer.LoadFromRecording(template.Recording, skipPrefabHydration);
+                var replayer = _replaySerializer ?? new EntitySerializer { DuplicateMode = true };
+                _replaySerializer = null;
+                try
+                {
+                    return replayer.LoadFromRecording(template.Recording, skipPrefabHydration);
+                }
+                finally
+                {
+                    _replaySerializer = replayer;
+                }
             }
+
+            var serializer = new EntitySerializer { DuplicateMode = true };
+            if (!UseTemplates || template != null && ReferenceEquals(template.Yaml, yaml) && template.Recording.IsCurrent)
+                return serializer.LoadFromBytes(yaml, skipPrefabHydration);   // templates off, or this YAML's replay fails
 
             var recording = new YAMLSerializer.Recording();
             var entities = serializer.LoadFromBytes(yaml, recording, skipPrefabHydration);

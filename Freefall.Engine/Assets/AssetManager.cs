@@ -473,6 +473,21 @@ namespace Freefall.Assets
             return asset;
         }
 
+        /// <summary>The key <see cref="LoadByGuid{T}"/> keeps an asset under, asked for as <paramref name="assetType"/>.</summary>
+        internal static string CacheKey(Type assetType, string guid) => $"{assetType.Name}:guid:{guid}";
+
+        /// <summary>
+        /// What <see cref="LoadByGuid{T}"/> would return for <paramref name="cacheKey"/> (from <see cref="CacheKey"/>)
+        /// when the asset is loaded already, pinned the same way; null when it is not, without loading it. A prefab
+        /// copy's replay takes its assets with this and makes no stubs to resolve afterwards.
+        /// </summary>
+        internal Asset? Loaded(string cacheKey, Type assetType)
+        {
+            if (!_assets.TryGetValue(cacheKey, out var cached) || !assetType.IsInstanceOfType(cached))
+                return null;
+            return PinIfCold(cached);
+        }
+
         /// <summary>
         /// Load an asset by GUID. Used by loaders to resolve cross-asset references.
         /// </summary>
@@ -481,7 +496,7 @@ namespace Freefall.Assets
             if (string.IsNullOrEmpty(guid))
                 return null;
 
-            string cacheKey = $"{typeof(T).Name}:guid:{guid}";
+            string cacheKey = CacheKey(typeof(T), guid);
 
             if (_assets.TryGetValue(cacheKey, out var cached))
             {

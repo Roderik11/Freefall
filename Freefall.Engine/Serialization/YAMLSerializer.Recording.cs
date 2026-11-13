@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using Freefall.Assets;
 using Freefall.Base;
+using Freefall.Components;
 using Freefall.Reflection;
 
 namespace Freefall.Serialization
@@ -55,9 +56,13 @@ namespace Freefall.Serialization
             public Recipe? Nested;
             public object?[]? Values;       // PrimitiveArray / PrimitiveList
             public List<object>? Items;     // List: a Recipe or an AssetItem per element
+            public string? CacheKey;        // AssetStub: where the asset manager keeps it, made on the first replay
         }
 
-        internal sealed record AssetItem(Type Type, string Guid);
+        internal sealed record AssetItem(Type Type, string Guid)
+        {
+            public string CacheKey { get; } = AssetManager.CacheKey(Type, Guid);
+        }
 
         private Recording? _recording;
         private Dictionary<object, Recipe>? _recipes;   // object the recorded parse created -> its recipe
@@ -86,18 +91,37 @@ namespace Freefall.Serialization
             }
         }
 
-        /// <summary>Do again what a recorded parse did: the objects it returned, made anew, in the same order.</summary>
+        /// <summary>
+        /// Do again what a recorded parse did: the objects it returned, made anew, in the same order. Two shortcuts a
+        /// parse cannot take, with the same outcome (ram.md "What a spawn takes"):
+        /// - an entity's Transform document is applied to the transform the entity made for itself, which the parse's
+        ///   own Transform was copied into afterwards (EntitySerializer: a second Transform and a copy by reflection);
+        /// - an asset that is loaded already is set at once, where the parse makes a stub (a Material stub alone is 1.1 KB
+        ///   of empty dictionaries and lists) and the load resolves it afterwards; only assets not loaded yet get stubs.
+        /// </summary>
         public List<object> Replay(Recording recording)
         {
             if (recording.DuplicateMode != DuplicateMode)
                 throw new InvalidOperationException("A recording replays only in the DuplicateMode it was recorded in");
 
             var results = new List<object>(recording.Documents.Count);
+            Entity? entity = null;   // the entity the documents after it belong to
             foreach (var recipe in recording.Documents)
             {
                 try
                 {
-                    var instance = Build(recipe);
+                    object? instance;
+                    if (entity != null && recipe.Type == typeof(Transform))
+                    {
+                        instance = entity.Transform;
+                        foreach (var op in recipe.Ops)
+                            Apply(instance, op);
+                    }
+                    else
+                    {
+                        instance = Build(recipe);
+                        if (instance is Entity built) entity = built;
+                    }
                     if (instance != null) results.Add(instance);
                 }
                 catch (Exception ex)
@@ -135,6 +159,11 @@ namespace Freefall.Serialization
 
                 case OpKind.AssetStub:
                 {
+                    if (Engine.Assets?.Loaded(op.CacheKey ??= AssetManager.CacheKey(op.Type!, (string)op.Value!), op.Type!) is { } loaded)
+                    {
+                        op.Field.SetValue(parent, loaded);
+                        break;
+                    }
                     var stub = (Asset)Activator.CreateInstance(op.Type!)!;
                     stub.Guid = (string)op.Value!;
                     op.Field.SetValue(parent, stub);
@@ -178,6 +207,11 @@ namespace Freefall.Serialization
                         }
                         else if (item is AssetItem asset)
                         {
+                            if (Engine.Assets?.Loaded(asset.CacheKey, asset.Type) is { } loaded)
+                            {
+                                list.Add(loaded);
+                                continue;
+                            }
                             var stub = (Asset)Activator.CreateInstance(asset.Type)!;
                             stub.Guid = asset.Guid;
                             int index = list.Count;

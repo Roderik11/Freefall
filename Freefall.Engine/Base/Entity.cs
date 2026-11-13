@@ -10,18 +10,40 @@ namespace Freefall.Base
 {
     public class Entity : IUniqueId, IIndex
     {
-        private static readonly Dictionary<Type, Type> _cacheTypes = new();
         private readonly List<Component> _components = new List<Component>();
         public IReadOnlyList<Component> Components => _components;
 
-        private static Type GetCacheType(Type componentType)
+        // Adding a component of a type known only at run time to its ComponentCache<T> and taking it out: delegates made
+        // once per component type, in place of GetMethod + Invoke with an argument array per call (558 ns per component
+        // of every prefab copy, and as much again when it was destroyed: ram.md "What a spawn takes"). The map is made
+        // anew when a script assembly comes or goes (Reflector.Generation), so it never keeps an unloaded type alive.
+        private sealed record CacheOps(Action<Entity, Component> Add, Func<Entity, bool> Remove);
+        private static Dictionary<Type, CacheOps> _cacheOps = new();
+        private static int _cacheOpsGeneration = -1;
+
+        private static class CacheOf<T> where T : Component
         {
-            if (!_cacheTypes.TryGetValue(componentType, out var cacheType))
+            public static void Add(Entity entity, Component component) => ComponentCache<T>.Add(entity, (T)component);
+            public static bool Remove(Entity entity) => ComponentCache<T>.Remove(entity);
+        }
+
+        private static CacheOps OpsFor(Type componentType)
+        {
+            int generation = Reflection.Reflector.Generation;
+            if (_cacheOpsGeneration != generation)
             {
-                cacheType = typeof(ComponentCache<>).MakeGenericType(componentType);
-                _cacheTypes[componentType] = cacheType;
+                _cacheOps = new Dictionary<Type, CacheOps>();
+                _cacheOpsGeneration = generation;
             }
-            return cacheType;
+            if (!_cacheOps.TryGetValue(componentType, out var ops))
+            {
+                var of = typeof(CacheOf<>).MakeGenericType(componentType);
+                ops = new CacheOps(
+                    of.GetMethod(nameof(CacheOf<Component>.Add))!.CreateDelegate<Action<Entity, Component>>(),
+                    of.GetMethod(nameof(CacheOf<Component>.Remove))!.CreateDelegate<Func<Entity, bool>>());
+                _cacheOps[componentType] = ops;
+            }
+            return ops;
         }
 
         public int Id { get; } = IDGenerator.GetId();
@@ -216,10 +238,7 @@ namespace Freefall.Base
                 Transform = t;
             }
 
-            // Invoke ComponentCache<T>.Add(this, component) via reflection
-            var cacheType = GetCacheType(component.GetType());
-            var addMethod = cacheType.GetMethod("Add", BindingFlags.Public | BindingFlags.Static);
-            addMethod?.Invoke(null, [this, component]);
+            OpsFor(component.GetType()).Add(this, component);
 
             component.Attached();
 
@@ -248,9 +267,7 @@ namespace Freefall.Base
             component.IsDestroyed = true;
             component.Destroyed();
 
-            var cacheType = GetCacheType(component.GetType());
-            var removeMethod = cacheType.GetMethod("Remove", BindingFlags.Public | BindingFlags.Static, [typeof(Entity)]);
-            removeMethod?.Invoke(null, [this]);
+            OpsFor(component.GetType()).Remove(this);
         }
 
         /// <summary>
@@ -263,20 +280,18 @@ namespace Freefall.Base
             if (component is Transform) return;
             if (!_components.Remove(component)) return;
 
-            var cacheType = GetCacheType(component.GetType());
-            var removeMethod = cacheType.GetMethod("Remove", BindingFlags.Public | BindingFlags.Static, [typeof(Entity)]);
-            removeMethod?.Invoke(null, [this]);
+            OpsFor(component.GetType()).Remove(this);
             component.Entity = null;
         }
 
         /// <summary>
-        /// Forget the ComponentCache&lt;T&gt; types built for component types matching the predicate
+        /// Forget the ComponentCache&lt;T&gt; delegates made for component types matching the predicate
         /// (script types whose assembly is being unloaded), so this static map doesn't pin their ALC.
         /// </summary>
         internal static void ForgetCacheTypes(Func<Type, bool> predicate)
         {
-            foreach (var type in _cacheTypes.Keys.Where(predicate).ToList())
-                _cacheTypes.Remove(type);
+            foreach (var type in _cacheOps.Keys.Where(predicate).ToList())
+                _cacheOps.Remove(type);
         }
 
         public void RemoveComponent<T>() where T : Component
@@ -318,11 +333,7 @@ namespace Freefall.Base
 
             // Unregister each component from its ComponentCache<T>
             foreach (var component in _components)
-            {
-                var cacheType = GetCacheType(component.GetType());
-                var removeMethod = cacheType.GetMethod("Remove", BindingFlags.Public | BindingFlags.Static, [typeof(Entity)]);
-                removeMethod?.Invoke(null, [this]);
-            }
+                OpsFor(component.GetType()).Remove(this);
 
             _components.Clear();
             Transform.Parent = null;
