@@ -233,6 +233,10 @@ namespace Freefall.Components
             public float ShoreSizeZ;
             public float SnowAlongX;    // Weather.SnowLaidAlong: the way the snow's drifts on the ice run
             public float SnowAlongZ;
+            public uint NearestDepthSRV;    // WaterReflections: the nearest-depth pyramid (0 = no screen-space reflections)
+            public uint NearestDepthMips;
+            public uint SceneColourSRV;     // WaterReflections: the composite snapshot as a pyramid, half size and down
+            public uint SceneColourMips;
         }
 
         protected override void Awake()
@@ -955,6 +959,14 @@ namespace Freefall.Components
             }
 
             var depth = DeferredRenderer.Current?.DepthGBuffer;
+            // The scene in the water (water.fx WaterScreenReflection): the renderer makes what it reads on frames a water
+            // asks; none on the first (the pyramids come with the next frame) or with the setting off
+            WaterReflections? reflections = null;
+            if (Engine.Settings.ScreenSpaceReflections)
+            {
+                WaterReflections.Want();
+                reflections = DeferredRenderer.Current?.WaterReflections;
+            }
 
             _params.SetParameter("WaterData", new WaterData
             {
@@ -991,6 +1003,10 @@ namespace Freefall.Components
                 ShoreSizeZ = _shore != null ? _shore.Height * _shore.Cell : 1f,
                 SnowAlongX = Weather.SnowLaidAlong.X,
                 SnowAlongZ = Weather.SnowLaidAlong.Y,
+                NearestDepthSRV = reflections?.NearestDepthSrv ?? 0u,
+                NearestDepthMips = reflections?.NearestDepthMips ?? 0u,
+                SceneColourSRV = reflections?.ColourSrv ?? 0u,
+                SceneColourMips = reflections?.ColourMipCount ?? 0u,
             });
 
             CommandBuffer.Enqueue(mesh, _material, _params, Transform.TransformSlot);

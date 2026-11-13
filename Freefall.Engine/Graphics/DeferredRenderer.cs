@@ -73,6 +73,9 @@ namespace Freefall.Graphics
         private readonly DecalPass _decals = new();
         // Screen-space reflections, after the lighting, before the composition (made on first use)
         private ScreenSpaceReflections? _ssr;
+        /// <summary>The water's screen-space reflections' pyramids (nearest depth, the scene's colour), made before the
+        /// forward pass on frames a WaterBody draws; null until then. WaterBody hands their SRVs to water.fx.</summary>
+        public WaterReflections? WaterReflections { get; private set; }
         private PrecipitationLayers? _precipitation;
         // Glass, particles, trails and vfx without order, after the Forward pass's water (EngineSettings.Transparency)
         private readonly OrderIndependentTransparency _oit = new();
@@ -1418,6 +1421,13 @@ namespace Freefall.Graphics
              // (avoids read/write hazard — ocean writes to Composite while reading the snapshot)
              SnapshotComposite(list);
 
+             // What the water's reflections read: the nearest depth and the scene's colour as pyramids, from this frame's
+             // linear depth and the snapshot just taken (the water is not in either)
+             if (Engine.Settings.ScreenSpaceReflections && Graphics.WaterReflections.Wanted)
+             {
+                 WaterReflections ??= new WaterReflections();
+                 WaterReflections.Execute(list, this);
+             }
 
              // Depth is in ShaderRead — forward objects can sample it via bindless SRV.
              // Transition depth back to DepthWrite so forward objects can depth-test.
@@ -1674,6 +1684,7 @@ namespace Freefall.Graphics
             _lightClusters.Dispose();
             _decals.Dispose();
             _ssr?.Dispose();
+            WaterReflections?.Dispose();
             _precipitation?.Dispose();
             _oit.Dispose();
             _aerialPerspective.Dispose();

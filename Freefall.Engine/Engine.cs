@@ -887,7 +887,8 @@ namespace Freefall
          /// <summary>
          /// Screen-space reflections on surfaces smoother than roughness 0.45 (ssr_cs.hlsl, half resolution): puddles and
          /// soaked flat ground mirror the houses and the lanterns; where a ray finds nothing the sky probe stays. Needs
-         /// AmbientSpecular.
+         /// AmbientSpecular. Lakes and rivers too (water.fx, through WaterReflections' depth pyramid): the banks, the
+         /// mountains and the clouds in the water, broken by its ripples.
          /// </summary>
          public bool ScreenSpaceReflections { get; set; } = true;
 
