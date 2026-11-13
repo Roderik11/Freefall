@@ -441,7 +441,7 @@ namespace Freefall.Serialization
                 // only plain classes the serializer writes as a mapping qualify.
                 if (field.CanWrite && !field.Ignored && field.Type.IsClass && field.Type != typeof(string)
                     && !typeof(Asset).IsAssignableFrom(field.Type) && !typeof(IList).IsAssignableFrom(field.Type)
-                    && field.Type.IsSerializable)
+                    && field.Type.IsSerializable && !PlainData(field.Type))
                 {
                     slots.Add((field, StubSlot.Nested, null));
                     continue;
@@ -465,11 +465,26 @@ namespace Freefall.Serialization
 
                     if (elType != null && typeof(Asset).IsAssignableFrom(elType))
                         slots.Add((field, StubSlot.AssetList, elType));
-                    else if (elType != null && Reflector.GetAttribute<SerializableAttribute>(elType) != null)
+                    else if (elType != null && Reflector.GetAttribute<SerializableAttribute>(elType) != null && !PlainData(elType))
                         slots.Add((field, StubSlot.NestedList, elType));
                 }
             }
             return new StubPlan(slots.ToArray(), slots.Exists(s => s.Item2 is StubSlot.Nested or StubSlot.NestedList));
+        }
+
+        /// <summary>
+        /// A sealed type (or struct) whose fields are only numbers, enums, strings and structs of those: nothing in it
+        /// can be an asset stub, so the walk need not read it. Reading a renderer's Instance list made one for every
+        /// renderer of every prefab copy (ram.md).
+        /// </summary>
+        private static bool PlainData(Type type, int depth = 0)
+        {
+            if (type.IsPrimitive || type.IsEnum || type == typeof(string)) return true;
+            if (depth > 4 || !(type.IsValueType || type.IsSealed)) return false;
+            foreach (var f in type.GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public
+                                             | System.Reflection.BindingFlags.NonPublic))
+                if (!PlainData(f.FieldType, depth + 1)) return false;
+            return true;
         }
 
         private static void ResolveObjectStubs(object obj, string context, int depth = 0, HashSet<object> seen = null)

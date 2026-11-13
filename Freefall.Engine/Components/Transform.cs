@@ -18,9 +18,19 @@ namespace Freefall.Components
         private Quaternion _rotation = Quaternion.Identity;
         private Vector3 _scale = Vector3.One;
         private Matrix4x4 _matrix = Matrix4x4.Identity;
-        private Matrix4x4 _localTransform = Matrix4x4.Identity;
         private Vector3 _worldPosition;
-        private readonly List<Transform> Children = new List<Transform>();
+
+        // Made with the first child: most transforms have none (a static mesh's), and the list was 32 B of each (ram.md)
+        private List<Transform>? _children;
+        private static readonly List<Transform> NoChildren = new(0);   // read only
+        private List<Transform> Children => _children ?? NoChildren;
+
+        /// <summary>
+        /// The renderer whose bounds follow this transform (PersistentRenderer.UpdateBounds), called in place like
+        /// <see cref="OnChangedInPlace"/>: a field, where a subscription was a delegate of 64 B per renderer. A second
+        /// renderer on the same transform subscribes to the event.
+        /// </summary>
+        internal PersistentRenderer? BoundsRenderer;
 
         /// <summary>
         /// Fired when any local property changes (position, rotation, scale, parent). In place on the main thread. A change
@@ -98,6 +108,7 @@ namespace Freefall.Components
                 _isFiringChanged = true;
                 try
                 {
+                    BoundsRenderer?.UpdateBounds();
                     OnChangedInPlace?.Invoke();
                     if (OnChanged != null)
                     {
@@ -126,9 +137,9 @@ namespace Freefall.Components
             set
             {
                 if (_parent == value) return;
-                _parent?.Children.Remove(this);
+                _parent?._children?.Remove(this);
                 _parent = value;
-                _parent?.Children.Add(this);
+                if (_parent != null) (_parent._children ??= new List<Transform>()).Add(this);
                 HierarchyVersion++;
                 SetDirty();
             }
@@ -182,7 +193,6 @@ namespace Freefall.Components
                 {
                     var local = Matrix4x4.CreateScale(_scale) * Matrix4x4.CreateFromQuaternion(_rotation) * Matrix4x4.CreateTranslation(_position);
                     var matrix = _parent != null ? local * _parent.Matrix : local;
-                    _localTransform = local;
                     _matrix = matrix;
                     _worldPosition = matrix.Translation;
                     Volatile.Write(ref _isDirty, false);
@@ -230,7 +240,7 @@ namespace Freefall.Components
                 // reads this, and a slot taken then is never given back (a whole scene's slots at every load).
                 if (_transformSlot < 0 && !IsDestroyed && TransformBuffer.Instance != null)
                 {
-                    lock (_slotInitLock)
+                    lock (SlotInitLock)
                     {
                         if (_transformSlot < 0)
                         {
@@ -244,7 +254,9 @@ namespace Freefall.Components
             }
         }
         private volatile int _transformSlot = -1;
-        private readonly object _slotInitLock = new();
+        // One lock for every transform's first slot (taken once per transform, rarely by two threads at once): an object
+        // of 24 B per transform before
+        private static readonly System.Threading.Lock SlotInitLock = new();
 
         public override void Destroy()
         {

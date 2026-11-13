@@ -34,21 +34,28 @@ namespace Freefall.Components
         [System.ComponentModel.Browsable(false)]
         public List<InstanceValue> Instance
         {
-            get => _instance;
+            get => _instance ??= new List<InstanceValue>();
             set
             {
-                _instance = value ?? new List<InstanceValue>();
-                foreach (var (effect, slot) in _instanceSlots)
+                // An empty one is none: loading a prefab gives every renderer an empty list
+                _instance = value is { Count: > 0 } ? value : null;
+                foreach (var (effect, slot) in InstanceSlots)
                     WriteInstanceSlot(effect, slot);
             }
         }
-        private List<InstanceValue> _instance = new();
+
+        // Made on first use, like the slots below: most renderers set no value and draw with no effect that declares a
+        // struct Instance, and the three containers were ~130 B of every static mesh entity (ram.md)
+        private List<InstanceValue>? _instance;
 
         // A slot of the instance data buffer per effect this renderer draws with (by Effect.Key: Effect objects of
         // one key share their layout; a project effect named like an engine one is another effect), and the ones
         // the current draws use
-        private readonly List<(Effect effect, int slot)> _instanceSlots = new();
-        private readonly HashSet<string> _instanceSlotsUsed = new();
+        private List<(Effect effect, int slot)>? _instanceSlots;
+        private HashSet<string>? _instanceSlotsUsed;
+        private static readonly List<(Effect effect, int slot)> NoSlots = new(0);   // read only
+
+        private List<(Effect effect, int slot)> InstanceSlots => _instanceSlots ?? NoSlots;
 
         /// <summary>The mesh the draws are built from (null = nothing to draw).</summary>
         protected abstract Mesh? RenderMesh { get; }
@@ -114,8 +121,8 @@ namespace Freefall.Components
             lock (_liveLock) _liveRenderers.Remove(this);
             TrackTransform(null);
             Unregister();
-            foreach (var (_, slot) in _instanceSlots) InstanceData.Release(slot);
-            _instanceSlots.Clear();
+            foreach (var (_, slot) in InstanceSlots) InstanceData.Release(slot);
+            _instanceSlots?.Clear();
         }
 
         // ── Per-object data (struct Instance of the effects) ──
@@ -127,11 +134,12 @@ namespace Freefall.Components
         /// </summary>
         public void SetInstance(string name, Vector4 value)
         {
-            int index = _instance.FindIndex(v => v.Name == name);
+            _instance ??= new List<InstanceValue>();
+            int index = IndexOf(_instance, name);
             if (index >= 0) _instance[index].Value = value;
             else _instance.Add(new InstanceValue { Name = name, Value = value });
 
-            foreach (var (effect, slot) in _instanceSlots)
+            foreach (var (effect, slot) in InstanceSlots)
             {
                 var member = effect.InstanceParams.Find(p => p.Name == name);
                 if (member != null) InstanceData.Write(slot, member, value);
@@ -151,7 +159,7 @@ namespace Freefall.Components
             if (index >= 0) _runtimeInstance[index].Value = value;
             else _runtimeInstance.Add(new InstanceValue { Name = name, Value = value });
 
-            foreach (var (effect, slot) in _instanceSlots)
+            foreach (var (effect, slot) in InstanceSlots)
             {
                 var member = effect.InstanceParams.Find(p => p.Name == name);
                 if (member != null) InstanceData.Write(slot, member, value);
@@ -165,7 +173,7 @@ namespace Freefall.Components
             int index = IndexOf(_runtimeInstance, name);
             if (index < 0) return;
             _runtimeInstance.RemoveAt(index);
-            foreach (var (effect, slot) in _instanceSlots) WriteInstanceSlot(effect, slot);
+            foreach (var (effect, slot) in InstanceSlots) WriteInstanceSlot(effect, slot);
         }
 
         // Values the running game wrote (WriteInstance): never saved
@@ -189,9 +197,9 @@ namespace Freefall.Components
         /// </summary>
         public bool TryGetInstance(string name, out Vector4 value)
         {
-            int index = _instance.FindIndex(v => v.Name == name);
-            if (index >= 0) { value = _instance[index].Value; return true; }
-            foreach (var (effect, _) in _instanceSlots)
+            int index = _instance == null ? -1 : IndexOf(_instance, name);
+            if (index >= 0) { value = _instance![index].Value; return true; }
+            foreach (var (effect, _) in InstanceSlots)
             {
                 var member = effect.InstanceParams.Find(p => p.Name == name);
                 if (member != null) { value = InstanceData.DefaultOf(member); return true; }
@@ -203,8 +211,8 @@ namespace Freefall.Components
         /// <summary>Drops this object's own value of a member: the effect's default applies again.</summary>
         public void ResetInstance(string name)
         {
-            if (_instance.RemoveAll(v => v.Name == name) == 0) return;
-            foreach (var (effect, slot) in _instanceSlots) WriteInstanceSlot(effect, slot);
+            if (_instance == null || _instance.RemoveAll(v => v.Name == name) == 0) return;
+            foreach (var (effect, slot) in InstanceSlots) WriteInstanceSlot(effect, slot);
         }
 
         /// <summary>
@@ -213,8 +221,8 @@ namespace Freefall.Components
         /// </summary>
         public List<Effect> GetInstanceEffects()
         {
-            var effects = new List<Effect>(_instanceSlots.Count);
-            foreach (var (effect, _) in _instanceSlots) effects.Add(effect);
+            var effects = new List<Effect>(InstanceSlots.Count);
+            foreach (var (effect, _) in InstanceSlots) effects.Add(effect);
             return effects;
         }
 
@@ -228,12 +236,12 @@ namespace Freefall.Components
             var effect = material?.Effect;
             if (effect == null || effect.InstanceParams.Count == 0) return 0;
 
-            _instanceSlotsUsed.Add(effect.Key);
-            foreach (var (known, slot) in _instanceSlots)
+            (_instanceSlotsUsed ??= new HashSet<string>()).Add(effect.Key);
+            foreach (var (known, slot) in InstanceSlots)
                 if (known.Key == effect.Key) return slot;
 
             int made = InstanceData.Allocate();
-            _instanceSlots.Add((effect, made));
+            (_instanceSlots ??= new List<(Effect effect, int slot)>()).Add((effect, made));
             WriteInstanceSlot(effect, made);
             return made;
         }
@@ -242,10 +250,13 @@ namespace Freefall.Components
         private void WriteInstanceSlot(Effect effect, int slot)
         {
             InstanceData.WriteDefaults(slot, effect.InstanceParams);
-            foreach (var own in _instance)
+            if (_instance != null)
             {
-                var member = effect.InstanceParams.Find(p => p.Name == own.Name);
-                if (member != null) InstanceData.Write(slot, member, own.Value);
+                foreach (var own in _instance)
+                {
+                    var member = effect.InstanceParams.Find(p => p.Name == own.Name);
+                    if (member != null) InstanceData.Write(slot, member, own.Value);
+                }
             }
             if (_runtimeInstance == null) return;
             foreach (var runtime in _runtimeInstance)
@@ -264,12 +275,22 @@ namespace Freefall.Components
         /// </summary>
         public override void OnMemberChanged() => Invalidate();
 
+        // Its own bounds only: safe on a worker. The first renderer on a transform takes its slot (Transform.BoundsRenderer),
+        // a field instead of a delegate of 64 B per renderer; another one on the same transform subscribes to the event
         private void TrackTransform(Transform? transform)
         {
             if (_trackedTransform == transform) return;
-            if (_trackedTransform != null) _trackedTransform.OnChangedInPlace -= UpdateBounds;
+            if (_trackedTransform != null)
+            {
+                if (_trackedTransform.BoundsRenderer == this) _trackedTransform.BoundsRenderer = null;
+                else _trackedTransform.OnChangedInPlace -= UpdateBounds;
+            }
             _trackedTransform = transform;
-            if (_trackedTransform != null) _trackedTransform.OnChangedInPlace += UpdateBounds;   // its own bounds only: safe on a worker
+            if (_trackedTransform != null)
+            {
+                if (_trackedTransform.BoundsRenderer == null) _trackedTransform.BoundsRenderer = this;
+                else _trackedTransform.OnChangedInPlace += UpdateBounds;
+            }
         }
 
         /// <summary>
@@ -280,7 +301,7 @@ namespace Freefall.Components
         /// symmetric, so the smallest sphere around its corners is centred on the box centre and reaches
         /// the farthest corner.
         /// </summary>
-        private void UpdateBounds()
+        internal void UpdateBounds()
         {
             var mesh = RenderMesh;
             if (mesh == null || Transform == null) return;
@@ -365,17 +386,18 @@ namespace Freefall.Components
 
             UpdateBounds();
 
-            var group = new DrawGroup();
-            _instanceSlotsUsed.Clear();
+            var group = new DrawGroup(mesh.DrawPartIndices.Length);
+            _instanceSlotsUsed?.Clear();
             AddDraws(group, mesh, slot);
             _drawGroup = group;
 
             // Slots of effects the draws no longer use go back; the ones in use are rewritten (an effect's layout
             // may have changed: a recompile invalidates every renderer through Material.EffectChanged)
+            if (_instanceSlots == null) return;
             for (int i = _instanceSlots.Count - 1; i >= 0; i--)
             {
                 var (effect, instanceSlot) = _instanceSlots[i];
-                if (_instanceSlotsUsed.Contains(effect.Key))
+                if (_instanceSlotsUsed != null && _instanceSlotsUsed.Contains(effect.Key))
                     WriteInstanceSlot(effect, instanceSlot);
                 else
                 {
@@ -398,7 +420,7 @@ namespace Freefall.Components
     /// name and up to four floats (a float uses X, a float2 XY, a float3 or colour XYZ).
     /// </summary>
     [Serializable]
-    public class InstanceValue
+    public sealed class InstanceValue   // sealed: plain data the asset-stub walk skips (EntitySerializer.PlainData)
     {
         public string Name = "";
         public Vector4 Value;

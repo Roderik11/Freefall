@@ -34,6 +34,9 @@ namespace Freefall.Assets
         public int EntityCount { get; set; }
 
         private static readonly ProfilerMarker _instantiateMarker = ProfilerMarker.Get("Prefab.Instantiate");
+
+        // The entity names this prefab's copies share (Instantiate): one string per name, kept with the asset
+        private readonly Dictionary<string, string> _names = new();
         private static readonly ProfilerMarker _applyMarker = ProfilerMarker.Get("Prefab.ApplyTo");
 
         // The prefabs ApplyTo is inside of, outermost first: a prefab that holds itself, at any depth, stops there
@@ -99,6 +102,18 @@ namespace Freefall.Assets
             {
                 e.Prefab = this;
                 break;
+            }
+
+            // The copies' names as one string per name of this prefab: the YAML made every copy its own (48 B per
+            // entity of a cliff rock's kind, ram.md)
+            lock (_names)
+            {
+                foreach (var e in entities)
+                {
+                    if (e.Name == null) continue;
+                    if (_names.TryGetValue(e.Name, out var shared)) e.Name = shared;
+                    else _names[e.Name] = e.Name;
+                }
             }
 
             Debug.Log($"[Prefab] Instantiated '{Name}': {entities.Count} entities");

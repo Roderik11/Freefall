@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Numerics;
+using System.Threading;
 
 namespace Freefall.Graphics
 {
@@ -33,8 +34,10 @@ namespace Freefall.Graphics
         private int _nextSlot = 0;
         private int _activeSlots = 0;
         
-        // Reverse lookup: slot → Entity (for mouse picking)
-        private readonly ConcurrentDictionary<int, Base.Entity> _slotToEntity = new();
+        // Reverse lookup: slot → Entity (for mouse picking). An array by slot, written under _slotLock and read without
+        // it (a reader takes the array it finds; an entry is a reference): a ConcurrentDictionary node was ~56 B per
+        // entity (ram.md)
+        private Base.Entity?[] _slotToEntity = new Base.Entity?[InitialCapacity];
 
         // Singleton instance
         public static TransformBuffer Instance { get; private set; } = null!;
@@ -115,7 +118,7 @@ namespace Freefall.Graphics
                 _freeSlots.Push(slot);
                 _activeSlots--;
                 _transforms.Set(slot, Matrix4x4.Identity);
-                _slotToEntity.TryRemove(slot, out _);
+                if (slot < _slotToEntity.Length) _slotToEntity[slot] = null;
             }
         }
 
@@ -142,7 +145,17 @@ namespace Freefall.Graphics
         /// </summary>
         public void RegisterEntity(int slot, Base.Entity entity)
         {
-            if (slot >= 0) _slotToEntity[slot] = entity;
+            if (slot < 0) return;
+            lock (_slotLock)
+            {
+                if (slot >= _slotToEntity.Length)
+                {
+                    var grown = new Base.Entity?[Math.Max(slot + 1, _slotToEntity.Length * 2)];
+                    Array.Copy(_slotToEntity, grown, _slotToEntity.Length);
+                    Volatile.Write(ref _slotToEntity, grown);
+                }
+                _slotToEntity[slot] = entity;
+            }
         }
 
         /// <summary>
@@ -150,7 +163,8 @@ namespace Freefall.Graphics
         /// </summary>
         public Base.Entity? GetEntityBySlot(int slot)
         {
-            return _slotToEntity.GetValueOrDefault(slot);
+            var map = Volatile.Read(ref _slotToEntity);
+            return slot >= 0 && slot < map.Length ? map[slot] : null;
         }
 
         /// <summary>

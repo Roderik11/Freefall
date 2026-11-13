@@ -65,11 +65,21 @@ namespace Freefall.Graphics
     public sealed class DrawGroup
     {
         // One handle per (draw, render pass). Touched only on the main thread (CommandBuffer.FlushPersistent).
-        internal readonly List<InstanceBatch.InstanceHandle> Handles = new();
+        internal readonly List<InstanceBatch.InstanceHandle> Handles;
 
         // The material of every draw added, held (Material.Acquire) from AddPersistent to RemovePersistent: a material's
         // on-demand textures are on the GPU while a persistent draw uses it. Locked on itself (adds come from parallel draws).
-        internal readonly List<Material> Held = new();
+        internal readonly List<Material> Held;
+
+        public DrawGroup() : this(0) { }
+
+        /// <param name="draws">How many draws it will likely get (a mesh's parts): the lists start at that size instead
+        /// of four, 48 B less for a one-part mesh (ram.md)</param>
+        public DrawGroup(int draws)
+        {
+            Handles = new List<InstanceBatch.InstanceHandle>(draws);
+            Held = new List<Material>(draws);
+        }
     }
 
     /// <summary>

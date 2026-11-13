@@ -93,19 +93,29 @@ namespace Freefall.Components
 
         /// <summary>
         /// Per-instance shader parameters. Their values are copied when the draws are registered;
-        /// the Set* methods re-register, mutating a value in place does not.
+        /// the Set* methods re-register, mutating a value in place does not. Made on first access: almost no renderer
+        /// has any, and the block with its dictionary and change subscription was 176 B of every static mesh entity
+        /// (ram.md). Until then the draws take a shared empty block. Never saved (no scene or prefab held one), so a
+        /// save does not make one for every renderer.
         /// </summary>
+        [Freefall.Reflection.DontSerialize]
+        [System.ComponentModel.Browsable(false)]
         public MaterialBlock Params
         {
-            get => _params!;
+            get
+            {
+                if (_params == null)
+                {
+                    // Empty: nothing for the draws to take again, so no Invalidate
+                    _params = new MaterialBlock();
+                    _params.Changed += Invalidate;
+                }
+                return _params;
+            }
             set => SetParams(ref _params, value);
         }
         private MaterialBlock? _params;
-
-        public MeshRenderer()
-        {
-            Params = new MaterialBlock();
-        }
+        private static readonly MaterialBlock NoParams = new();   // never changed
 
         protected override Mesh? RenderMesh => _mesh;
 
@@ -146,7 +156,7 @@ namespace Freefall.Components
                 if (partIdx >= meshParts.Count) continue;
                 var mat = GetMaterial(meshParts[partIdx].MaterialSlot);
                 if (mat != null)
-                    CommandBuffer.AddPersistent(group, mesh, partIdx, mat, Params, transformSlot, lodManaged: true, instanceSlot: InstanceSlotFor(mat));
+                    CommandBuffer.AddPersistent(group, mesh, partIdx, mat, _params ?? NoParams, transformSlot, lodManaged: true, instanceSlot: InstanceSlotFor(mat));
             }
         }
     }
