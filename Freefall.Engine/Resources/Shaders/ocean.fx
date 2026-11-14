@@ -1,6 +1,9 @@
 #include "ocean_patch.hlsli"
 #include "ocean_shade.hlsli"
-// @RenderState(RenderTargets=1)
+#include "underwater.hlsli"
+// Both faces: from under the sea its surface is seen from below (PS, Snell's window). A back face seen from above is a
+// crest folded over itself and is dropped, as the culling did before
+// @RenderState(RenderTargets=1, CullMode=None)
 
 
 // SampleNormal + SampleFoam merged into PS loop below
@@ -130,7 +133,7 @@ bool OutsideSea(OceanData ocean, float2 xz)
 // How far the surf's water must at least face the eye (the cosine of its normal's angle to the view): PS below
 static const float SURF_FACING = 0.15;
 
-PSOutput PS(DSOutput input)
+PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
 {
     PSOutput output;
 
@@ -140,6 +143,10 @@ PSOutput PS(DSOutput input)
     OceanData ocean = oceanData[input.InstanceIdx];
 
     if (OutsideSea(ocean, input.UndisplacedXZ.xy))
+        discard;
+    // A back face over the eye is the sea seen from under it; one under the eye is a fold of a choppy crest
+    bool fromBelow = !front;
+    if (fromBelow && camPos.y > input.WorldPos.y)
         discard;
 
     // Where a breaking lip stands, the lip pass (ocean_lip.fx) draws the strip ahead of the crest, the curl and a steep
@@ -190,7 +197,7 @@ PSOutput PS(DSOutput input)
     // the open sea the backs of waves facing away keep their dark mirror
     float facing = SURF_FACING * (1.0 - smoothstep(1.5, 4.0, shoreDepth));
     float rawNdotV = dot(N, V);
-    if (facing > 0.0 && rawNdotV < facing)
+    if (!fromBelow && facing > 0.0 && rawNdotV < facing)
         N = normalize(N + (facing - rawNdotV) * V);
     float alpha = WaterAlpha(slopes, WaterUnresolvedVariance(bands.resolvedTotal));
 
@@ -208,6 +215,23 @@ PSOutput PS(DSOutput input)
     // The cascades, and the terrain's shadow past them (a headland the sun stands behind), as the deferred light has them
     sunRadiance *= min(WaterSunShadow(ShadowMapIdx, worldPos - camPos, input.Position.xy), TerrainLightShadow(worldPos, L));
     sunRadiance *= TerrainOpen(worldPos, float3(0, 1, 0));   // a sea cave under a hill: no sun, whatever the shadow map holds
+
+    // ── Seen from under the surface (the eye in the sea): Snell's window onto the air above, bent by the waves, and past it
+    // the sea below mirrored (underwater.hlsli). The underwater pass fades it over the way through the water to it ──
+    if (fromBelow)
+    {
+        float3 above = 0;
+        if (ocean.CompositeSRV != 0)
+        {
+            Texture2D<float4> snapshot = ResourceDescriptorHeap[ocean.CompositeSRV];
+            float2 bent = saturate(input.Position.xy * ocean.InvViewportSize - N.xz * 0.06);
+            above = snapshot.SampleLevel(AtmosphereLinearClamp, bent, 0).rgb;
+        }
+        float3 seaLight = WaterInscatter(ocean.OceanColor, sunRadiance, saturate(L.y), input.SkyAmbient.rgb * skyVisible,
+                                         0.0, -V, ocean.ShallowColor, ocean.ShoreFadeDepth);
+        output.Color = float4(max(WaterUnderside(N, V, above, seaLight), 0.0), 1.0);
+        return output;
+    }
 
     float H = max(0.0, waveHeight);
 

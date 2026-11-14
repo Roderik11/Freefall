@@ -260,6 +260,56 @@ namespace Freefall.Components
             _drawn != null && _drawn._drawnTick >= Engine.TickCount - 1 ? _drawn.Transform.WorldPosition.Y : null;
 
         internal float PlaneY => Transform.WorldPosition.Y;
+
+        /// <summary>
+        /// The sea mask as uploaded last, on the CPU, with where it lies over the terrain then: what Water.SurfaceAt asks.
+        /// Replaced whole with each new mask, never written; null until the first.
+        /// </summary>
+        private SeaPlaces? SeaCells
+        {
+            get => Volatile.Read(ref _seaPlaces);
+            set => Volatile.Write(ref _seaPlaces, value);
+        }
+        private SeaPlaces? _seaPlaces;
+
+        private sealed class SeaPlaces
+        {
+            private readonly byte[] _cells;
+            private readonly int _size;
+            private readonly float _originX, _originZ, _sizeX, _sizeZ;
+            private readonly bool _onTerrain;
+
+            public SeaPlaces(SeaMask.Result mask, TerrainRenderer? terrain)
+            {
+                _cells = mask.Cells;
+                _size = mask.Size;
+                _onTerrain = terrain?.Terrain != null && _size > 1 && _cells.Length >= _size * _size;
+                if (!_onTerrain) return;
+                var origin = terrain!.Transform.WorldPosition;
+                _originX = origin.X;
+                _originZ = origin.Z;
+                _sizeX = terrain.Terrain!.TerrainSize.X;
+                _sizeZ = terrain.Terrain.TerrainSize.Y;
+            }
+
+            // Laid out as the heights are, its first and last cells on the terrain's edges (as ocean.fx OutsideSea reads it);
+            // past the terrain it is all sea
+            public bool IsSea(float x, float z)
+            {
+                if (!_onTerrain) return true;
+                float u = (x - _originX) / _sizeX, v = (z - _originZ) / _sizeZ;
+                if (u < 0f || u > 1f || v < 0f || v > 1f) return true;
+                int i = (int)MathF.Round(u * (_size - 1)), j = (int)MathF.Round(v * (_size - 1));
+                return _cells[j * _size + i] >= 128;
+            }
+        }
+
+        /// <summary>
+        /// Whether the open sea reaches a place (its sea mask, as the ocean draws it; up a beach the mask reaches past the
+        /// waterline, where the ground stands over the water anyway). Before the first mask: everywhere. Any thread.
+        /// </summary>
+        public bool IsSea(float x, float z)
+            => Engine.Settings.DisableSeaMask || SeaCells is not { } places || places.IsSea(x, z);
         internal uint DisplacementSrv => _oceanFFT?.DisplacementSRV ?? 0;
         internal int BandCount => _oceanFFT?.NumBands ?? 0;
         internal Effect SurfaceEffect => _material.Effect;
@@ -942,7 +992,10 @@ namespace Freefall.Components
             if (_seaMaskRequest == 0)
                 RequestSeaMask();
             if (Interlocked.Exchange(ref _builtSeaMask, null) is { } seaMask)
+            {
                 _seaMask.Upload(seaMask);
+                SeaCells = new SeaPlaces(seaMask, _terrain);
+            }
             if (Interlocked.Exchange(ref _builtShoreWarp, null) is { } shoreWarp)
                 _shoreWarp.Upload(shoreWarp);
             if (_seaMaskOwed && Volatile.Read(ref _warpRunning) == 0 && !SceneManager.IsLoading)

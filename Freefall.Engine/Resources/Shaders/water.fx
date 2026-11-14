@@ -37,6 +37,7 @@ cbuffer PushConstants : register(b3)
 #include "common.fx"
 #include "sky_common.fx"
 #include "water_common.fx"
+#include "underwater.hlsli"
 // @RenderState(RenderTargets=1, CullMode=None)
 
 // Must match WaterBody.WaterData (C#)
@@ -518,7 +519,7 @@ struct PSOutput
     float4 Color : SV_Target0;
 };
 
-PSOutput PS(VSOutput input)
+PSOutput PS(VSOutput input, bool front : SV_IsFrontFace)
 {
     PSOutput output;
 
@@ -601,6 +602,27 @@ PSOutput PS(VSOutput input)
     sunRadiance *= min(WaterSunShadow(ShadowMapIdx, worldPos - camPos, input.Position.xy), TerrainLightShadow(worldPos, L));
     sunRadiance *= TerrainOpen(worldPos, float3(0, 1, 0));   // a sea cave under a hill: no sun, whatever the shadow map holds
     float3 skyAmbient = input.SkyAmbient.rgb * skyVisible;
+
+    // ── Seen from under the surface (the eye in the water; the mesh faces up): Snell's window onto the air above, bent by
+    // the ripples, and past it the water below mirrored (underwater.hlsli). The underwater pass fades it over the way
+    // through the water to it, as everything else down there. Under ice, a dim milky ceiling where it holds ──
+    if (!front)
+    {
+        float3 above = 0;
+        if (water.CompositeSRV != 0)
+        {
+            Texture2D<float4> snapshot = ResourceDescriptorHeap[water.CompositeSRV];
+            float2 bent = saturate(input.Position.xy * water.InvViewportSize - N.xz * 0.06);
+            above = snapshot.SampleLevel(AtmosphereLinearClamp, bent, 0).rgb;
+        }
+        float3 waterLight = WaterInscatter(water.WaterColor, sunRadiance, saturate(L.y), skyAmbient, 0.0, -V,
+                                           water.ShallowColor, water.Visibility);
+        float3 underside = WaterUnderside(N, V, above, waterLight);
+        float3 iceCeiling = ICE_ALBEDO * (sunRadiance * saturate(L.y) * 0.25 + skyAmbient * 0.5) * 0.4;
+        underside = lerp(underside, iceCeiling, smoothstep(0.0, 0.3, ice));
+        output.Color = float4(max(underside, 0.0), 1.0);
+        return output;
+    }
 
     // ── Deep water color (same model as the ocean, without the wave-height term) ──
     float3 scatter = (0.1 * NdotV * NdotV + 0.08 * NdotL) * water.WaterColor * sunRadiance

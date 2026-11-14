@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Description = System.ComponentModel.DescriptionAttribute;
 using Category = System.ComponentModel.CategoryAttribute;
 using Freefall.Base;
@@ -126,7 +127,16 @@ namespace Freefall.Components
         // triangles (a lake's are the outline's: a few big ones)
         private Vector3[] _surfacePoints = Array.Empty<Vector3>();
         private float[] _surfaceSteep = Array.Empty<float>();
+        private Vector2[] _surfaceFlow = Array.Empty<Vector2>();   // a river's: the way its current runs at each point (mesh-local xz, unit)
         private int[] _surfaceTriangles = Array.Empty<int>();
+
+        // The surface as built, in the world, for Water.SurfaceAt (a swimmer, the camera under water): made on a worker with
+        // each new surface and replaced whole, never written, so any thread may read it. Null until the first is made
+        private SurfaceLookup? _lookup;
+        private int _lookupVersion;
+
+        /// <summary>The surface as a lookup by place (Water.SurfaceAt); null until it is built.</summary>
+        internal SurfaceLookup? Lookup => Volatile.Read(ref _lookup);
 
         // The ice collider's grid: cells of IceCell metres, a narrow river's as wide as its strip's columns, and no more
         // than IceCellsMax a side
@@ -654,15 +664,180 @@ namespace Freefall.Components
             _mesh = null;
             _surfacePoints = Array.Empty<Vector3>();
             _surfaceSteep = Array.Empty<float>();
+            _surfaceFlow = Array.Empty<Vector2>();
             _surfaceTriangles = Array.Empty<int>();
 
-            if (_spline == null || _spline.Points.Count < 2) return;
+            if (_spline == null || _spline.Points.Count < 2)
+            {
+                Interlocked.Increment(ref _lookupVersion);
+                Volatile.Write(ref _lookup, null);
+                return;
+            }
             _mesh = _spline.Closed ? BuildLake(_spline) : BuildRiver(_spline);
             var world = Transform.WorldMatrix;
             float heights = 0f;
             foreach (var p in _surfacePoints) heights += Vector3.Transform(p, world).Y;
             _iceHeight = _surfacePoints.Length > 0 ? heights / _surfacePoints.Length : Transform.WorldPosition.Y;
             StartShoreField();
+            StartLookup(world);
+        }
+
+        // The lookup of the surface just built, on a worker (the arrays are replaced with each surface, never written). A
+        // lookup of an older surface that finishes later is dropped
+        private void StartLookup(Matrix4x4 world)
+        {
+            int version = Interlocked.Increment(ref _lookupVersion);
+            var (points, triangles, steep, flow) = (_surfacePoints, _surfaceTriangles, _surfaceSteep, _surfaceFlow);
+            bool flowing = _spline != null && !_spline.Closed;
+            if (triangles.Length < 3)
+            {
+                Volatile.Write(ref _lookup, null);
+                return;
+            }
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                var built = SurfaceLookup.Build(points, triangles, steep, flow, world, flowing);
+                if (Volatile.Read(ref _lookupVersion) == version) Volatile.Write(ref _lookup, built);
+            });
+        }
+
+        /// <summary>
+        /// A water body's surface in the world, found by place: its triangles in a grid of cells over its bounds, each cell
+        /// listing the triangles that reach into it (a lake's few big ones in many cells, a river's small ones in one or
+        /// two). Built once per surface on a worker; read from any thread.
+        /// </summary>
+        internal sealed class SurfaceLookup
+        {
+            public bool Flowing;
+            private float _minX, _minZ, _maxX, _maxZ, _cell;
+            private int _w, _h;
+            private int[] _cellStart = Array.Empty<int>();   // _w × _h + 1: where each cell's triangles start in _cellTris
+            private int[] _cellTris = Array.Empty<int>();
+            private Vector3[] _points = Array.Empty<Vector3>();   // world
+            private Vector2[] _flow = Array.Empty<Vector2>();     // per point: the current's way × (1 + 4 × steepness), as water.fx runs it
+            private int[] _triangles = Array.Empty<int>();
+
+            // Cells a side at most: a lake's outline triangles are tested against each cell they may reach (2D SAT), so
+            // the count bounds the build's time (~64 triangles × 4096 cells for a big lake)
+            private const int MaxCells = 64;
+            private const float SmallestCell = 2f;
+
+            public static SurfaceLookup Build(Vector3[] local, int[] triangles, float[] steep, Vector2[] flow, Matrix4x4 world, bool flowing)
+            {
+                var l = new SurfaceLookup { Flowing = flowing, _triangles = triangles };
+                var points = new Vector3[local.Length];
+                float minX = float.MaxValue, minZ = float.MaxValue, maxX = float.MinValue, maxZ = float.MinValue;
+                for (int i = 0; i < local.Length; i++)
+                {
+                    var p = Vector3.Transform(local[i], world);
+                    points[i] = p;
+                    minX = MathF.Min(minX, p.X); maxX = MathF.Max(maxX, p.X);
+                    minZ = MathF.Min(minZ, p.Z); maxZ = MathF.Max(maxZ, p.Z);
+                }
+                l._points = points;
+                if (flowing && flow.Length == local.Length)
+                {
+                    l._flow = new Vector2[flow.Length];
+                    for (int i = 0; i < flow.Length; i++)
+                    {
+                        var d = Vector3.TransformNormal(new Vector3(flow[i].X, 0f, flow[i].Y), world);
+                        var dir = new Vector2(d.X, d.Z);
+                        if (dir.LengthSquared() > 1e-12f) dir = Vector2.Normalize(dir);
+                        l._flow[i] = dir * (1f + 4f * (i < steep.Length ? Math.Clamp(steep[i], 0f, 1f) : 0f));
+                    }
+                }
+
+                float extent = MathF.Max(maxX - minX, maxZ - minZ);
+                float cell = MathF.Max(SmallestCell, extent / MaxCells);
+                int w = Math.Max(1, (int)MathF.Ceiling((maxX - minX) / cell));
+                int h = Math.Max(1, (int)MathF.Ceiling((maxZ - minZ) / cell));
+                (l._minX, l._minZ, l._maxX, l._maxZ, l._cell, l._w, l._h) = (minX, minZ, maxX, maxZ, cell, w, h);
+
+                // Two passes over the triangles: count per cell, then fill
+                var counts = new int[w * h + 1];
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    int[] cursor = pass == 1 ? (int[])counts.Clone() : counts;
+                    int[] fill = pass == 1 ? new int[counts[w * h]] : Array.Empty<int>();
+                    for (int t = 0; t + 2 < triangles.Length; t += 3)
+                    {
+                        var a = points[triangles[t]]; var b = points[triangles[t + 1]]; var c = points[triangles[t + 2]];
+                        int x0 = Math.Clamp((int)((MathF.Min(a.X, MathF.Min(b.X, c.X)) - minX) / cell), 0, w - 1);
+                        int x1 = Math.Clamp((int)((MathF.Max(a.X, MathF.Max(b.X, c.X)) - minX) / cell), 0, w - 1);
+                        int z0 = Math.Clamp((int)((MathF.Min(a.Z, MathF.Min(b.Z, c.Z)) - minZ) / cell), 0, h - 1);
+                        int z1 = Math.Clamp((int)((MathF.Max(a.Z, MathF.Max(b.Z, c.Z)) - minZ) / cell), 0, h - 1);
+                        bool small = x1 - x0 <= 1 && z1 - z0 <= 1;
+                        for (int z = z0; z <= z1; z++)
+                        for (int x = x0; x <= x1; x++)
+                        {
+                            if (!small && !Overlaps(a, b, c, minX + x * cell, minZ + z * cell, cell)) continue;
+                            int k = z * w + x;
+                            if (pass == 0) counts[k + 1]++;
+                            else fill[cursor[k]++] = t;
+                        }
+                    }
+                    if (pass == 0)
+                        for (int k = 0; k < w * h; k++) counts[k + 1] += counts[k];
+                    else
+                        l._cellTris = fill;
+                }
+                l._cellStart = counts;
+                return l;
+            }
+
+            // A triangle (xz) and a square cell overlap: no axis of the cell's or the triangle's edges separates them
+            private static bool Overlaps(Vector3 a, Vector3 b, Vector3 c, float x, float z, float size)
+            {
+                var p0 = new Vector2(a.X, a.Z); var p1 = new Vector2(b.X, b.Z); var p2 = new Vector2(c.X, c.Z);
+                var lo = new Vector2(x, z); var hi = lo + new Vector2(size, size);
+                if (MathF.Max(p0.X, MathF.Max(p1.X, p2.X)) < lo.X || MathF.Min(p0.X, MathF.Min(p1.X, p2.X)) > hi.X) return false;
+                if (MathF.Max(p0.Y, MathF.Max(p1.Y, p2.Y)) < lo.Y || MathF.Min(p0.Y, MathF.Min(p1.Y, p2.Y)) > hi.Y) return false;
+                return !Separates(p0, p1, p2, lo, hi) && !Separates(p1, p2, p0, lo, hi) && !Separates(p2, p0, p1, lo, hi);
+            }
+
+            // The edge p→q's normal separates the cell from the triangle (whose third corner is r)
+            private static bool Separates(Vector2 p, Vector2 q, Vector2 r, Vector2 lo, Vector2 hi)
+            {
+                var n = new Vector2(q.Y - p.Y, p.X - q.X);
+                float side = Vector2.Dot(n, r - p);
+                float d0 = Vector2.Dot(n, lo - p), d1 = Vector2.Dot(n, new Vector2(hi.X, lo.Y) - p);
+                float d2 = Vector2.Dot(n, hi - p), d3 = Vector2.Dot(n, new Vector2(lo.X, hi.Y) - p);
+                return side >= 0f
+                    ? MathF.Max(MathF.Max(d0, d1), MathF.Max(d2, d3)) < 0f
+                    : MathF.Min(MathF.Min(d0, d1), MathF.Min(d2, d3)) > 0f;
+            }
+
+            /// <summary>The surface's height over a place, how it rises per metre of x and z there, and its current (per metre a second of FlowSpeed).</summary>
+            public bool HeightAt(float x, float z, out float y, out Vector2 slope, out Vector2 flow)
+            {
+                y = 0f;
+                slope = Vector2.Zero;
+                flow = Vector2.Zero;
+                if (x < _minX || x > _maxX || z < _minZ || z > _maxZ) return false;
+                int cx = Math.Min((int)((x - _minX) / _cell), _w - 1), cz = Math.Min((int)((z - _minZ) / _cell), _h - 1);
+                int k = cz * _w + cx;
+                for (int i = _cellStart[k]; i < _cellStart[k + 1]; i++)
+                {
+                    int t = _cellTris[i];
+                    int ia = _triangles[t], ib = _triangles[t + 1], ic = _triangles[t + 2];
+                    var a = _points[ia]; var b = _points[ib]; var c = _points[ic];
+                    // Barycentric weights of (x, z) in the triangle's xz
+                    float d = (b.Z - c.Z) * (a.X - c.X) + (c.X - b.X) * (a.Z - c.Z);
+                    if (MathF.Abs(d) < 1e-9f) continue;
+                    float wa = ((b.Z - c.Z) * (x - c.X) + (c.X - b.X) * (z - c.Z)) / d;
+                    float wb = ((c.Z - a.Z) * (x - c.X) + (a.X - c.X) * (z - c.Z)) / d;
+                    float wc = 1f - wa - wb;
+                    const float Edge = -1e-4f;
+                    if (wa < Edge || wb < Edge || wc < Edge) continue;
+                    y = wa * a.Y + wb * b.Y + wc * c.Y;
+                    // The plane's rise per metre of x and z: from its normal
+                    var n = Vector3.Cross(b - a, c - a);
+                    if (MathF.Abs(n.Y) > 1e-9f) slope = new Vector2(-n.X / n.Y, -n.Z / n.Y);
+                    if (_flow.Length > 0) flow = wa * _flow[ia] + wb * _flow[ib] + wc * _flow[ic];
+                    return true;
+                }
+                return false;
+            }
         }
 
         /// <summary>
@@ -744,7 +919,12 @@ namespace Freefall.Components
 
             _surfacePoints = verts.ToArray();
             _surfaceSteep = new float[flow.Count];
-            for (int i = 0; i < flow.Count; i++) _surfaceSteep[i] = flow[i].Y;
+            _surfaceFlow = new Vector2[flow.Count];
+            for (int i = 0; i < flow.Count; i++)
+            {
+                _surfaceSteep[i] = flow[i].Y;
+                _surfaceFlow[i] = new Vector2(flow[i].X, flow[i].Z);
+            }
             _surfaceTriangles = ToInts(indices);
             return BuildSurface(verts, flow, uvs, indices, parts);
         }

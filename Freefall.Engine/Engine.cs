@@ -899,6 +899,19 @@ namespace Freefall
          /// </summary>
          public bool PrecipitationLayers { get; set; } = true;
 
+         /// <summary>
+         /// The camera in the water (Graphics.Underwater, underwater_cs.hlsl): what it sees fades into the water's own
+         /// light with the distance, things down there take less light the deeper they lie, and a waterline runs across the
+         /// picture where the eye is half in. Off, the water is only seen from above.
+         /// </summary>
+         [System.ComponentModel.Description("The camera under water: the view fades into the water's colour with distance, light dims with depth and a waterline shows when the eye is half in")]
+         public bool Underwater { get; set; } = true;
+
+         /// <summary>The sunlight's play on what lies under the water, seen from in it: 0 = none, 1 = as bright as the sun's share there.</summary>
+         [ValueRange(0f, 2f)]
+         [System.ComponentModel.Description("Caustics under water: how strongly the sunlight focused by the waves plays over things below the surface (0 = none)")]
+         public float UnderwaterCaustics { get; set; } = 0.8f;
+
          [ValueRange(0.5f, 4f)]
          public float GTAOPower{ get; set; } = 1.5f;                       // Visibility exponent (higher = darker)
 

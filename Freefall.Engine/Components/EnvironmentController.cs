@@ -256,9 +256,11 @@ namespace Freefall.Components
 
             // Rain, snow and hail drift in the wind the far rain and snow lean in (Weather.FallWind: steady, capped by how
             // fast each falls), so the near drops and the far field agree
-            DriveEmitter(ref _lastRain, RainEmitter, Graphics.Weather.Rain, FallWind(RainEmitter), camPos, EmitterHeight);
-            DriveEmitter(ref _lastSnow, SnowEmitter, Graphics.Weather.Snow, FallWind(SnowEmitter), camPos, EmitterHeight);
-            DriveEmitter(ref _lastHail, HailEmitter, Graphics.Weather.Hail, FallWind(HailEmitter), camPos, EmitterHeight);
+            // None round an eye under the water: the drops would fall through it (Graphics.Underwater)
+            float falls = Graphics.Underwater.CameraUnder ? 0f : 1f;
+            DriveEmitter(ref _lastRain, RainEmitter, Graphics.Weather.Rain * falls, FallWind(RainEmitter), camPos, EmitterHeight);
+            DriveEmitter(ref _lastSnow, SnowEmitter, Graphics.Weather.Snow * falls, FallWind(SnowEmitter), camPos, EmitterHeight);
+            DriveEmitter(ref _lastHail, HailEmitter, Graphics.Weather.Hail * falls, FallWind(HailEmitter), camPos, EmitterHeight);
             // ... and the far layers past them hold as many drops, falling as fast (Weather.RainDensity and the rest)
             if (RainEmitter != null)
             {
@@ -270,14 +272,14 @@ namespace Freefall.Components
                 Graphics.Weather.SnowDensity = FallDensity(SnowEmitter);
                 Graphics.Weather.SnowFallSpeed = FallSpeed(SnowEmitter);
             }
-            DriveEmitter(ref _lastSplash, SplashEmitter, Graphics.Weather.Rain, wind, camPos, 0f);
+            DriveEmitter(ref _lastSplash, SplashEmitter, Graphics.Weather.Rain * falls, wind, camPos, 0f);
             // The splashes as many as the drops striking their square make (the rain emitter's flux, density × fall speed,
             // × the square's area × SplashShare); at most the splash emitter's EmitRate, which sizes its particle slots
             if (SplashEmitter != null && RainEmitter != null)
             {
                 float flux = Graphics.Weather.RainDensity * Graphics.Weather.RainFallSpeed;
                 float area = 4f * SplashEmitter.ShapeExtents.X * SplashEmitter.ShapeExtents.Z;
-                float rate = flux * area * SplashShare * MathF.Max(0f, Graphics.Weather.Rain);
+                float rate = flux * area * SplashShare * MathF.Max(0f, Graphics.Weather.Rain) * falls;
                 SplashEmitter.EmitRateScale = Math.Clamp(rate / MathF.Max(SplashEmitter.EmitRate, 1e-3f), 0f, 1f);
             }
             // Dust: park it on the terrain under the camera (or a body height below the camera when

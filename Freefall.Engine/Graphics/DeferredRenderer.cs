@@ -79,6 +79,9 @@ namespace Freefall.Graphics
         private PrecipitationLayers? _precipitation;
         // Glass, particles, trails and vfx without order, after the Forward pass's water (EngineSettings.Transparency)
         private readonly OrderIndependentTransparency _oit = new();
+
+        // The camera in the water (Underwater.cs): made with the first frame that draws
+        private Underwater? _underwater;
         private uint _ssrSrv;
         // This view's aerial perspective volume (the far haze), sized to its target: SceneConstants.AerialPerspectiveIdx
         private readonly AerialPerspectiveVolume _aerialPerspective = new();
@@ -1443,6 +1446,12 @@ namespace Freefall.Graphics
              CommandBuffer.Execute(RenderPass.Forward, list, Engine.Device);
              PixMarker.End(list); // Forward Draws
 
+             // The camera in the water: over the scene and the water just drawn (from below too), before the glass and
+             // particles. Back to the forward targets after it (the pass binds compute state only)
+             _underwater ??= new Underwater();
+             if (_underwater.Execute(list, camera, Composite, Depth, DepthGBuffer, Normals, BindSceneConstantsForCompute, ShaderRead))
+                 list.OMSetRenderTargets(new[] { Composite.RtvHandle, EntityIdBuffer.RtvHandle }, Depth.DsvHandle);
+
              // Glass, particles, trails and vfx without order, over the water just drawn (EngineSettings.Transparency).
              // The glass refracts a snapshot taken after the water, so a window shows the sea behind it
              if (OrderIndependentTransparency.Active)
@@ -1508,7 +1517,7 @@ namespace Freefall.Graphics
 
              // 4b. The rain and snow past the near particles, over the finished forward image (before the exposure is
              //     measured and the bloom): layers in depth, cut by the linear depth, lit as the fog volume's air there
-             if (PrecipitationLayers.Due)
+             if (PrecipitationLayers.Due && !Underwater.CameraUnder)
              {
                  _precipitation ??= new PrecipitationLayers();
                  bool fog = _fogVolumeIdx != 0;
@@ -1686,6 +1695,7 @@ namespace Freefall.Graphics
             _ssr?.Dispose();
             WaterReflections?.Dispose();
             _precipitation?.Dispose();
+            _underwater?.Dispose();
             _oit.Dispose();
             _aerialPerspective.Dispose();
             _cloudView.Dispose();
