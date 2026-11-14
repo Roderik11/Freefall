@@ -104,15 +104,23 @@ namespace Freefall.Components
             OutputEntity.AddComponent<RigidBody>();
 
             // 3. Inject context into nodes that need it
-            InjectContext();
+            var sink = PlacementSink();
+            InjectContext(sink);
 
-            // 4. Execute graph
+            // 4. Execute graph (a placement sink takes the prefabs it places instead of instances)
+            sink?.PlacementsBegin(OutputEntity);
             using (_graphMarker.Auto())
                 Graph.Execute(Seed);
+            sink?.PlacementsEnd();
 
             int childCount = OutputEntity.Transform.GetChildCount();
             Debug.Log($"[PCG] '{Entity?.Name}' ran '{Graph.Name}' (tick {Engine.TickCount}): {Graph.Nodes.Count} nodes, {childCount} children spawned." +
                       (TraceNodes ? " Points per node: " + DescribeNodeOutputs() : ""));
+
+            // What the nodes put out was taken during the run: the graph (an asset all its users share) holds none of it
+            // until the next one. Kept, the forest outline of 1 M sampled points was ~250 MiB of heap (vram.md).
+            foreach (var node in Graph.Nodes)
+                node.ReleaseOutputs();
 
             // 5. Whoever takes this output into account is out of date now
             PCGScheduler.OutputChanged(this);
@@ -343,10 +351,19 @@ namespace Freefall.Components
             Invalidate();
         }
 
+        /// <summary>The enabled component on this entity that takes the placed prefabs instead of instances, or null.</summary>
+        private IPlacementSink? PlacementSink()
+        {
+            foreach (var component in Entity.Components)
+                if (component is IPlacementSink sink && component.Enabled)
+                    return sink;
+            return null;
+        }
+
         /// <summary>
         /// Inject this entity's components as context for graph nodes.
         /// </summary>
-        private void InjectContext()
+        private void InjectContext(IPlacementSink? sink)
         {
             Spline spline = Entity.GetComponentInChildren<Spline>();
 
@@ -356,7 +373,10 @@ namespace Freefall.Components
                     sampler.Spline = spline;
 
                 if (node is SpawnPrefab spawner)
+                {
                     spawner.SpawnParent = OutputEntity;
+                    spawner.Sink = sink;
+                }
 
                 if (node is ExcludeObstacles exclude)
                 {

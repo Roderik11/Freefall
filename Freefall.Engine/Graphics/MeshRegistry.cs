@@ -42,7 +42,19 @@ namespace Freefall.Graphics
             // A skinned part's bone that carries most of its vertices, + 1 (0: none): the culler moves the part's sphere
             // with it, so that a pose far from the bind pose (a body lying where it fell) is culled where it is drawn
             public uint CullBone;
-            public uint Reserved9;
+            // MeshFlags: how the part's streams are to be read (common.fx MESH_CARD_ORIGINS)
+            public uint Flags;
+        }
+
+        /// <summary>Bits of <see cref="MeshPartEntry.Flags"/>; common.fx has the same.</summary>
+        [Flags]
+        public enum MeshFlags : uint
+        {
+            None = 0,
+            /// <summary>Merged far cards (<see cref="Mesh.CardOrigins"/>): the normal stream holds each card's tree origin, the tangent stream its centre.</summary>
+            CardOrigins = 1,
+            /// <summary>A merged far mesh of the far tier (<see cref="Mesh.CellFade"/>): each vertex fades with its cell past <see cref="FarTier.From"/>.</summary>
+            CellFade = 2,
         }
 
         /// <summary>
@@ -184,6 +196,7 @@ namespace Freefall.Graphics
                     IndexBufferAddressHi = (uint)(mesh.IndexBufferView.BufferLocation >> 32),
                     IndexBufferBytes = mesh.IndexBufferView.SizeInBytes,
                     CullBone = mesh.CullBoneOf(partIndex),
+                    Flags = (uint)((mesh.CardOrigins ? MeshFlags.CardOrigins : MeshFlags.None) | (mesh.CellFade ? MeshFlags.CellFade : MeshFlags.None)),
                 };
                 var lodEntry = BuildLodEntry(mesh, partIndex);
 

@@ -69,6 +69,11 @@ cbuffer SceneConstants : register(b0)
 
     // ── The scene's terrain (Graphics.Atmosphere.TerrainIdx) — terrain_pages.hlsli LoadTerrain ──
     uint TerrainIdx;                   // StructuredBuffer<TerrainPagesParams> of this frame; 0 = no terrain
+
+    // ── The far tier (Graphics.FarTier) — FarTierShows / FarTierCasts ──
+    float FarTierFrom;                 // metres from the camera where merged far meshes start to take over from instances
+    float FarTierBand;                 // over how many metres they dither into each other; 0 = no far tier
+    float FarTierCell;                 // metres a side of a cell: the unit a far mesh's vertices and the instances fade by
 }
 
 // ── Large-scale variation of the ground and what grows on it (gputerrain.fx, grass cards, blades, flowers) ──
@@ -335,8 +340,62 @@ struct MeshPartEntry
     uint IndexBufferAddressHi;
     uint IndexBufferBytes;
     uint CullBone;              // a skinned part's bone with most of its vertices + 1, 0 = none (cull_instances.hlsl)
-    uint Reserved9;
+    uint Flags;                 // MESH_* bits (MeshRegistry.MeshFlags)
 };
+
+// Merged far cards (Mesh.CardOrigins): each vertex's normal holds its tree's origin and its tangent the card's centre,
+// both mesh-local, where a tree's own cards take them from its world matrix and its part's bounds (gbuffer_crossmesh.fx)
+#define MESH_CARD_ORIGINS 1u
+
+// A merged far mesh of the far tier (Mesh.CellFade): drawn past FarTierFrom, each vertex fading with its cell. Its cell
+// is the one its object stands in: a card's from its tree's origin (MESH_CARD_ORIGINS), any other vertex's UV holds the
+// world XZ of its cell's centre. Every triangle lies in one cell.
+#define MESH_CELL_FADE 2u
+
+// InstanceDescriptor.MeshPartIdx: the part's index in its mesh is the low bits (only the low 8 are read, for picking);
+// this bit marks an instance of the far tier's near side (CommandBuffer.AddPersistent farTier), which gives way to the
+// merged far meshes past FarTierFrom
+#define DRAW_FAR_TIER (1u << 31)
+
+// ── The far tier: instances near, merged far meshes past FarTierFrom, dithered into each other over FarTierBand ──
+
+// The centre of the cell a world point stands in
+float2 FarTierCellOf(float3 p)
+{
+    return (floor(p.xz / FarTierCell) + 0.5) * FarTierCell;
+}
+
+// The far side's share of a cell, 0 (instances only) to 1 (the far mesh only), by the camera's level distance to it
+float FarTierShare(float2 cellCentre)
+{
+    if (FarTierBand <= 0.0)
+        return 0.0;
+    return saturate((length(cellCentre - CamPos.xz) - FarTierFrom) / FarTierBand);
+}
+
+// Whether a draw of the far tier shows in this cell (false: collapse the vertex), and the LodFadeClip word it draws
+// with: the far side on a share of the pixels, the near side on the rest of the same blue noise, so together they
+// cover each pixel once. 0 = every pixel.
+bool FarTierShows(float2 cellCentre, bool farSide, out uint fade)
+{
+    uint share = (uint)(FarTierShare(cellCentre) * 127.0 + 0.5);
+    fade = 0u;
+    if (farSide)
+    {
+        if (share == 0u) return false;
+        if (share < 127u) fade = share;
+        return true;
+    }
+    if (share >= 127u) return false;
+    if (share > 0u) fade = 128u | share;
+    return true;
+}
+
+// Shadows switch at half way, with no dither (as the LOD crossfade's)
+bool FarTierCasts(float2 cellCentre, bool farSide)
+{
+    return (FarTierShare(cellCentre) >= 0.5) == farSide;
+}
 
 // The mesh vertex a mesh draw's vertex shader invocation shades. An indexed draw (InstanceBatch, the effect's push
 // constant IndexedDraw in slot 17 = 1) hands it over in SV_VertexID: the input assembler read the part's indices, and a

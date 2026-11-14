@@ -876,6 +876,13 @@ namespace Freefall.PCG
         [Browsable(false)]
         public Entity SpawnParent;
 
+        /// <summary>
+        /// Takes the placements instead of instances when the PCG component's entity has one (a cell spawner). Set by
+        /// PCGComponent before execution.
+        /// </summary>
+        [Browsable(false)]
+        public IPlacementSink? Sink;
+
         public override void Process()
         {
             var points = GetInputValue<SamplePointSet>("Input");
@@ -903,6 +910,12 @@ namespace Freefall.PCG
                     prefab = Entities[chosen].Prefab;
                 if (prefab == null) continue;
 
+                if (Sink != null)
+                {
+                    Sink.Place(prefab, points.position[i], points.rotation[i], points.extents[i]);
+                    continue;
+                }
+
                 var instance = prefab.Instantiate();
                 if (instance == null) continue;
 
@@ -912,7 +925,7 @@ namespace Freefall.PCG
                 instance.Transform.Scale = points.extents[i];
             }
 
-            Debug.Log($"[SpawnPrefab] Spawned {points.Count} instances under '{parent.Name}'");
+            Debug.Log($"[SpawnPrefab] {(Sink != null ? "Placed" : "Spawned")} {points.Count} instances under '{parent.Name}'");
         }
 
         private Prefab PickWeighted(Random rng, float totalWeight)

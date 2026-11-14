@@ -115,6 +115,18 @@ namespace Freefall.Graph
         }
 
         /// <summary>
+        /// Let go of what the last run put out: the cache and the output ports' fields (SetOutput fills both). A PCG
+        /// graph's point sets are 64 B a point per node and nothing reads them after the run (PCGComponent.Execute).
+        /// </summary>
+        public void ReleaseOutputs()
+        {
+            _outputCache.Clear();
+            foreach (var port in Outputs)
+                if (port.Field.CanWrite && !port.Field.Type.IsValueType)
+                    port.Field.SetValue(this, null);
+        }
+
+        /// <summary>
         /// Create a deterministic Random from this node's seed.
         /// </summary>
         protected Random CreateRandom()

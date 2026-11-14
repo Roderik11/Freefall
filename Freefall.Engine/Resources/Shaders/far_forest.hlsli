@@ -1,0 +1,109 @@
+// The far forest (Graphics/FarForest.cs): trees drawn past the far tier's start as the grass is, from a static buffer
+// of 16 bytes a tree, picked each frame on the GPU (far_forest_cull.hlsl) and drawn by gbuffer_crossmesh.fx's FarForest
+// passes. Shared by both.
+
+#ifndef FAR_FOREST_HLSLI
+#define FAR_FOREST_HLSLI
+
+// One tree: its world position, and packed: yaw (12 bits, of a turn), scale across (7 bits) and up (7 bits, in
+// FAR_TREE_SCALE_STEP), its kind (6 bits)
+struct FarTree
+{
+    float3 Position;
+    uint Packed;
+};
+
+// A kind of tree: the part it draws (the coarsest LOD's cards) and its indices (an indexed draw: a card's corners are
+// shaded once), where its lists start in the visible buffer and the shadow buffer, its material, the part's bounding
+// sphere (centre height, radius) and its crown's half width (the part's box across) in the tree's own frame
+struct FarKind
+{
+    uint MeshPartId;
+    uint IndexCount;
+    uint VisibleBase;
+    uint ShadowBase;
+    uint ShadowCapacity;
+    uint MaterialId;
+    float CentreY;
+    float Radius;
+    uint IndexAddressLo;      // the mesh's index buffer (Mesh.IndexBufferView)
+    uint IndexAddressHi;
+    uint IndexBytes;
+    uint BaseIndex;           // the part's first index
+    float HalfWidth;          // what thinning measures on screen
+    uint3 _pad;
+};
+
+// Thinning (as the grass's plants, stochastic simplification): a tree whose crown is narrower on screen than ThinPixels
+// is kept with the share (width / ThinPixels)^2, so the trees per bit of screen stay the same however far, and a kept
+// tree grows by 1 / sqrt(share), up to MaxGrow, so they cover what they covered. Its growth rides in its list entry:
+//   the camera's: tree (24 bits) | growth (8 bits << 24)
+//   the shadows': tree (22 bits) | growth (7 bits << 22) | cascade (3 bits << 29)
+// growth over 1 .. 1 + FAR_GROW_RANGE
+#define FAR_GROW_RANGE 3.0
+
+uint FarGrowBits(float grow, uint levels)
+{
+    return (uint)(saturate((grow - 1.0) / FAR_GROW_RANGE) * (float)levels + 0.5);
+}
+
+float FarGrowOf(uint bits, uint levels)
+{
+    return 1.0 + (float)bits / (float)levels * FAR_GROW_RANGE;
+}
+
+// The tree's world matrix grown about its foot
+row_major float4x4 FarGrow(row_major float4x4 world, float grow)
+{
+    world[0].xyz *= grow;
+    world[1].xyz *= grow;
+    world[2].xyz *= grow;
+    return world;
+}
+
+// A draw command (InstanceBatch's IndexedDrawCommand, 12 uints, GraphicsDevice.IndexedCommandSignature): MeshPartId,
+// InstanceBaseOffset, the index buffer view (address lo, hi, bytes, format), then DrawIndexed (index count, instance
+// count, start index, base vertex, start instance) and a pad
+#define FAR_COMMAND_UINTS 12u
+#define FAR_COMMAND_INSTANCES 28u   // the instance count's byte offset in a command
+
+// A cell of the far tier (Graphics.FarTier.CellSize) and its trees, which the buffer holds together from First on: the
+// box round their bounding spheres, and the cell's centre the far tier fades it by (every tree of it alike)
+struct FarCell
+{
+    float3 Min;
+    uint First;
+    float3 Max;
+    uint Count;
+    float2 Centre;
+    uint2 _pad;
+};
+
+#define FAR_TREE_SCALE_STEP 0.025
+
+uint FarTreeKind(FarTree t)
+{
+    return t.Packed >> 26;
+}
+
+// The tree's world matrix: scale, then a turn about up, then its position (as the placement's)
+row_major float4x4 FarTreeWorld(FarTree t)
+{
+    float yaw = (float)(t.Packed & 0xFFFu) * (6.28318530718 / 4096.0);
+    float across = (float)((t.Packed >> 12) & 0x7Fu) * FAR_TREE_SCALE_STEP;
+    float up = (float)((t.Packed >> 19) & 0x7Fu) * FAR_TREE_SCALE_STEP;
+    float s, c;
+    sincos(yaw, s, c);
+    return float4x4(c * across, 0, -s * across, 0,
+                    0, up, 0, 0,
+                    s * across, 0, c * across, 0,
+                    t.Position.x, t.Position.y, t.Position.z, 1);
+}
+
+// The larger of the two scales: what the bounding sphere grows by
+float FarTreeScale(FarTree t)
+{
+    return max((float)((t.Packed >> 12) & 0x7Fu), (float)((t.Packed >> 19) & 0x7Fu)) * FAR_TREE_SCALE_STEP;
+}
+
+#endif

@@ -55,6 +55,11 @@ namespace Freefall.Graphics
         /// 0 = none of its own: the effect's defaults (Effect.DefaultInstanceSlot).
         /// </summary>
         public int InstanceSlot;
+        /// <summary>
+        /// An instance of the far tier's near side: past <see cref="FarTier.From"/> it gives way to the merged far
+        /// meshes (InstanceDescriptor.DrawFarTier). Only effects that read it fade (gbuffer_crossmesh, CliffRock).
+        /// </summary>
+        public bool FarTier;
     }
 
     /// <summary>
@@ -771,9 +776,9 @@ namespace Freefall.Graphics
         /// Register a draw that stays in its batches until the group is removed: nothing is enqueued
         /// per frame for it. Same parameters as Enqueue. Thread-safe (callable from parallel Draw());
         /// takes effect at the next pass execution. To change a registered draw, remove the group and
-        /// add a new one.
+        /// add a new one. <paramref name="farTier"/>: an instance of the far tier's near side (DrawCall.FarTier).
         /// </summary>
-        public static void AddPersistent(DrawGroup group, Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot, uint boneBufferIdx = 0, bool lodManaged = false, int instanceSlot = 0)
+        public static void AddPersistent(DrawGroup group, Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot, uint boneBufferIdx = 0, bool lodManaged = false, int instanceSlot = 0, bool farTier = false)
         {
             var op = new PersistentOp
             {
@@ -789,7 +794,8 @@ namespace Freefall.Graphics
                     TransformSlot = transformSlot,
                     BoneBufferIdx = boneBufferIdx,
                     LodManaged = lodManaged,
-                    InstanceSlot = instanceSlot
+                    InstanceSlot = instanceSlot,
+                    FarTier = farTier
                 }
             };
 

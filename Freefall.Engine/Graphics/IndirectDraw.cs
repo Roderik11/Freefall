@@ -13,8 +13,14 @@ namespace Freefall.Graphics
         public uint TransformSlot;   // index into GlobalTransformBuffer
         public uint MaterialId;      // index into MaterialsBuffer
         public uint CustomDataIdx;   // the object's slot of the instance data buffer (InstanceData; its effect's defaults slot if it has none)
-        public uint MeshPartIdx;     // meshpart index within the mesh (for GPU picking)
+        public uint MeshPartIdx;     // meshpart index within the mesh (for GPU picking: shaders read its low 8 bits) | DrawFarTier
         public uint BoneBufferIdx;   // per-Animator bone buffer SRV (0 = static mesh)
+
+        /// <summary>
+        /// <see cref="MeshPartIdx"/>'s top bit: an instance of the far tier's near side, which gives way to the merged far
+        /// meshes past <see cref="FarTier.From"/> (common.fx DRAW_FAR_TIER, FarTierShows).
+        /// </summary>
+        public const uint DrawFarTier = 1u << 31;
     }
 
 

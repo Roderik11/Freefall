@@ -359,6 +359,50 @@ namespace Freefall.Graphics
         // CPU-side data retained for physics cooking
         public Vector3[]? Positions { get; private set; }
         public uint[]? CpuIndices { get; private set; }
+
+        /// <summary>
+        /// The UVs of the vertices the coarsest LOD uses, vertex <see cref="CoarseUVBase"/> first, kept on the CPU for
+        /// merging far meshes from it (a forest's far cards); null when the mesh has no LODs or its coarsest LOD is not
+        /// small. A tree's cards are eight vertices.
+        /// </summary>
+        public Vector2[]? CoarseUVs { get; private set; }
+        public int CoarseUVBase { get; private set; }
+
+        /// <summary>
+        /// Merged far cards: the normal stream holds each card's tree origin and the tangent stream (xyz) the card's
+        /// centre, mesh-local, which gbuffer_crossmesh.fx takes from a tree's world matrix and its part's bounds
+        /// otherwise (MeshRegistry.MeshFlags.CardOrigins). Set before the mesh is drawn.
+        /// </summary>
+        public bool CardOrigins { get; set; }
+
+        /// <summary>
+        /// A merged far mesh of the far tier (<see cref="FarTier"/>): drawn past <see cref="FarTier.From"/>, each vertex
+        /// fading with the cell its object stands in, dithered against the instances of the near side. A card's cell is its
+        /// tree's (<see cref="CardOrigins"/>); any other vertex's UV holds the world XZ of its cell's centre. Every triangle
+        /// must lie in one cell. Set before the mesh is drawn (MeshRegistry.MeshFlags.CellFade).
+        /// </summary>
+        public bool CellFade { get; set; }
+
+        private void KeepCoarseUVs(Vector2[]? uvs)
+        {
+            if (uvs == null || LODs.Count < 2 || CpuIndices == null) return;
+            int min = int.MaxValue, max = -1;
+            foreach (int pi in LODs[^1].MeshPartIndices)
+            {
+                if (pi < 0 || pi >= MeshParts.Count) continue;
+                var part = MeshParts[pi];
+                int end = Math.Min(part.BaseIndex + part.NumIndices, CpuIndices.Length);
+                for (int i = part.BaseIndex; i < end; i++)
+                {
+                    int v = (int)CpuIndices[i] + part.BaseVertex;
+                    if (v < min) min = v;
+                    if (v > max) max = v;
+                }
+            }
+            if (max < 0 || max >= uvs.Length || max - min >= 4096) return;
+            CoarseUVBase = min;
+            CoarseUVs = uvs[min..(max + 1)];
+        }
         
         public Vector4 LocalBoundingSphere
         {
@@ -534,6 +578,7 @@ namespace Freefall.Graphics
             if (data.LODs != null && data.LODs.Count > 0)
                 LODs.AddRange(data.LODs);
             ComputeNonLodPartIndices();
+            KeepCoarseUVs(data.UVs);
             
             //if (data.Bones != null)
             //    Bones = data.Bones;
@@ -569,7 +614,8 @@ namespace Freefall.Graphics
             // So we can reuse CreateBuffers but we need to CHANGE it to NOT do the CopyQueueWait.
             
             mesh.CreateBuffersAsync(device, data.Positions, data.Normals, data.Tangents, data.UVs, data.Indices, PushNormalsOf(data));
-            
+            mesh.KeepCoarseUVs(data.UVs);
+
             // Bone weights?
             if (data.BoneWeights != null && data.BoneWeights.Length > 0)
             {

@@ -202,7 +202,7 @@ struct MeshPartEntry
     uint IndexBufferAddressHi;
     uint IndexBufferBytes;
     uint CullBone;              // a skinned part's bone with most of its vertices + 1, 0 = none (SkinnedCentre)
-    uint Reserved9;
+    uint Flags;                 // MESH_* bits (common.fx, MeshRegistry.MeshFlags)
 };
 
 // LOD chain data per mesh part - matches C# MeshRegistry.MeshPartLod exactly (32 bytes).

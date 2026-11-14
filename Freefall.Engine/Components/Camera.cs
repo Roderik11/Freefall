@@ -179,6 +179,9 @@ namespace Freefall.Components
                 pair.Value.SetParameter("CloudParamsIdx", cloudParamsIdx);
                 pair.Value.SetParameter("CloudsOn", Graphics.Clouds.Active ? 1u : 0u);
                 pair.Value.SetParameter("TerrainIdx", Graphics.Atmosphere.TerrainIdx);
+                pair.Value.SetParameter("FarTierFrom", Graphics.FarTier.From);
+                pair.Value.SetParameter("FarTierBand", Graphics.FarTier.Band);
+                pair.Value.SetParameter("FarTierCell", Graphics.FarTier.CellSize);
             }
         }
         

@@ -377,7 +377,7 @@ namespace Freefall.Graphics
                 TransformSlot = (uint)call.TransformSlot,
                 MaterialId = (uint)call.Material.MaterialID,
                 CustomDataIdx = (uint)(call.InstanceSlot > 0 ? call.InstanceSlot : call.Material.Effect?.DefaultInstanceSlot ?? 0),
-                MeshPartIdx = (uint)call.MeshPartIndex,
+                MeshPartIdx = (uint)call.MeshPartIndex | (call.FarTier ? InstanceDescriptor.DrawFarTier : 0u),
                 BoneBufferIdx = call.BoneBufferIdx
             };
             WriteCore(DrawBucket.DescriptorsHash, 20, index, descriptor);
