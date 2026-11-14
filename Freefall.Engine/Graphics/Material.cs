@@ -177,14 +177,9 @@ namespace Freefall.Graphics
     [CreateAsset("Material")]
     public partial class Material : Asset, IDisposable
     {
-        // Per-pass PSOs (Apex pattern for multi-pass rendering like shadow maps)
-        private Dictionary<int, PipelineState> _passPipelineStates = new();
-        private Dictionary<int, PipelineState> _passWireframePSOs = new();
-        // The Shadow pass drawn into the sky captures (SkyCapture.cs): the same shaders with a small, clamped slope bias.
-        // The shadows' bias (3 × the depth slope, unclamped) pushes a wall seen edge-on from a low sky direction metres
-        // back, and the room behind it would see the sky through it. Made on first use: only the batches' materials draw.
-        private Dictionary<int, GraphicsPipelineStateDescription> _passCaptureDescs = new();
-        private Dictionary<int, PipelineState> _passCapturePSOs = new();
+        // The pipeline states are the effect's, one per pass (EffectPipelines: every material of an effect draws with
+        // the same ones, made once on a worker). Only a material made from a pipeline state of its own has one here.
+        private PipelineState? _customPipeline;
         private bool _isFullscreenPass = false; // Skip wireframe for post-process passes
 
         /// <summary>While set, <see cref="Apply(ID3D12GraphicsCommandList, GraphicsDevice, MaterialBlock?)"/> binds a
@@ -263,7 +258,16 @@ namespace Freefall.Graphics
         // SubShaders parsed from Effect techniques (Apex pattern)
         private readonly List<SubShader> _subShaders = new();
         
-        public PipelineState PipelineState => _passPipelineStates.TryGetValue(Pass, out var pso) ? pso : _passPipelineStates.GetValueOrDefault(0)!;
+        public PipelineState? PipelineState
+        {
+            get
+            {
+                if (_customPipeline != null) return _customPipeline;
+                var set = _effect?.Pipelines.Ready;
+                if (set == null || set.Solid.Length == 0) return null;
+                return set.Solid[(uint)Pass < (uint)set.Solid.Length ? Pass : 0];
+            }
+        }
         public IEnumerable<ConstantBuffer> ConstantBuffers => _constantBuffers.Values;
         private Effect _effect;
         public Effect Effect
@@ -574,18 +578,11 @@ namespace Freefall.Graphics
         {
             if (effect == null || effect == Effect) return;
 
-            // Release the old GPU state deferred, as RebuildFromEffect does: frames in flight may still use it. Only the
-            // native PSOs: their root signature is the device's shared one
+            // Release the old GPU state deferred, as RebuildFromEffect does: frames in flight may still use it. The
+            // pipeline states are the effects' (EffectPipelines)
             var device = Freefall.Engine.Device;
             foreach (var cb in _constantBuffers.Values) device.DeferDispose(cb);
-            foreach (var pso in _passPipelineStates.Values) device.DeferDispose(pso.Native);
-            foreach (var pso in _passWireframePSOs.Values) device.DeferDispose(pso.Native);
-            foreach (var pso in _passCapturePSOs.Values) device.DeferDispose(pso.Native);
             _constantBuffers.Clear();
-            _passPipelineStates.Clear();
-            _passWireframePSOs.Clear();
-            _passCaptureDescs.Clear();
-            _passCapturePSOs.Clear();
             _subShaders.Clear();
             _textureParameters.Clear();
             _textureSlots.Clear();
@@ -638,9 +635,10 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Same as SetEffect for an effect whose shaders changed underneath it: new PSOs and constant
-        /// buffers, keeping textures, bindless indices and the values already written to the buffers.
-        /// Old GPU objects may still be referenced by frames in flight, so they are released deferred.
+        /// Same as SetEffect for an effect whose shaders changed underneath it: new constant buffers (the
+        /// effect made its new pipeline states itself, EffectPipelines), keeping textures, bindless indices and
+        /// the values already written to the buffers. Old GPU objects may still be referenced by frames in
+        /// flight, so they are released deferred.
         /// </summary>
         private void RebuildFromEffect()
         {
@@ -648,17 +646,8 @@ namespace Freefall.Graphics
             var effect = _effect;
 
             var oldBuffers = new Dictionary<string, ConstantBuffer>(_constantBuffers);
-            // Only the native PSO: PipelineState.Dispose() also releases its root signature, which here
-            // is the device's shared GlobalRootSignature (disposing it crashes the next draw).
-            foreach (var pso in _passPipelineStates.Values) device.DeferDispose(pso.Native);
-            foreach (var pso in _passWireframePSOs.Values) device.DeferDispose(pso.Native);
-            foreach (var pso in _passCapturePSOs.Values) device.DeferDispose(pso.Native);
 
             _constantBuffers.Clear();
-            _passPipelineStates.Clear();
-            _passWireframePSOs.Clear();
-            _passCaptureDescs.Clear();
-            _passCapturePSOs.Clear();
             _subShaders.Clear();
             _textureParameters.Clear();
             _textureSlots.Clear();
@@ -810,7 +799,31 @@ namespace Freefall.Graphics
             if (effect.Techniques.Count == 0 || effect.Techniques[0].Passes.Count == 0)
                 return;
 
-            var renderState = effect.RenderState;
+            // The pipeline states are the effect's (EffectPipelines, made on a worker when it was compiled): what a
+            // material makes is its constant buffers, from the first pass' reflection
+            var first = effect.Techniques[0].Passes[0];
+            if (first.VertexShader?.Reflection != null) CreateConstantBuffers(device, first.VertexShader.Reflection);
+            if (first.PixelShader?.Reflection != null) CreateConstantBuffers(device, first.PixelShader.Reflection);
+            if (first.HullShader?.Reflection != null) CreateConstantBuffers(device, first.HullShader.Reflection);
+            if (first.DomainShader?.Reflection != null) CreateConstantBuffers(device, first.DomainShader.Reflection);
+            if (first.MeshShader?.Reflection != null) CreateConstantBuffers(device, first.MeshShader.Reflection);
+            if (first.AmplificationShader?.Reflection != null) CreateConstantBuffers(device, first.AmplificationShader.Reflection);
+
+            // Detect fullscreen passes (no depth = post-process, don't wireframe)
+            _isFullscreenPass = !effect.RenderState.DepthTest && !effect.RenderState.DepthWrite;
+        }
+
+        /// <summary>
+        /// The pipeline states of <paramref name="technique"/>'s passes under <paramref name="renderState"/>: what every
+        /// material of an effect draws with (<see cref="EffectPipelines"/>, which calls this on a worker; the device
+        /// makes pipeline states on any thread). A pass whose pipeline state cannot be made gets none (logged) and
+        /// draws nothing.
+        /// </summary>
+        internal static EffectPipelines.Set BuildPipelines(EffectTechnique technique, ShaderRenderState renderState,
+            BlendState effectBlend, GraphicsDevice device, string? name)
+        {
+            var subShader = new SubShader(technique);
+            var set = new EffectPipelines.Set(technique.Passes.Count);
 
             // Render target formats from shader metadata: the deferred renderer's targets for that count
             Format[] rtvFormats = TargetFormats(renderState.RenderTargetCount, renderState.RenderTargetFormat);
@@ -837,9 +850,9 @@ namespace Freefall.Graphics
                 "Additive" => new BlendDescription(Blend.One, Blend.One),
                 "AlphaBlend" => BlendDescription.AlphaBlend,
                 "Premultiplied" => Premultiplied(),
-                _ => effect.BlendState == BlendState.Additive 
+                _ => effectBlend == BlendState.Additive
                     ? new BlendDescription(Blend.One, Blend.One)
-                    : effect.BlendState == BlendState.AlphaBlend 
+                    : effectBlend == BlendState.AlphaBlend
                         ? BlendDescription.AlphaBlend 
                         : BlendDescription.Opaque
             };
@@ -908,13 +921,13 @@ namespace Freefall.Graphics
             };
 
             // Create PSO for each pass (Apex multi-pass pattern for shadow maps, etc.)
-            var firstTechnique = effect.Techniques[0];
-            for (int passIndex = 0; passIndex < firstTechnique.Passes.Count; passIndex++)
+            for (int passIndex = 0; passIndex < technique.Passes.Count; passIndex++)
             {
-                var currentPass = firstTechnique.Passes[passIndex];
-                
+                var currentPass = technique.Passes[passIndex];
+                string passName = $"{name} {currentPass.Name}";
+
                 // Shadow pass overrides (shared by both traditional and mesh shader paths)
-                var passType = _subShaders[0].ShaderPasses[passIndex].RenderPass;
+                var passType = subShader.ShaderPasses[passIndex].RenderPass;
                 var passRtvFormats = rtvFormats;
                 int passWritten = currentPass.RenderState?.RenderTargetCount ?? renderState.RenderTargetCount;   // outputs the shader writes
                 var passDepthFormat = depthFormat;
@@ -1025,16 +1038,29 @@ namespace Freefall.Graphics
                         SampleMask = uint.MaxValue,
                     };
                     
-                    _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, meshPsoDesc, $"{_effect?.Name} {currentPass.Name}");
+                    set.Solid[passIndex] = MakePipeline(passName, () => new PipelineState(device, rootSignature, meshPsoDesc, passName));
 
-                    // Wireframe variant for mesh shaders
-                    meshPsoDesc.RasterizerState = new RasterizerDescription(CullMode.None, FillMode.Wireframe);
-                    _passWireframePSOs[passIndex] = new PipelineState(device, rootSignature, meshPsoDesc, $"{_effect?.Name} {currentPass.Name} wireframe");
+                    // Wireframe variant for mesh shaders (the editor's view; made when first drawn)
+                    var meshWireDesc = new PipelineState.MeshShaderPSODescription
+                    {
+                        AmplificationShader = meshPsoDesc.AmplificationShader,
+                        MeshShader = meshPsoDesc.MeshShader,
+                        PixelShader = meshPsoDesc.PixelShader,
+                        RasterizerState = new RasterizerDescription(CullMode.None, FillMode.Wireframe),
+                        BlendState = meshPsoDesc.BlendState,
+                        DepthStencilState = meshPsoDesc.DepthStencilState,
+                        RenderTargetFormats = meshPsoDesc.RenderTargetFormats,
+                        DepthStencilFormat = meshPsoDesc.DepthStencilFormat,
+                        SampleDescription = meshPsoDesc.SampleDescription,
+                        SampleMask = meshPsoDesc.SampleMask,
+                    };
+                    set.MakeWireframe[passIndex] = () => new PipelineState(device, rootSignature, meshWireDesc, passName + " wireframe");
                 }
                 else
                 {
-                    // Traditional pipeline: VS → [HS → DS →] [GS →] PS
-                    var psoDesc = psoDescBase;
+                    // Traditional pipeline: VS → [HS → DS →] [GS →] PS. A description of its own per pass: Vortice's is a
+                    // class, and one shared by the passes carried a tessellated pass' Patch topology into the next
+                    var psoDesc = CopyDescription(psoDescBase);
                     psoDesc.VertexShader = currentPass.VertexShader?.Bytecode ?? default;
                     psoDesc.PixelShader = currentPass.PixelShader?.Bytecode ?? default;
                     psoDesc.HullShader = currentPass.HullShader?.Bytecode ?? default;
@@ -1050,56 +1076,68 @@ namespace Freefall.Graphics
                     psoDesc.RasterizerState = passRasterDesc;
                     psoDesc.BlendState = FitBlendToTargets(passBlendDesc, passRtvFormats, passWritten);
                     
-                    _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, psoDesc, $"{_effect?.Name} {currentPass.Name}");
+                    set.Solid[passIndex] = MakePipeline(passName, () => new PipelineState(device, rootSignature, psoDesc, passName));
 
-                    // A new description, not a copy of psoDesc: Vortice's description is a class, and the wireframe
-                    // variant below rewrites psoDesc's rasterizer (a capture PSO made from it later drew in wireframe:
-                    // empty maps at 19 ms a group)
+                    // The Shadow pass drawn into the sky captures (SkyCapture.cs): the same shaders with a small, clamped
+                    // slope bias. The shadows' bias (3 × the depth slope, unclamped) pushes a wall seen edge-on from a low
+                    // sky direction metres back, and the room behind it would see the sky through it. Its own description:
+                    // a capture PSO made from one the wireframe variant had rewritten drew in wireframe (empty maps at
+                    // 19 ms a group)
                     if (passType == RenderPass.Shadow)
                     {
-                        _passCaptureDescs[passIndex] = new GraphicsPipelineStateDescription
-                        {
-                            RootSignature = psoDesc.RootSignature,
-                            InputLayout = psoDesc.InputLayout,
-                            VertexShader = psoDesc.VertexShader,
-                            PixelShader = psoDesc.PixelShader,
-                            HullShader = psoDesc.HullShader,
-                            DomainShader = psoDesc.DomainShader,
-                            RasterizerState = SkyCaptureRasterizer,
-                            BlendState = psoDesc.BlendState,
-                            DepthStencilState = psoDesc.DepthStencilState,
-                            PrimitiveTopologyType = psoDesc.PrimitiveTopologyType,
-                            RenderTargetFormats = psoDesc.RenderTargetFormats,
-                            DepthStencilFormat = psoDesc.DepthStencilFormat,
-                            SampleDescription = psoDesc.SampleDescription,
-                            SampleMask = psoDesc.SampleMask,
-                            Flags = psoDesc.Flags,
-                        };
+                        var captureDesc = CopyDescription(psoDesc);
+                        captureDesc.RasterizerState = SkyCaptureRasterizer;
+                        set.Capture[passIndex] = MakePipeline(passName + " sky capture",
+                            () => new PipelineState(device, device.GlobalRootSignature, captureDesc, passName + " sky capture"));
                     }
 
-                    psoDesc.RasterizerState = new RasterizerDescription(CullMode.None, FillMode.Wireframe);
-                    _passWireframePSOs[passIndex] = new PipelineState(device, rootSignature, psoDesc, $"{_effect?.Name} {currentPass.Name} wireframe");
-                }
-                
-                // Reflection for constant buffers (from first pass for simplicity)
-                if (passIndex == 0)
-                {
-                    if (currentPass.VertexShader?.Reflection != null) CreateConstantBuffers(device, currentPass.VertexShader.Reflection);
-                    if (currentPass.PixelShader?.Reflection != null) CreateConstantBuffers(device, currentPass.PixelShader.Reflection);
-                    if (currentPass.HullShader?.Reflection != null) CreateConstantBuffers(device, currentPass.HullShader.Reflection);
-                    if (currentPass.DomainShader?.Reflection != null) CreateConstantBuffers(device, currentPass.DomainShader.Reflection);
-                    if (currentPass.MeshShader?.Reflection != null) CreateConstantBuffers(device, currentPass.MeshShader.Reflection);
-                    if (currentPass.AmplificationShader?.Reflection != null) CreateConstantBuffers(device, currentPass.AmplificationShader.Reflection);
+                    // The editor's wireframe view: made when first drawn
+                    var wireDesc = CopyDescription(psoDesc);
+                    wireDesc.RasterizerState = new RasterizerDescription(CullMode.None, FillMode.Wireframe);
+                    set.MakeWireframe[passIndex] = () => new PipelineState(device, rootSignature, wireDesc, passName + " wireframe");
                 }
             }
-            
-            // Detect fullscreen passes (no depth = post-process, don't wireframe)
-            _isFullscreenPass = !renderState.DepthTest && !renderState.DepthWrite;
+
+            return set;
         }
+
+        // One pass' pipeline state; a pass whose state the device refuses draws nothing, the others still do
+        private static PipelineState? MakePipeline(string name, Func<PipelineState> make)
+        {
+            try
+            {
+                return make();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError("Material", $"{name}: pipeline state not made (0x{ex.HResult:X8}), the pass draws nothing: {ex.Message}");
+                return null;
+            }
+        }
+
+        private static GraphicsPipelineStateDescription CopyDescription(GraphicsPipelineStateDescription d) => new()
+        {
+            RootSignature = d.RootSignature,
+            InputLayout = d.InputLayout,
+            VertexShader = d.VertexShader,
+            PixelShader = d.PixelShader,
+            HullShader = d.HullShader,
+            DomainShader = d.DomainShader,
+            GeometryShader = d.GeometryShader,
+            RasterizerState = d.RasterizerState,
+            BlendState = d.BlendState,
+            DepthStencilState = d.DepthStencilState,
+            PrimitiveTopologyType = d.PrimitiveTopologyType,
+            RenderTargetFormats = d.RenderTargetFormats,
+            DepthStencilFormat = d.DepthStencilFormat,
+            SampleDescription = d.SampleDescription,
+            SampleMask = d.SampleMask,
+            Flags = d.Flags,
+        };
 
         public Material(PipelineState pipelineState, Shader vertexShader, Shader pixelShader, GraphicsDevice device)
         {
-            _passPipelineStates[0] = pipelineState; // Custom PSO provided for pass 0
+            _customPipeline = pipelineState; // Custom PSO provided for pass 0
 
             // Reflect and Create Constant Buffers
             if (vertexShader.Reflection != null)
@@ -1371,19 +1409,19 @@ namespace Freefall.Graphics
             // Drawn by whoever applies it: its on-demand textures are held while it keeps being applied
             Touch();
 
-            // Bind Pipeline - use selected pass's PSO, wireframe variant if enabled
-            var pso = _passPipelineStates.TryGetValue(Pass, out var selectedPso) ? selectedPso : _passPipelineStates.GetValueOrDefault(0);
-            if (Engine.Settings.Wireframe && !_isFullscreenPass && _passWireframePSOs.TryGetValue(Pass, out var wireframePso))
+            // Bind Pipeline - the effect's for the selected pass (pass 0 for one it does not have), its wireframe
+            // variant if enabled (the solid one until that is made), its sky capture variant while capturing
+            var pso = _customPipeline;
+            if (pso == null && _effect?.Pipelines.Ready is { } set && set.Solid.Length > 0)
             {
-                pso = wireframePso;
+                bool hasPass = (uint)Pass < (uint)set.Solid.Length;
+                pso = set.Solid[hasPass ? Pass : 0];
+                if (hasPass && Engine.Settings.Wireframe && !_isFullscreenPass)
+                    pso = set.WireframeFor(Pass) ?? pso;
+                if (hasPass && SkyCaptureRaster && set.Capture[Pass] is { } capturePso)
+                    pso = capturePso;
             }
-            if (SkyCaptureRaster && _passCaptureDescs.TryGetValue(Pass, out var captureDesc))
-            {
-                if (!_passCapturePSOs.TryGetValue(Pass, out var capturePso))
-                    _passCapturePSOs[Pass] = capturePso = new PipelineState(device, device.GlobalRootSignature, captureDesc, $"{_effect?.Name} pass {Pass} sky capture");
-                pso = capturePso;
-            }
-            if (pso?.Native == null) return; // Device lost — PSO wasn't created
+            if (pso?.Native == null) return; // Device lost, or the pass has none: nothing drawn
             commandList.SetPipelineState(pso.Native);
             commandList.SetGraphicsRootSignature(device.GlobalRootSignature);
 

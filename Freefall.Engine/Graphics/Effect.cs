@@ -148,6 +148,13 @@ namespace Freefall.Graphics
         /// <summary>Push constant slot 17 (IndexedDraw): 1 while an InstanceBatch draws the effect indexed.</summary>
         public const uint IndexedDrawSlot = 17;
 
+        /// <summary>
+        /// The pipeline states of the passes, which every material of the effect draws with: made on a worker after
+        /// every compile, shared by every instance of the key like <see cref="Techniques"/>.
+        /// </summary>
+        internal EffectPipelines Pipelines => _pipelines;
+        private EffectPipelines _pipelines = new();
+
         // MasterEffects: Global dictionary of all loaded effects (Apex pattern)
         // Camera.SetShaderParams iterates this to set View/Projection on all effects
         internal static Dictionary<int, Effect> MasterEffects = new Dictionary<int, Effect>();
@@ -188,6 +195,7 @@ namespace Freefall.Graphics
                 _readsShadowMap = existing._readsShadowMap;
                 _drawsIndexed = existing._drawsIndexed;
                 _materialBlock = existing._materialBlock;
+                _pipelines = existing._pipelines;
                 lock (_instances) _instances.Add(new WeakReference<Effect>(this));
                 return;
             }
@@ -212,6 +220,7 @@ namespace Freefall.Graphics
             MaterialParams.AddRange(FXParser.ParseMaterialParams(content));
             InstanceParams.AddRange(FXParser.ParseInstanceParams(content));
             WriteInstanceDefaults();
+            _pipelines.Start(this);
 
             Dependencies = ShaderHotReload.CollectDependencies(_sourcePath);
 
@@ -280,6 +289,7 @@ namespace Freefall.Graphics
             MaterialParams.AddRange(FXParser.ParseMaterialParams(content));
             InstanceParams.AddRange(FXParser.ParseInstanceParams(content));
             WriteInstanceDefaults();
+            _pipelines.Start(this);   // nothing for a source that did not compile
 
             if (_sourcePath != null)
                 Dependencies = ShaderHotReload.CollectDependencies(_sourcePath);
@@ -410,6 +420,9 @@ namespace Freefall.Graphics
 
             if (_sourcePath != null)
                 Dependencies = ShaderHotReload.CollectDependencies(_sourcePath);
+
+            // The new pipeline states, on a worker; the old ones are released deferred (frames in flight may draw with them)
+            _pipelines.Start(this);
 
             foreach (var t in old) t.Dispose();
         }

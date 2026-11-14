@@ -86,6 +86,67 @@ namespace Freefall.Assets
             return entities;
         }
 
+        private static readonly ProfilerMarker _preloadMarker = ProfilerMarker.Get("Prefab.Preload");
+
+        // The YAML whose assets Preload loaded: a new SourceYaml (reimport, prefab update) loads again
+        private byte[]? _preloaded;
+
+        /// <summary>
+        /// Loads every asset the prefab's copies use (meshes, materials, animation clips, sound banks, the assets of the
+        /// prefabs inside it), so that its first <see cref="Instantiate"/> finds them loaded. For what is spawned later
+        /// in play, called while a load screen is up (a worn horse item's prefab, at the wearer's wake-up): the first
+        /// summon of the Bay Horse loaded its mesh, clips and sounds in the frame, 255 ms. Nothing is made in the world.
+        /// Main thread. Once per <see cref="SourceYaml"/>: later calls return at once. Returns the ms it took.
+        /// </summary>
+        public double Preload() => Preload(null);
+
+        private double Preload(HashSet<Prefab>? visiting)
+        {
+            var yaml = SourceYaml;
+            if (yaml == null || ReferenceEquals(_preloaded, yaml) || Engine.Assets == null) return 0;
+            visiting ??= new HashSet<Prefab>();
+            if (!visiting.Add(this)) return 0;   // a prefab that holds itself, at any depth
+
+            using var _ = _preloadMarker.Auto();
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+
+            // The references in the YAML are GUIDs (32 hex digits): each one the asset database knows is loaded as its
+            // recorded type, which is the field's type the copies resolve it as (one cache entry: AssetManager.CacheKey)
+            foreach (var guid in GuidTokens(yaml))
+            {
+                if (string.Equals(guid, Guid, StringComparison.OrdinalIgnoreCase)) continue;
+                var type = AssetDatabase.GetAssetType(guid);
+                if (type == null || type == typeof(SceneAsset)) continue;
+                var asset = Engine.Assets.LoadByGuid(guid, type);
+                if (asset is Prefab inner) inner.Preload(visiting);
+            }
+
+            _preloaded = yaml;
+            return System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+        }
+
+        // Every run of exactly 32 hex digits in the bytes, lower-cased, each once (as the publish scan reads references)
+        private static IEnumerable<string> GuidTokens(byte[] bytes)
+        {
+            var seen = new HashSet<string>();
+            int start = -1;
+            for (int i = 0; i <= bytes.Length; i++)
+            {
+                byte b = i < bytes.Length ? bytes[i] : (byte)0;
+                if (b is >= (byte)'0' and <= (byte)'9' or >= (byte)'a' and <= (byte)'f' or >= (byte)'A' and <= (byte)'F')
+                {
+                    if (start < 0) start = i;
+                    continue;
+                }
+                if (start >= 0 && i - start == 32)
+                {
+                    var token = Encoding.ASCII.GetString(bytes, start, 32).ToLowerInvariant();
+                    if (seen.Add(token)) yield return token;
+                }
+                start = -1;
+            }
+        }
+
         /// <summary>
         /// Instantiate this prefab: parse the YAML, assign fresh UIDs,
         /// resolve asset references, and register entities in EntityManager.
