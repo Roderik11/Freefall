@@ -129,13 +129,15 @@ namespace Freefall.Editor.Mcp
                 foreach (var (t, path) in nodes)
                     foreach (var e in t.Entity.Components.OfType<ParticleEmitter>())
                     {
-                        bool works = e.Enabled && e.ParticleTexture != null && e.EmitRate > 0f;
+                        // One made for bursts (ParticleEmitter.Burst: a splash) has no rate and stays disabled: it works by its room
+                        bool bursts = e.BurstRoom > 0;
+                        bool works = e.ParticleTexture != null && (bursts || (e.Enabled && e.EmitRate > 0f));
                         emitters.Add(new JsonObject
                         {
                             ["path"] = path, ["position"] = V(t.WorldPosition), ["texture"] = e.ParticleTexture?.Name,
-                            ["emitRate"] = R(e.EmitRate), ["works"] = works,
+                            ["emitRate"] = R(e.EmitRate), ["burstRoom"] = e.BurstRoom, ["works"] = works,
                         });
-                        if (!works) problems.Add($"dead emitter at {path} (no texture or zero rate — empty component?)");
+                        if (!works) problems.Add($"dead emitter at {path} (no texture, or zero rate and no burst room — empty component?)");
                     }
 
                 // Converted packs lose components: a "Point Light" / "Fire" node with nothing but a Transform.

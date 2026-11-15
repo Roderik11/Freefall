@@ -594,8 +594,8 @@ PSOutput PS(VSOutput input, bool front : SV_IsFrontFace)
                       + WaterBandTotalVariance(slopeTex, WaterSampler, water.BandB, scale);
     }
     // What moves in the water round the camera ripples it (WaterRipples): rings, wakes, the steps of a wader
-    float rippleHeight;
-    float2 ripple = RippleSlope(water.RipplesSRV, water.RipplesOrigin, water.RipplesSpan, worldPos.xz, rippleHeight);
+    float rippleHeight, rippleFoam;
+    float2 ripple = RippleSlope(water.RipplesSRV, water.RipplesOrigin, water.RipplesSpan, worldPos.xz, rippleHeight, rippleFoam);
     slopes.mean += ripple;
     calm.mean += ripple;
     float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));
@@ -690,6 +690,9 @@ PSOutput PS(VSOutput input, bool front : SV_IsFrontFace)
     // Churned where the ripples are steep: a swimmer's strokes, a splash; not the rings of one treading water (their
     // slopes reach ~0.25 at the body: from 0.25 they made a white rim round it)
     coverage += smoothstep(0.45, 0.9, length(ripple)) * 0.6;
+
+    // What splashes and waders left on the surface (WaterRipples.Foam): a patch that fades over seconds
+    coverage += rippleFoam;
     coverage = saturate(coverage);
 
     float foamTex = 0.5;

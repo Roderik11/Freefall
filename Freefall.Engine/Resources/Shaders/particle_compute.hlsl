@@ -501,7 +501,8 @@ bool spawn_ground(ParticleEmitter e, uint seed, inout ParticleCore p)
     return true;
 }
 
-void spawn(ParticleEmitter e, uint seed, out ParticleCore p, out ParticleVisual v)
+// ringPos: the slot's place in the frame's emission (Jets picks a jet by it)
+void spawn(ParticleEmitter e, uint seed, uint ringPos, out ParticleCore p, out ParticleVisual v)
 {
     [branch]
     if (e.Shape == SHAPE_SURF || e.Shape == SHAPE_GROUND)
@@ -520,30 +521,42 @@ void spawn(ParticleEmitter e, uint seed, out ParticleCore p, out ParticleVisual 
         return;
     }
 
+    // Jets (ParticleEmitter.Jets): the frame's particles share a few starts, ways and speeds, one per jet, and each goes
+    // a little round its jet's way at a share of its speed, so they string out along its arc
+    uint jets = e.Jets & 0xFFFFu;
+    uint pick = seed;
+    if (jets > 0u)
+        pick = pcg_hash(e.RandomSeed ^ ((ringPos % jets) * 0x9E3779B9u + 0x68E31DA4u));
+
     float3 localPos, shapeDir;
-    sample_shape(e, seed + 100u, localPos, shapeDir);
+    sample_shape(e, pick + 100u, localPos, shapeDir);
 
     float3 localDir;
     [branch]
     if (e.DirectionMode == DIR_RANDOM)
     {
-        localDir = rand_direction(seed + 200u);
+        localDir = rand_direction(pick + 200u);
     }
     else if (e.DirectionMode == DIR_RADIAL)
     {
         // Outward from the origin; fall back to the shape's natural direction at the centre
         float len = length(localPos);
         float3 radial = len > 1e-5 ? localPos / len : shapeDir;
-        localDir = rand_cone(radial, e.SpreadCos, seed + 200u);
+        localDir = rand_cone(radial, e.SpreadCos, pick + 200u);
     }
     else // DIR_DIRECTIONAL
     {
         // Cone shape steers the base direction outward; other shapes use EmitDirection
         float3 baseDir = (e.Shape == SHAPE_CONE) ? shapeDir : e.EmitDirection;
-        localDir = rand_cone(baseDir, e.SpreadCos, seed + 200u);
+        localDir = rand_cone(baseDir, e.SpreadCos, pick + 200u);
     }
 
-    float speed = rand_range(e.SpeedRange.x, e.SpeedRange.y, seed + 4u);
+    float speed = rand_range(e.SpeedRange.x, e.SpeedRange.y, pick + 4u);
+    if (jets > 0u)
+    {
+        localDir = rand_cone(localDir, e.JetSpreadCos, seed + 210u);
+        speed *= rand_range(((e.Jets >> 16) & 0xFFu) / 255.0, 1.0, seed + 4u);
+    }
 
     p.Position = e.Position + local_to_world(e, localPos);
     p.Age = 0.0;
@@ -737,7 +750,7 @@ void CSSimulate(uint3 gid : SV_GroupID, uint3 dtid : SV_DispatchThreadID)
         if (ringPos < e.EmitCount)
         {
             ParticleVisual v;
-            spawn(e, pcg_hash(e.RandomSeed + local * 7919u + slot * 6271u), p, v);
+            spawn(e, pcg_hash(e.RandomSeed + local * 7919u + slot * 6271u), ringPos, p, v);
 
             // None born under a roof (the box over a camera in a hall)
             if ((e.Flags & PARTICLE_FLAG_COVER) != 0 && UnderCover(p.Position))

@@ -242,21 +242,25 @@ namespace Freefall.Editor.Mcp
                      "does). Play and Stop are scene loads behind the editor's progress popup; this waits until the load is done " +
                      "(Play on Eldermoor ~12 s, most of it physics cooking; Stop ~5 s), unless wait=false. " +
                      "The game's UI is drawn over the scene viewport: screenshot target='viewport' shows it. Drive the game with " +
-                     "play_input; read the game UI's controls with game_ui.")]
+                     "play_input; read the game UI's controls with game_ui. timeScale slows the game clock (Time.Scale) to catch a " +
+                     "quick effect in a screenshot: 0.1 = a tenth of the pace, 0 = stood still (the frame still draws), 1 = back; " +
+                     "Play and Stop put it back to 1. play_input's holds and waits are in real seconds.")]
         public static async Task<CallToolResult> PlayMode(
             [Description("true = Play, false = Stop")] bool? play = null,
             [Description("true = game menu open, false = closed (play mode only)")] bool? menu = null,
             [Description("Play only: write the scene to its file first (the toolbar's way). Default false: kept in memory")] bool save = false,
             [Description("Wait until the game runs (Play) or the scene is back (Stop), and has settled")] bool wait = true,
-            [Description("Max seconds to wait")] int waitSeconds = 120)
+            [Description("Max seconds to wait")] int waitSeconds = 120,
+            [Description("The game clock's pace (Time.Scale, 0..4): 0.1 slow motion, 0 stood still, 1 normal")] float? timeScale = null)
         {
-            if (play == null && menu == null)
+            if (play == null && menu == null && timeScale == null)
                 return await McpBridge.Get("/api/playmode");
 
             var body = new JsonObject();
             if (play != null) body["play"] = play.Value;
             if (play == true) body["save"] = save;
             if (menu != null && play != true) body["menu"] = menu.Value;
+            if (timeScale != null && play == null) body["timeScale"] = timeScale.Value;
             var result = await McpBridge.Post("/api/playmode", body);
             if (play == null || !wait || result.IsError == true) return result;
 

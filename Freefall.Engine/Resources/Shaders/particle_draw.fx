@@ -186,8 +186,11 @@ VSOutput DrawVS(uint vertexID, uint instanceID, uint draw)
         // Rain and snow right at the eye would be out of focus, a blur too faint to see: drawn, a drop a hand's width away
         // was a white bar across the screen, a flake a dark blot on the sky. Falling drops only (streaks): water on the
         // ground (the rain's splashes) is seen at one's feet
+        // Weather round the camera only (it wraps in its box and stops under cover): a splash's drops at a third-person
+        // camera's 3-4 m were faded to nothing; they fade only right at the lens
         if ((e.Flags & PARTICLE_FLAG_WATER) != 0 && e.BillboardMode == BILLBOARD_VELOCITY)
-            output.Color *= smoothstep(1.0, 3.5, viewDepth);
+            output.Color *= (e.Flags & (PARTICLE_FLAG_WRAP | PARTICLE_FLAG_COVER)) != 0 ? smoothstep(1.0, 3.5, viewDepth)
+                                                                                     : smoothstep(0.2, 0.6, viewDepth);
         else if ((e.Flags & PARTICLE_FLAG_COVER) != 0)
             output.Color *= smoothstep(0.5, 2.0, viewDepth);
         float minWidth = viewDepth > 0.0 ? PIXEL_FLOOR * 2.0 * viewDepth / (Projection._22 * ViewportSize.y) : 0.0;

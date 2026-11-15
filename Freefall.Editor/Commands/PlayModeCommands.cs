@@ -9,15 +9,16 @@ namespace Freefall.Editor.Commands
         {
             var editor = Program.EditorUI;
             if (editor == null) return CommandResult.BadRequest("No project open");
-            return CommandResult.Json(new { playing = editor.IsPlaying, menuOpen = GameUI.MenuOpen, uiRunning = GameUI.Running });
+            return CommandResult.Json(new { playing = editor.IsPlaying, menuOpen = GameUI.MenuOpen, uiRunning = GameUI.Running, timeScale = Freefall.Base.Time.Scale });
         }
     }
 
     /// <summary>
-    /// Body {"play": true|false, "menu": true|false, "save": true|false}, all optional. play = the
+    /// Body {"play": true|false, "menu": true|false, "save": true|false, "timeScale": 0.25}, all optional. play = the
     /// toolbar's Play / Stop (Play saves the scene first; with "save": false it keeps it in memory
     /// for Stop instead and leaves the file alone); menu = what Escape toggles in the game
-    /// (windows, free cursor, no player control).
+    /// (windows, free cursor, no player control); timeScale = the game clock's pace (Time.Scale: 0 stands it still,
+    /// 0.1 slow motion for looking at an effect; back to 1 at Play and Stop).
     /// </summary>
     [CommandRoute("POST", "/api/playmode")]
     public class SetPlayModeCommand : EditorCommand
@@ -50,7 +51,10 @@ namespace Freefall.Editor.Commands
                 GameUI.MenuOpen = menu.GetBoolean();
             }
 
-            return CommandResult.Json(new { playing = editor.IsPlaying, menuOpen = GameUI.MenuOpen, uiRunning = GameUI.Running });
+            if (root.TryGetProperty("timeScale", out var scale))
+                Freefall.Base.Time.Scale = System.Math.Clamp(scale.GetSingle(), 0f, 4f);
+
+            return CommandResult.Json(new { playing = editor.IsPlaying, menuOpen = GameUI.MenuOpen, uiRunning = GameUI.Running, timeScale = Freefall.Base.Time.Scale });
         }
     }
 }

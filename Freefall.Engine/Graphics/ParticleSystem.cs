@@ -78,7 +78,7 @@ namespace Freefall.Graphics
             public Vector3 Carry;          public float PivotX;
             public Vector3 LeanWind;       public float PivotY;
             public float ForwardScatter;   public float MultipleScattering; public float PyroFire;          public float PyroTemperature;
-            public uint MotionTextureIdx;  public float MotionStrength;     public float Pad3;              public float Pad4;
+            public uint MotionTextureIdx;  public float MotionStrength;     public uint Jets;               public float JetSpreadCos;
         }
 
         /// <summary>Everything the system keeps per emitter. The component itself only holds authored data.</summary>
@@ -103,6 +103,8 @@ namespace Freefall.Graphics
             public float SpreadCos;
             public float ConeTan;
             public Vector3 Direction;
+            public float JetSpread = float.NaN;
+            public float JetSpreadCos;
 
             // Moving emitters (FollowEmitter): live particles have been carried along as far as CarriedTo,
             // where the emitter was in the last row a simulate ran with. RowPosition / RowSerial: the last
@@ -269,7 +271,8 @@ namespace Freefall.Graphics
         {
             // Most particles alive at once, plus headroom for the frame-sized emission steps
             float life = MathF.Max(0.01f, emitter.Lifetime) * (1f + Math.Clamp(emitter.LifetimeRandomness, 0f, 1f));
-            float slots = MathF.Min(MathF.Max(0f, emitter.EmitRate) * life * 1.05f + 16f, MaxEmitterChunks * (float)ChunkSize);
+            float slots = MathF.Min(MathF.Max(0f, emitter.EmitRate) * life * 1.05f + Math.Max(0, emitter.BurstRoom) + 16f,
+                MaxEmitterChunks * (float)ChunkSize);
             return Math.Clamp((int)MathF.Ceiling(slots / ChunkSize), 1, MaxEmitterChunks);
         }
 
@@ -391,7 +394,7 @@ namespace Freefall.Graphics
             for (int i = 0; i < count; i++)
             {
                 var entry = _entries[i];
-                if (!entry.Asleep)
+                if (!entry.Asleep || entry.Emitter.BurstOwed)
                     BuildRow(entry, i, ref _rows[i], dt);
             }
 
@@ -439,12 +442,19 @@ namespace Freefall.Graphics
             entry.Accumulator += rate * dt;
             uint emit = (uint)entry.Accumulator;
             entry.Accumulator -= emit;
+            uint burst = (uint)Math.Max(0, e.TakeBurst());   // ParticleEmitter.Burst: let go of at once, enabled or not
+            emit += burst;
             if (emit > capacity) emit = capacity;
 
             if (e.SpreadAngle != entry.SpreadAngle)
             {
                 entry.SpreadAngle = e.SpreadAngle;
                 entry.SpreadCos = MathF.Cos(Math.Clamp(e.SpreadAngle, 0f, 180f) * (MathF.PI / 180f));
+            }
+            if (e.JetSpread != entry.JetSpread)
+            {
+                entry.JetSpread = e.JetSpread;
+                entry.JetSpreadCos = MathF.Cos(Math.Clamp(e.JetSpread, 0f, 45f) * (MathF.PI / 180f));
             }
             if (e.ConeAngle != entry.ConeAngle)
             {
@@ -588,6 +598,8 @@ namespace Freefall.Graphics
                 TextureIdx = e.ParticleTexture?.BindlessIndex ?? 0u,
                 MotionTextureIdx = e.FlipbookBlend ? e.FlipbookMotion?.BindlessIndex ?? 0u : 0u,
                 MotionStrength = MathF.Max(0f, e.FlipbookMotionStrength),
+                Jets = (uint)Math.Clamp(e.Jets, 0, 256) | ((uint)(Math.Clamp(e.JetSlowest, 0f, 1f) * 255f + 0.5f) << 16),
+                JetSpreadCos = entry.JetSpreadCos,
                 FlipbookCols = (uint)Math.Max(1, e.FlipbookColumns),
                 FlipbookRows = (uint)Math.Max(1, e.FlipbookRows),
                 FlipbookFrameCount = (uint)Math.Max(0, e.FlipbookFrameCount),
@@ -632,7 +644,7 @@ namespace Freefall.Graphics
 
             // Disabled for longer than its particles live (and nothing of another emitter's left to clear): this row,
             // which emits nothing, stands until it is enabled again
-            entry.OutFor = e.Enabled ? 0f : entry.OutFor + dt;
+            entry.OutFor = e.Enabled || burst > 0 ? 0f : entry.OutFor + dt;
             entry.Asleep = !e.Enabled && !entry.Reset && entry.OutFor > life + 0.5f;
         }
 

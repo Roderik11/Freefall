@@ -77,6 +77,29 @@ namespace Freefall.Components
         public float EmitRate = 100f;
 
         [Category("Emission")]
+        [Description("Room for particles let go at once by Burst (a splash, a puff of dust), besides what EmitRate keeps " +
+                     "alive: the most that bursts within a lifetime let go together. An emitter made for bursts has EmitRate " +
+                     "0 and stays disabled. 0 = no room: a burst takes the place of the oldest particles")]
+        public int BurstRoom = 0;
+
+        [Category("Emission")]
+        [Description("Particles let go of in one frame go out in this many jets: a jet's particles start at one place on the " +
+                     "shape and go its way (SpreadAngle scatters the jets, JetSpread its particles round it), at speeds from " +
+                     "JetSlowest of the jet's to all of it, so they string out along its arc and break up as they go: the " +
+                     "jets of a splash, a spray of sparks. 0 = each particle its own way")]
+        public int Jets = 0;
+
+        [Category("Emission")]
+        [Description("Jets: how far a jet's particles scatter round its way (degrees)")]
+        [ValueRange(0f, 45f)]
+        public float JetSpread = 4f;
+
+        [Category("Emission")]
+        [Description("Jets: the slowest particle of a jet, as a share of the jet's speed (the rest between it and the jet's)")]
+        [ValueRange(0f, 1f)]
+        public float JetSlowest = 0.35f;
+
+        [Category("Emission")]
         [Description("Particle lifetime in seconds")]
         [ValueRange(0.1f, 30f)]
         public float Lifetime = 2.0f;
@@ -369,6 +392,26 @@ namespace Freefall.Components
 
         /// <summary>Index of this emitter's entry in <see cref="Graphics.ParticleSystem"/>; -1 while it has none.</summary>
         internal int SystemIndex = -1;
+
+        private int _burst;
+
+        /// <summary>
+        /// Let go of <paramref name="count"/> particles at once, at the next gather, from where the emitter is then (move
+        /// it first; what it let go before stays where it was). Any thread. A disabled emitter lets go of its bursts and
+        /// nothing else, so one made for bursts (a splash: EmitRate 0, <see cref="BurstRoom"/>) stays disabled, and asleep
+        /// between them. Colour and size are read from the emitter as the particles are drawn: a burst cannot be bigger
+        /// than the last one still in the air, so bursts of different sizes go to emitters of their own.
+        /// </summary>
+        public void Burst(int count)
+        {
+            if (count > 0) System.Threading.Interlocked.Add(ref _burst, count);
+        }
+
+        /// <summary>A burst waits for the gather (it wakes an emitter asleep).</summary>
+        internal bool BurstOwed => System.Threading.Volatile.Read(ref _burst) > 0;
+
+        /// <summary>The bursts owed since the last gather, taken.</summary>
+        internal int TakeBurst() => System.Threading.Interlocked.Exchange(ref _burst, 0);
 
         // A disabled emitter whose particles are gone sleeps in the system: it has to hear of it
         protected override void OnEnabledChanged() => Systems.Get<Graphics.ParticleSystem>()?.EnabledChanged(this);

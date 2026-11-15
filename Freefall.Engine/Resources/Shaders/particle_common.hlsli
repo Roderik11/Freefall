@@ -52,7 +52,7 @@ struct ParticleEmitter     // 384 bytes
     float3 Carry;          float  PivotX;              // how far live particles move along with the emitter this frame (FollowEmitter)
     float3 LeanWind;       float  PivotY;              // the wind a sprite leans in: Wind less the emitter's own motion it follows / quad offset in its sizes
     float  ForwardScatter; float  MultipleScattering;  float PyroFire;           float PyroTemperature; // lit: Henyey-Greenstein g of the light (ParticleLight) / its even share (ParticlePhase) / pyro: the fire's nits and kelvin at its brightest
-    uint   MotionTextureIdx; float MotionStrength;     float _pad3;              float _pad4;        // the flipbook's motion atlas (0 = none) / its full-scale motion in shares of a frame
+    uint   MotionTextureIdx; float MotionStrength;     uint  Jets;               float JetSpreadCos; // the flipbook's motion atlas (0 = none) / its full-scale motion in shares of a frame / a burst in jets: their count (bits 0-15, 0 = none) and slowest share x 255 (bits 16-23) / cos of the spread round a jet
 };
 
 // ParticleEmitter.RenderMode

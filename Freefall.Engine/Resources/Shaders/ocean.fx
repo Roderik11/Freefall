@@ -191,8 +191,8 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
     }
 
     // What moves in the water round the camera ripples it (WaterRipples): rings, wakes, the steps of a wader
-    float rippleHeight;
-    float2 ripple = RippleSlope(ocean.RipplesSRV, ocean.RipplesOrigin, ocean.RipplesSpan, worldPos.xz, rippleHeight);
+    float rippleHeight, rippleFoam;
+    float2 ripple = RippleSlope(ocean.RipplesSRV, ocean.RipplesOrigin, ocean.RipplesSpan, worldPos.xz, rippleHeight, rippleFoam);
     slopes.mean += ripple;
 
     float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));
@@ -502,6 +502,8 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
     foam = max(foam, lerp(surfNear, surfFoam, foamFar));
     foam = max(foam, streakFoam * (1.0 - foamFar));   // the web of thinning foam
     foam = max(foam, smoothstep(0.45, 0.9, length(ripple)) * 0.6 * (1.0 - foamFar));   // churned by strokes (water.fx)
+    // What splashes and waders left on the surface (WaterRipples.Foam), broken up by the lace's cells as the waterline's is
+    foam = max(foam, saturate((saturate(rippleFoam) * 1.25 - (1.0 - laceTex)) * 3.0) * (1.0 - foamFar));
     float thickness = saturate(max(coverage, surfFoam));
 
     // Always feather the last few centimeters of water: whatever the foam pattern, it must not end

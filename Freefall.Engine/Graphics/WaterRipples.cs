@@ -35,6 +35,12 @@ namespace Freefall.Graphics
         /// </summary>
         public const float KeptPerSecond = 0.7f;
 
+        /// <summary>
+        /// What is left of the foam a splash or a wader leaves on the surface after a second (it also spreads a little):
+        /// a splash's patch shows for 3-5 s.
+        /// </summary>
+        public const float FoamKeptPerSecond = 0.6f;
+
         /// <summary>Seconds the water goes on moving after the last stir.</summary>
         public const float LivesFor = 10f;
 
@@ -43,13 +49,15 @@ namespace Freefall.Graphics
         private const int MaxDrops = 64;
         private const int FrameCount = 3;
 
-        /// <summary>One stir of the water (water_ripples_cs.hlsl RippleDrop, 16 bytes).</summary>
+        /// <summary>One stir of the water (water_ripples_cs.hlsl RippleDrop, 32 bytes).</summary>
         [StructLayout(LayoutKind.Sequential, Pack = 4)]
         private struct Drop
         {
             public Vector2 XZ;
             public float Radius;
-            public float Strength;
+            public float Strength;      // m of height pushed
+            public float Foam;          // foam left (0..1.5 coverage)
+            public float Pad0, Pad1, Pad2;
         }
 
         private static readonly object _lock = new();
@@ -82,11 +90,29 @@ namespace Freefall.Graphics
         /// </summary>
         public static void Disturb(Vector3 at, float radius, float strength)
         {
-            if (!Engine.Settings.WaterRipples || radius <= 0f || strength == 0f) return;
+            if (strength == 0f) return;
+            Add(at, radius, strength, 0f);
+        }
+
+        /// <summary>
+        /// Leave foam on the water at a place: <paramref name="amount"/> of coverage (1 = white water, up to 1.5) over
+        /// <paramref name="radius"/> metres round <paramref name="at"/>, fading by <see cref="FoamKeptPerSecond"/> and
+        /// spreading a little. Once for a splash; every frame for something churning the water, amount × the frame's time.
+        /// The water's own foam pattern breaks it up (water.fx, ocean.fx). Any thread.
+        /// </summary>
+        public static void Foam(Vector3 at, float radius, float amount)
+        {
+            if (amount <= 0f) return;
+            Add(at, radius, 0f, amount);
+        }
+
+        private static void Add(Vector3 at, float radius, float strength, float foam)
+        {
+            if (!Engine.Settings.WaterRipples || radius <= 0f) return;
             lock (_lock)
             {
                 if (_pending.Count < MaxDrops)
-                    _pending.Add(new Drop { XZ = new Vector2(at.X, at.Z), Radius = radius, Strength = strength });
+                    _pending.Add(new Drop { XZ = new Vector2(at.X, at.Z), Radius = radius, Strength = strength, Foam = foam });
                 _alive = LivesFor;
             }
         }
@@ -192,6 +218,7 @@ namespace Freefall.Graphics
 
             float courant = WaveSpeed * StepSeconds / Cell;
             float damping = MathF.Pow(KeptPerSecond, StepSeconds);
+            float foamKept = MathF.Pow(FoamKeptPerSecond, StepSeconds);
             bool first = true;
             while (_owed >= StepSeconds)
             {
@@ -211,6 +238,7 @@ namespace Freefall.Graphics
                 s.SetPushConstant(_kStep, "OriginZBits", BitConverter.SingleToUInt32Bits(newOrigin.Y));
                 s.SetPushConstant(_kStep, "Courant2Bits", BitConverter.SingleToUInt32Bits(courant * courant));
                 s.SetPushConstant(_kStep, "DampingBits", BitConverter.SingleToUInt32Bits(damping));
+                s.SetPushConstant(_kStep, "FoamKeptBits", BitConverter.SingleToUInt32Bits(foamKept));
                 s.Dispatch(_kStep, list, Size / 8, Size / 8);
                 _origin = newOrigin;
                 _prev = _cur;
@@ -236,7 +264,7 @@ namespace Freefall.Graphics
             _states = new ResourceStates[3];
             for (int i = 0; i < 3; i++)
             {
-                _heights[i] = new RenderTexture2D(Engine.Device, Size, Size, Format.R16_Float, randomWrite: true);
+                _heights[i] = new RenderTexture2D(Engine.Device, Size, Size, Format.R16G16_Float, randomWrite: true);   // height, foam
                 _states[i] = ResourceStates.Common;
             }
             _prev = 0;
