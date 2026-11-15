@@ -994,6 +994,11 @@ namespace Freefall.Serialization
             if (Reflector.GetType(fqn) != null)
                 return fqn;
 
+            // A full name outside Freefall's namespaces, as the writer left it: a project type in its own namespace, or a
+            // nested class ("WorkNode+State", a world cells record's kept state)
+            if (Reflector.GetType(name) != null)
+                return name;
+
             // Simple name like "StaticMesh" → scan all assemblies
             var type = Reflector.FindTypeBySimpleName(name);
             if (type != null)

@@ -108,10 +108,22 @@ namespace Freefall.World
             s_parts.Remove(prefab);
             s_renderers.Remove(prefab);
             s_live.Remove(prefab);
+            s_stateful.Remove(prefab);
         }
 
         // Live prefabs, with the first component that makes each one live; record prefabs map to null
         private static readonly Dictionary<Prefab, string?> s_live = new();
+
+        // Record prefabs with a component that keeps state of its own (IRecordState)
+        private static readonly HashSet<Prefab> s_stateful = new();
+
+        /// <summary>A record prefab with state of its own (an <see cref="IRecordState"/> component anywhere in it): its
+        /// records have ids, and what changed is kept in <see cref="WorldState"/> while their cells are away.</summary>
+        public static bool IsStateful(Prefab prefab)
+        {
+            if (!s_live.ContainsKey(prefab)) Of(prefab);
+            return s_stateful.Contains(prefab);
+        }
 
         /// <summary>
         /// Why a prefab must be an entity wherever it is placed (the type of the first component that is neither drawn,
@@ -123,9 +135,10 @@ namespace Freefall.World
             return s_live.GetValueOrDefault(prefab);
         }
 
-        /// <summary>A component a record stands for: drawn, solid or blocking the navmesh, or marked as needing no copy far away.</summary>
+        /// <summary>A component a record stands for: drawn, solid or blocking the navmesh, marked as needing no copy far away,
+        /// or keeping state of its own that waits in <see cref="WorldState"/> while its cell is away.</summary>
         internal static bool IsRecordComponent(Component c) =>
-            c is Transform or MeshRenderer or Collider or NavMeshBlocker
+            c is Transform or MeshRenderer or Collider or NavMeshBlocker or IRecordState
             || c is RigidBody { IsStatic: true }
             || c.GetType().IsDefined(typeof(CellRecordAttribute), true);
 
@@ -138,16 +151,21 @@ namespace Freefall.World
             var root = prefab.Instantiate();
             if (root != null)
             {
-                // Live: anything a record does not stand for, anywhere in the prefab
+                // Live: anything a record does not stand for, anywhere in the prefab; stateful: a component that keeps state
                 var stack = new Stack<Transform>();
                 stack.Push(root.Transform);
+                bool stateful = false;
                 while (stack.Count > 0 && live == null)
                 {
                     var t = stack.Pop();
                     foreach (var c in t.Entity.Components)
+                    {
                         if (!IsRecordComponent(c)) { live = c.GetType().Name; break; }
+                        stateful |= c is IRecordState;
+                    }
                     for (int i = 0; i < t.Count; i++) stack.Push(t.GetChild(i));
                 }
+                if (stateful && live == null) s_stateful.Add(prefab);
 
                 foreach (var r in root.GetComponentsInChildren<MeshRenderer>())
                 {

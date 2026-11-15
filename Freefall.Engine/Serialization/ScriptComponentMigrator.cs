@@ -43,6 +43,7 @@ namespace Freefall.Serialization
             public int Index;
             public ulong UID;
             public string Yaml;
+            public string? RecordState;   // IRecordState.Save() as YAML, when it had changed
             public readonly Dictionary<string, (Type Type, object Value)> Direct = new();
             public readonly HashSet<string> Applied = new();  // Direct members actually set on New
             public Component New;
@@ -114,6 +115,14 @@ namespace Freefall.Serialization
             catch (Exception ex)
             {
                 Debug.LogWarning("ScriptReload", $"{type.Name} on '{entity.Name}': serialize failed ({ex.Message}); only engine-typed members are carried over");
+            }
+
+            // State a component keeps outside its serialized members (a world cells record's: a worked tree), in its own
+            // words, as WorldState keeps it while its cell is away
+            if (component is Freefall.World.IRecordState state)
+            {
+                try { if (state.Changed) entry.RecordState = Freefall.World.WorldState.Write(state.Save()); }
+                catch (Exception ex) { Debug.LogWarning("ScriptReload", $"{type.Name} on '{entity.Name}': its state could not be kept ({ex.Message})"); }
             }
 
             if (!_oldMembers.TryGetValue(type.FullName, out var members))
@@ -267,6 +276,17 @@ namespace Freefall.Serialization
             ResolveAssetStubs(newToEntry);
             if (oldToNew.Count > 0)
                 RemapReferences(oldToNew);
+
+            // Kept state back into the new classes (IRecordState), read from its YAML
+            foreach (var entry in _entries)
+            {
+                if (entry.RecordState == null || entry.New is not Freefall.World.IRecordState state) continue;
+                try
+                {
+                    if (Freefall.World.WorldState.Read(entry.RecordState) is { } kept) state.Load(kept);
+                }
+                catch (Exception ex) { Debug.LogWarning("ScriptReload", $"{entry.TypeName} on '{entry.Entity.Name}': its state could not be put back ({ex.Message})"); }
+            }
 
             foreach (var (typeName, members) in dropped)
             {

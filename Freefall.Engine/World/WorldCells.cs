@@ -83,6 +83,7 @@ namespace Freefall.World
             public float CullTerm;              // its renderers' largest radius / LODCullScreenSize: × scale × LODScale × √FoVFactor = where the GPU stops drawing it; 0 = never
             public float MaxScale;              // its placements' largest axis scale (in the output frame)
             public bool Coarse;                 // the ring is where its coarsest LOD starts, which its far form draws as it is
+            public bool Stateful;               // its prefab keeps state of its own (IRecordState): its records have ids
         }
 
         internal sealed class Owner
@@ -103,6 +104,8 @@ namespace Freefall.World
             public bool Open;                   // between Begin and End
             public int Generation;              // a far build of an earlier generation is dropped
             public float MaxRing;               // the farthest any of its kinds reaches (from + band)
+            public int StatefulRecords;         // records with an id (their prefab keeps state)
+            public Dictionary<int, ulong>? IdOverrides;   // ids of records that stand on the spot of an earlier one of the same prefab
 
             public Entity? FarEntity;
             public Mesh? FarMesh;
@@ -134,6 +137,7 @@ namespace Freefall.World
             public bool Gone;                           // its owner ran again or was cleared
             public bool Near;                           // a viewer within A: its entities
             public Entity? Spawned;
+            public List<(Entity Copy, int Record)>? Stateful;   // its copies that keep state, while it is spawned
             public int Stamp;                           // the look that last visited it
         }
 
@@ -230,7 +234,7 @@ namespace Freefall.World
             if (!o.KindIndex.TryGetValue(key, out int index))
             {
                 index = o.Kinds.Count;
-                o.Kinds.Add(new Kind { Prefab = prefab, RingSet = kindRing, Far = kindFar, CullTerm = CullTermOf(prefab) });
+                o.Kinds.Add(new Kind { Prefab = prefab, RingSet = kindRing, Far = kindFar, CullTerm = CullTermOf(prefab), Stateful = PrefabShapes.IsStateful(prefab) });
                 o.KindIndex[key] = index;
             }
             o.Kinds[index].MaxScale = MathF.Max(o.Kinds[index].MaxScale, MathF.Max(MathF.Abs(scale.X), MathF.Max(MathF.Abs(scale.Y), MathF.Abs(scale.Z))));
@@ -303,6 +307,7 @@ namespace Freefall.World
         {
             if (!s_owners.TryGetValue(owner.UID, out var o) || !o.Open) return;
             o.Open = false;
+            if (o.Alive) AssignIds(o);
             if (!o.Alive || o.Records.Count == 0)
             {
                 if (o.Records.Count == 0 && o.Live.Count == 0) s_owners.Remove(o.Uid);
@@ -361,6 +366,123 @@ namespace Freefall.World
             if (merges) FarBuilder.Start(o, shapes);
         }
 
+        // ── Records with state (IRecordState, WorldState) ──
+
+        /// <summary>
+        /// A record's id: its owner's UID, its prefab's GUID and its position (in the owner's output frame) to the millimetre,
+        /// so a re-run that places it again gives it the same id, and one stray point does not shift the others'. A record on
+        /// the spot of an earlier one of the same prefab gets a counter (<see cref="AssignIds"/>).
+        /// </summary>
+        internal static ulong IdOf(Owner o, int record)
+        {
+            if (o.IdOverrides != null && o.IdOverrides.TryGetValue(record, out ulong id)) return id;
+            var r = o.Records[record];
+            var prefab = o.Kinds[r.Kind].Prefab;
+            ulong h = Fnv(14695981039346656037UL, o.Uid);
+            foreach (char c in string.IsNullOrEmpty(prefab.Guid) ? prefab.Name ?? "" : prefab.Guid) h = (h ^ c) * 1099511628211UL;
+            h = Fnv(h, (ulong)(long)Math.Round(r.Position.X * 1000.0));
+            h = Fnv(h, (ulong)(long)Math.Round(r.Position.Y * 1000.0));
+            return Fnv(h, (ulong)(long)Math.Round(r.Position.Z * 1000.0));
+        }
+
+        private static ulong Fnv(ulong h, ulong v)
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                h ^= (v >> (i * 8)) & 0xFF;
+                h *= 1099511628211UL;
+            }
+            return h;
+        }
+
+        // The ids of the owner's records with state, a counter for those on the spot of an earlier one; what was kept for
+        // records that are no longer placed (their placements moved, re-iding them) goes and is counted in the log
+        private static void AssignIds(Owner o)
+        {
+            o.IdOverrides = null;
+            o.StatefulRecords = 0;
+            bool any = false;
+            foreach (var k in o.Kinds) any |= k.Stateful;
+            if (!any && WorldState.CountOf(o.Uid) == 0) return;
+            var ids = new HashSet<ulong>();
+            int twins = 0;
+            for (int i = 0; i < o.Records.Count; i++)
+            {
+                if (!o.Kinds[o.Records[i].Kind].Stateful) continue;
+                ulong id = IdOf(o, i);
+                if (!ids.Add(id))
+                {
+                    ulong n = 1, other;
+                    do other = Fnv(id, n++); while (!ids.Add(other));
+                    (o.IdOverrides ??= new())[i] = other;
+                    twins++;
+                }
+            }
+            o.StatefulRecords = ids.Count;
+            if (twins > 0)
+                Debug.LogWarning("WorldCells", $"'{o.Name}': {twins} placements with state stand on the spot of another of the same prefab; they are told apart by their order");
+            int orphans = WorldState.Prune(o.Uid, ids);
+            if (orphans > 0)
+                Debug.LogWarning("WorldCells", $"'{o.Name}': what was kept of {orphans} placements is gone: they are no longer placed where they were (an outline or the graph changed)");
+        }
+
+        private static readonly List<IRecordState> s_states = new();
+
+        // The copy's components that keep state, in the copy's own order (the same for every copy of one prefab)
+        private static void StatesOf(Entity copy, List<IRecordState> into)
+        {
+            into.Clear();
+            var stack = new Stack<Transform>();
+            stack.Push(copy.Transform);
+            while (stack.Count > 0)
+            {
+                var t = stack.Pop();
+                if (t.Entity != null)
+                    foreach (var c in t.Entity.Components)
+                        if (c is IRecordState s) into.Add(s);
+                for (int i = t.Count - 1; i >= 0; i--) stack.Push(t.GetChild(i));
+            }
+        }
+
+        // A copy just made reads what its record kept
+        private static void LoadState(Owner o, Entity copy, int record)
+        {
+            if (!WorldState.TryGet(IdOf(o, record), out var states)) return;
+            StatesOf(copy, s_states);
+            for (int k = 0; k < s_states.Count && k < states.Length; k++)
+            {
+                if (states[k] == null) continue;
+                try { s_states[k].Load(states[k]!); }
+                catch (Exception ex) { Debug.LogWarning("WorldCells", $"{s_states[k].GetType().Name}.Load on '{copy.Name}' threw: {ex.Message}"); }
+            }
+            s_states.Clear();   // script components: held here they would keep a reloaded script assembly from unloading
+        }
+
+        // The slice's copies are about to go: what changed is kept, what is back to its prefab's is let go of
+        private static void KeepState(Slice slice)
+        {
+            if (slice.Stateful == null) return;
+            var o = slice.Owner;
+            foreach (var (copy, record) in slice.Stateful)
+            {
+                StatesOf(copy, s_states);
+                object?[]? kept = null;
+                for (int k = 0; k < s_states.Count; k++)
+                {
+                    try
+                    {
+                        if (s_states[k].Changed) (kept ??= new object?[s_states.Count])[k] = s_states[k].Save();
+                    }
+                    catch (Exception ex) { Debug.LogWarning("WorldCells", $"{s_states[k].GetType().Name}.Save on '{copy.Name}' threw: {ex.Message}"); }
+                }
+                ulong id = IdOf(o, record);
+                if (kept != null) WorldState.Put(id, o.Uid, kept);
+                else WorldState.Remove(id);
+            }
+            s_states.Clear();   // script components: held here they would keep a reloaded script assembly from unloading
+            slice.Stateful = null;
+        }
+
         /// <summary>Everything the owner placed goes: its cells' entities, instances, far form and records.</summary>
         public static void Clear(Component owner)
         {
@@ -406,6 +528,7 @@ namespace Freefall.World
                 slice.Gone = true;
                 if (slice.Spawned != null)
                 {
+                    KeepState(slice);   // a re-run that places them again finds it under the same ids
                     s_spawned.Remove(slice.Spawned);
                     if (!slice.Spawned.IsBeingDestroyed) slice.Spawned.Destroy();
                 }
@@ -528,12 +651,18 @@ namespace Freefall.World
             foreach (int i in slice.Records)
             {
                 var r = o.Records[i];
-                var e = o.Kinds[r.Kind].Prefab.Instantiate();
+                var kind = o.Kinds[r.Kind];
+                var e = kind.Prefab.Instantiate();
                 if (e == null) continue;
                 e.Transform.Parent = root.Transform;
                 e.Transform.Position = r.Position;
                 e.Transform.Rotation = r.Rotation;
                 e.Transform.Scale = r.Scale;
+                if (kind.Stateful)
+                {
+                    (slice.Stateful ??= new()).Add((e, i));
+                    LoadState(o, e, i);
+                }
             }
             slice.Spawned = root;
             s_spawned.Add(root);
@@ -549,6 +678,7 @@ namespace Freefall.World
                 g.DropInstancesIn = -1;
                 if (g.InRing && g.Draws == null) draws += AddInstances(g);
             }
+            KeepState(slice);
             s_spawned.Remove(slice.Spawned);
             if (!slice.Spawned.IsBeingDestroyed) slice.Spawned.Destroy();
             slice.Spawned = null;
@@ -738,6 +868,8 @@ namespace Freefall.World
                 // Placements of live prefabs, made as entities at once, and the component types that made them live
                 live,
                 liveBecause = liveBecause.OrderByDescending(p => p.Value).Select(p => $"{p.Key}: {p.Value}").ToArray(),
+                // Records whose prefab keeps state (IRecordState), and how many of them have changed state kept (WorldState)
+                withState = new { records = s_owners.Values.Sum(o => o.StatefulRecords), kept = WorldState.Count },
                 cells = s_cells.Count,
                 slices,
                 groups,
