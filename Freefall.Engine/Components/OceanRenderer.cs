@@ -407,6 +407,10 @@ namespace Freefall.Components
             public Vector2 LipMapOrigin; // its corner (world xz)
             public uint LipSurfaceSRV;   // the smooth swell's displacement over the same texels (LipMap): xyz, w 1 = written
             public float _lipPad;
+            public uint RipplesSRV;      // Graphics.WaterRipples: the ripples round the camera (0 = still)
+            public float RipplesOriginX; // the ripple grid's corner (world xz) and the metres it spans
+            public float RipplesOriginZ;
+            public float RipplesSpan;
         }
 
         private const int GridSize = 128;
@@ -1085,6 +1089,10 @@ namespace Freefall.Components
                 LipMapSRV = lips ? _lipMap.Srv : 0,
                 LipMapOrigin = lipMapOrigin,
                 LipSurfaceSRV = lips ? _lipMap.SurfaceSrv : 0,
+                RipplesSRV = WaterRipples.Srv,
+                RipplesOriginX = WaterRipples.Origin.X,
+                RipplesOriginZ = WaterRipples.Origin.Y,
+                RipplesSpan = WaterRipples.Span,
             };
             _params.SetParameter("OceanData", data);
 

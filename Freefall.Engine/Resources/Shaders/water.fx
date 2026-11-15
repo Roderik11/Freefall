@@ -38,6 +38,7 @@ cbuffer PushConstants : register(b3)
 #include "sky_common.fx"
 #include "water_common.fx"
 #include "underwater.hlsli"
+#include "water_ripples.hlsli"
 // @RenderState(RenderTargets=1, CullMode=None)
 
 // Must match WaterBody.WaterData (C#)
@@ -76,6 +77,9 @@ struct WaterData
     uint NearestDepthMips;
     uint SceneColourSRV;        // Graphics.WaterReflections: the composite snapshot averaged, half size and down
     uint SceneColourMips;
+    uint RipplesSRV;            // Graphics.WaterRipples: the ripples round the camera (water_ripples.hlsli); 0 = still
+    float2 RipplesOrigin;       // the ripple grid's corner (world xz)
+    float RipplesSpan;          // metres it spans
 };
 
 SamplerState WaterSampler : register(s0);
@@ -233,6 +237,8 @@ float WaterNearest(WaterData water, int2 cell, int level, int2 fullSize)
 // something (olive: past something nearer), red stood in for what something nearer hid, blue reached the sky on the
 // screen, grey left the screen, yellow ran out of steps, magenta met the sky
 #define WATER_TRACE_DEBUG 0
+// RIPPLE_DEBUG 1 draws the ripples round the camera (WaterRipples): red up, blue down (±1 cm full), green their slope
+#define RIPPLE_DEBUG 0
 static float3 WaterTraceDebug = 0;
 
 // A clip-space place as full-size pixels and 1 / view depth (affine on the screen)
@@ -587,6 +593,11 @@ PSOutput PS(VSOutput input, bool front : SV_IsFrontFace)
         resolvedTotal = WaterBandTotalVariance(slopeTex, WaterSampler, water.BandA, scale)
                       + WaterBandTotalVariance(slopeTex, WaterSampler, water.BandB, scale);
     }
+    // What moves in the water round the camera ripples it (WaterRipples): rings, wakes, the steps of a wader
+    float rippleHeight;
+    float2 ripple = RippleSlope(water.RipplesSRV, water.RipplesOrigin, water.RipplesSpan, worldPos.xz, rippleHeight);
+    slopes.mean += ripple;
+    calm.mean += ripple;
     float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));
     float unresolved = WaterUnresolvedVariance(resolvedTotal);
     float alpha = WaterAlpha(slopes, unresolved);
@@ -675,6 +686,10 @@ PSOutput PS(VSOutput input, bool front : SV_IsFrontFace)
     // White water where the surface runs steeply downhill
     // (kept below full coverage so the cell texture always breaks it up into streaks of dark water)
     coverage += smoothstep(0.04, 0.3, steep) * 0.68 * water.RapidsFoam;
+
+    // Churned where the ripples are steep: a swimmer's strokes, a splash; not the rings of one treading water (their
+    // slopes reach ~0.25 at the body: from 0.25 they made a white rim round it)
+    coverage += smoothstep(0.45, 0.9, length(ripple)) * 0.6;
     coverage = saturate(coverage);
 
     float foamTex = 0.5;
@@ -762,6 +777,10 @@ PSOutput PS(VSOutput input, bool front : SV_IsFrontFace)
     output.Color = float4(color, 1.0);
 #if WATER_TRACE_DEBUG
     output.Color = float4(WaterTraceDebug * 0.6, 1.0);
+#endif
+#if RIPPLE_DEBUG
+    if (water.RipplesSRV != 0)
+        output.Color = float4(saturate(rippleHeight * 50.0 + 0.5), saturate(length(ripple) * 2.0), saturate(-rippleHeight * 50.0 + 0.5), 1.0);
 #endif
     return output;
 }

@@ -45,7 +45,8 @@ struct UnderwaterFrame
     uint ProbeCount;
     uint OceanData;         // StructuredBuffer<OceanData> of this frame (OceanRenderer.SurfDataSrv); 0 = no sea
     uint LinearDepthSrv;    // the opaque scene's view depth (0 = sky): where the full depth is nearer, the water was drawn
-    uint3 _pad;
+    float Shafts;           // EngineSettings.UnderwaterShafts
+    uint2 _pad;
 };
 
 // ── The sea at a place ──
@@ -134,6 +135,17 @@ float Caustics(float2 p, float t)
     return 0.8 * (a + b) + 1.5 * a * b;
 }
 #define CAUSTICS_MEAN 0.2
+
+// ── Light shafts: the same focusing seen in the water itself. Down through the water the net blurs (the rays from each
+// focus spread), so the shafts are the caustics' cells wider and softer, sampled at points along the view ray where the
+// sunlight that reaches them came in, each lit as the daylight there is and seen through the water up to it ──
+#define SHAFT_STEPS 6           // 10 cost 0.48 ms at 1618 × 1249 (the pass without them 0.085)
+#define SHAFT_MEAN 0.27
+#define SHAFT_GAIN 0.08
+float ShaftField(float2 p, float t)
+{
+    return exp(-6.0 * CausticCells(CausticWarp(p / 2.6, t * 0.5), t * 0.4));   // narrower cells average out along a ray
+}
 
 [numthreads(8, 8, 1)]
 void CSUnderwater(uint3 id : SV_DispatchThreadID)
@@ -240,6 +252,29 @@ void CSUnderwater(uint3 id : SV_DispatchThreadID)
     float3 T = WaterTransmittance(dist, f.ShallowColor, f.Visibility);
     float3 fog = WaterInscatter(f.WaterColor, sunRadiance, f.SunUp, sky, midDepth, dir, f.ShallowColor, f.Visibility);
     color = color * T + fog * (1.0 - T);
+
+    // The shafts: brighter and darker than the water's mean glow along the way, more so looking toward the sun (light
+    // in water scatters mostly forward)
+    if (f.Shafts > 0.0 && f.SunUp > 0.02)
+    {
+        float reach = min(dist, 2.0 * f.Visibility);
+        float jitter = frac(52.9829189 * frac(dot(float2(id.xy), float2(0.06711056, 0.00583715))));
+        float3 shaft = 0;
+        [loop]
+        for (uint k = 0; k < SHAFT_STEPS; k++)
+        {
+            float t = (k + jitter) / SHAFT_STEPS * reach;
+            float3 p = dir * t;
+            float depthHere = max(0.0, rise + dot(slope, p.xz) - p.y);
+            float2 entered = (p + CamPos).xz + depthHere * L.xz / max(L.y, 0.25);
+            float3 seen = WaterTransmittance(t, f.ShallowColor, f.Visibility) * WaterDaylightAt(depthHere, f.ShallowColor, f.Visibility);
+            shaft += seen * (ShaftField(entered, Time) - SHAFT_MEAN);
+        }
+        float toward = saturate(dot(dir, L));
+        float phase = 0.4 + 2.0 * toward * toward * toward;
+        float3 hue = sqrt(f.WaterColor / max(max(f.WaterColor.r, max(f.WaterColor.g, f.WaterColor.b)), 1e-4));
+        color += hue * sunRadiance * shaft * (reach / SHAFT_STEPS) * (f.Shafts * SHAFT_GAIN * phase) * smoothstep(0.02, 0.15, f.SunUp);
+    }
 
     color *= 1.0 - 0.5 * meniscus;
     composite[id.xy] = float4(max(color, 0.0), here.a);

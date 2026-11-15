@@ -66,6 +66,9 @@ struct OceanData
     float2 LipMapOrigin;        // its corner (world xz)
     uint LipSurfaceSRV;         // the smooth swell's displacement over the same texels (LipSurfaceAt): xyz, w 1 = written
     float _lipPad;
+    uint RipplesSRV;            // Graphics.WaterRipples: the ripples round the camera (water_ripples.hlsli); 0 = still
+    float2 RipplesOrigin;       // the ripple grid's corner (world xz)
+    float RipplesSpan;          // metres it spans
 };
 
 SamplerState OceanSampler : register(s0);

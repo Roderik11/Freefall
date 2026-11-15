@@ -490,6 +490,9 @@ namespace Freefall.Graphics
             // pre-exposes its light with it
             AutoExposure.Update();
 
+            // The ripples round the camera, stepped once a tick while something stirs the water (read by the water's draws)
+            WaterRipples.Step(list, camera.Position);
+
             // 1. G-Buffer Pass (includes shadow rendering internally)
             using (_gbufferMarker.Auto())
                 FillGBuffer(camera, list);

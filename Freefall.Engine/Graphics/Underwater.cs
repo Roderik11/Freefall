@@ -32,7 +32,9 @@ namespace Freefall.Graphics
             public Vector3 SunDirection; public float SunUp;                       // the light's way (from the sun) and how high it stands
             public Vector3 SunColor; public float SunIntensity;
             public uint DepthSrv, NormalsSrv, ProbeCount, OceanData;
-            public uint LinearDepthSrv, Pad0, Pad1, Pad2;                          // the opaque scene's view depth: what is not water
+            public uint LinearDepthSrv;                                            // the opaque scene's view depth: what is not water
+            public float Shafts;                                                   // EngineSettings.UnderwaterShafts
+            public uint Pad1, Pad2;
         }
 
         private const int FrameCount = 3;
@@ -98,6 +100,10 @@ namespace Freefall.Graphics
                 : eye.Y < surface.Height + 0.3f);
             CameraUnder = near && eye.Y < surface.Height;
 
+            // The world's sounds as through water while the eye is under (Engine.Muffled), eased over about a tenth of a second
+            float muffled = Engine.Muffled + ((CameraUnder ? 1f : 0f) - Engine.Muffled) * MathF.Min(1f, Base.Time.SmoothDelta * 10f);
+            Engine.Muffled = MathF.Abs(muffled - (CameraUnder ? 1f : 0f)) < 0.01f ? (CameraUnder ? 1f : 0f) : muffled;
+
             // The places to measure the sea at: the camera's (when it is at sea), then the swimmers'
             Span<Vector2> watched = stackalloc Vector2[Water.SeaProbes];
             int watchedCount = Water.TakeWatched(watched);
@@ -159,6 +165,7 @@ namespace Freefall.Graphics
                 ProbeCount = (uint)probes,
                 OceanData = ocean?.SurfDataSrv ?? 0u,
                 LinearDepthSrv = linearDepth.BindlessIndex,
+                Shafts = Engine.Settings.UnderwaterShafts,
             };
 
             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });

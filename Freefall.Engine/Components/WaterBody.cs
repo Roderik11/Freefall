@@ -248,6 +248,10 @@ namespace Freefall.Components
             public uint NearestDepthMips;
             public uint SceneColourSRV;     // WaterReflections: the composite snapshot as a pyramid, half size and down
             public uint SceneColourMips;
+            public uint RipplesSRV;        // Graphics.WaterRipples: the ripples round the camera (0 = still)
+            public float RipplesOriginX;   // the ripple grid's corner (world xz) and the metres it spans
+            public float RipplesOriginZ;
+            public float RipplesSpan;
         }
 
         protected override void Awake()
@@ -1504,6 +1508,10 @@ namespace Freefall.Components
                 NearestDepthMips = reflections?.NearestDepthMips ?? 0u,
                 SceneColourSRV = reflections?.ColourSrv ?? 0u,
                 SceneColourMips = reflections?.ColourMipCount ?? 0u,
+                RipplesSRV = WaterRipples.Srv,
+                RipplesOriginX = WaterRipples.Origin.X,
+                RipplesOriginZ = WaterRipples.Origin.Y,
+                RipplesSpan = WaterRipples.Span,
             });
 
             CommandBuffer.Enqueue(mesh, _material, _params, Transform.TransformSlot);

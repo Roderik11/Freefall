@@ -1,6 +1,7 @@
 #include "ocean_patch.hlsli"
 #include "ocean_shade.hlsli"
 #include "underwater.hlsli"
+#include "water_ripples.hlsli"
 // Both faces: from under the sea its surface is seen from below (PS, Snell's window). A back face seen from above is a
 // crest folded over itself and is dropped, as the culling did before
 // @RenderState(RenderTargets=1, CullMode=None)
@@ -188,6 +189,11 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
         slopes.mean *= capSlope;
         slopes.variance *= capSlope * capSlope;
     }
+
+    // What moves in the water round the camera ripples it (WaterRipples): rings, wakes, the steps of a wader
+    float rippleHeight;
+    float2 ripple = RippleSlope(ocean.RipplesSRV, ocean.RipplesOrigin, ocean.RipplesSpan, worldPos.xz, rippleHeight);
+    slopes.mean += ripple;
 
     float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));
     // In the surf the swell's slopes, steepened through the shore's warp, can face away from a low eye on water it sees
@@ -495,6 +501,7 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
     float surfNear = surfMass.cover;
     foam = max(foam, lerp(surfNear, surfFoam, foamFar));
     foam = max(foam, streakFoam * (1.0 - foamFar));   // the web of thinning foam
+    foam = max(foam, smoothstep(0.45, 0.9, length(ripple)) * 0.6 * (1.0 - foamFar));   // churned by strokes (water.fx)
     float thickness = saturate(max(coverage, surfFoam));
 
     // Always feather the last few centimeters of water: whatever the foam pattern, it must not end

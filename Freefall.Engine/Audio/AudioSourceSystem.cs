@@ -571,12 +571,14 @@ namespace Freefall.Audio
                 other.Native.DestroyVoice();
                 other.Native.Dispose();
                 other.Native = Engine.AudioDevice.CreateSourceVoice(format, false);
+                ToWorld(other.Native);
                 other.Format = format;
                 return other;
             }
 
             if (_voices.Count >= MaxVoices) return null;
             var made = new Voice { Native = Engine.AudioDevice.CreateSourceVoice(format, false), Format = format };
+            ToWorld(made.Native);
             _voices.Add(made);
             return made;
         }
@@ -707,6 +709,14 @@ namespace Freefall.Audio
             float edge = Edge(source.HeardWithin, away);
             voice.Native.SetFrequencyRatio(pitch, 0);
             voice.Native.SetVolume(source.Volume * Share(source) * voice.Fade * edge);
+        }
+
+        // A voice of the world's into the world's submix (Engine.WorldVoice: muffled under water), not the speakers
+        private static void ToWorld(IXAudio2SourceVoice voice)
+        {
+            var world = Engine.WorldVoice;
+            if (world == null) return;
+            voice.SetOutputVoices(new[] { new VoiceSendDescriptor { OutputVoice = world } });   // once per voice made
         }
 
         private static bool SameFormat(WaveFormat a, WaveFormat b)

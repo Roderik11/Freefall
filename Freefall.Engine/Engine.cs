@@ -44,6 +44,61 @@ namespace Freefall
         private static float _masterVolume = 1f;
 
         /// <summary>
+        /// The submix every sound of the world plays through (AudioSourceSystem's voices), so that it can be heard as from
+        /// under water (<see cref="Muffled"/>); music (AudioStream) goes to the speakers straight. Null without audio.
+        /// </summary>
+        public static IXAudio2Voice? WorldVoice => _worldVoice;
+        private static IXAudio2SubmixVoice? _worldVoice;
+        private static uint _worldSampleRate = 48000;
+
+        /// <summary>
+        /// How far the world's sounds are heard as through water, 0..1 (Graphics.Underwater, with the camera's eye under
+        /// the surface): a low-pass on the world's submix closing to <see cref="MuffledCutoff"/> Hz and the level down to
+        /// <see cref="MuffledLevel"/>. Set it every frame: it eases itself only through what it is set to.
+        /// </summary>
+        public static float Muffled
+        {
+            get => _muffled;
+            set
+            {
+                value = Math.Clamp(value, 0f, 1f);
+                if (value == _muffled || _worldVoice == null) { _muffled = value; return; }
+                _muffled = value;
+                float open = XAudio2.MaximumFilterFrequency;
+                float closed = MathF.Min(open, 2f * MathF.Sin(MathF.PI * MuffledCutoff / _worldSampleRate));
+                // Even in the filter's own measure (radians), so the change sounds steady
+                _worldVoice.SetFilterParameters(new FilterParameters
+                {
+                    Type = FilterType.LowPassFilter,
+                    Frequency = open + (closed - open) * value,
+                    OneOverQ = 1f,
+                }, 0u);
+                _worldVoice.SetVolume(1f + (MuffledLevel - 1f) * value);
+            }
+        }
+        private static float _muffled;
+
+        /// <summary>The low-pass's cutoff fully under water (Hz): what water lets through of the air's sounds.</summary>
+        public const float MuffledCutoff = 450f;
+
+        /// <summary>The world's level fully under water: muffled and quieter.</summary>
+        public const float MuffledLevel = 0.6f;
+
+        // The world's submix, made with the mastering voice: its sample rate, two channels (AudioSourceSystem pans to two),
+        // and a filter of its own
+        private static void CreateWorldVoice()
+        {
+            _worldVoice?.DestroyVoice();
+            _worldVoice?.Dispose();
+            _worldVoice = null;
+            if (AudioDevice == null || _masteringVoice == null) return;
+            _worldSampleRate = _masteringVoice.VoiceDetails.InputSampleRate;
+            _worldVoice = AudioDevice.CreateSubmixVoice(2, _worldSampleRate, SubmixVoiceFlags.UseFilter);
+            _muffled = -1f;
+            Muffled = 0f;
+        }
+
+        /// <summary>
         /// Where the game keeps what belongs to the player on this computer (its options, later saved games). The player
         /// sets it: %LOCALAPPDATA%\&lt;Product&gt;, beside player.log. Null in the editor, whose play sessions keep nothing.
         /// </summary>
@@ -184,6 +239,7 @@ namespace Freefall
             AudioDevice = XAudio2.XAudio2Create(ProcessorSpecifier.DefaultProcessor, true);
             _masteringVoice = AudioDevice.CreateMasteringVoice();
             _masteringVoice.SetVolume(_masterVolume);
+            CreateWorldVoice();
             Audio3D = new X3DAudio(Speakers.FrontLeft | Speakers.FrontRight);
             Debug.Log("[Engine] XAudio2 + X3DAudio initialized");
             
@@ -244,6 +300,7 @@ namespace Freefall
             AudioDevice = XAudio2.XAudio2Create(ProcessorSpecifier.DefaultProcessor, true);
             _masteringVoice = AudioDevice.CreateMasteringVoice();
             _masteringVoice.SetVolume(_masterVolume);
+            CreateWorldVoice();
             Audio3D = new X3DAudio(Speakers.FrontLeft | Speakers.FrontRight);
             Debug.Log(editor ? "[Engine] Initialized (editor mode)" : "[Engine] Initialized (game)");
             IsEditor = editor;
@@ -616,6 +673,7 @@ namespace Freefall
 
             Assets?.Dispose();
             Done("assets");
+            _worldVoice?.Dispose();
             _masteringVoice?.Dispose();
             AudioDevice?.Dispose();
             Done("audio");
@@ -911,6 +969,18 @@ namespace Freefall
          [ValueRange(0f, 2f)]
          [System.ComponentModel.Description("Caustics under water: how strongly the sunlight focused by the waves plays over things below the surface (0 = none)")]
          public float UnderwaterCaustics { get; set; } = 0.8f;
+
+         /// <summary>Under water, the sunlight's shafts from the surface down through the water (underwater_cs.hlsl): 0 = none.</summary>
+         [ValueRange(0f, 2f)]
+         [System.ComponentModel.Description("Light shafts under water: how strongly the sunlight shows in the water itself, in shafts from the rippled surface (0 = none)")]
+         public float UnderwaterShafts { get; set; } = 1f;
+
+         /// <summary>
+         /// Ripples round the camera on lakes, rivers and the sea (Graphics.WaterRipples): what moves in the water stirs them
+         /// (swimmers, waders), into rings and wakes. Off, the water takes no notice of what goes through it.
+         /// </summary>
+         [System.ComponentModel.Description("Ripples on the water round the camera: swimmers and waders leave rings and wakes")]
+         public bool WaterRipples { get; set; } = true;
 
          [ValueRange(0.5f, 4f)]
          public float GTAOPower{ get; set; } = 1.5f;                       // Visibility exponent (higher = darker)
