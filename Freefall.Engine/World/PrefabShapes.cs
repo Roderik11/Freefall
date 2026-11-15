@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using Freefall.Assets;
+using Freefall.Base;
 using Freefall.Components;
 using Freefall.Graphics;
 
@@ -46,7 +47,47 @@ namespace Freefall.World
             public Mesh Mesh = null!;
             public Matrix4x4 ToRoot;
             public (int Part, Material Material)[] Chains = Array.Empty<(int, Material)>();
+
+            /// <summary>The local matrices from the renderer's entity up to the root's child (the root's own is the
+            /// placement's): a copy's world matrix is made from them level by level, as Transform.Matrix makes it, so a
+            /// record's renderer has exactly the matrix its entity would have (<see cref="WorldOf"/>). Empty: on the root.</summary>
+            public Matrix4x4[] Chain = Array.Empty<Matrix4x4>();
+
+            /// <summary>Drawn: the renderer is enabled.</summary>
+            public bool Enabled;
+
+            /// <summary>Static for the navmesh bake: no RigidBody on it or above it in the prefab, or a static one.</summary>
+            public bool Static;
+
+            /// <summary>Under a NavMeshBlocker in the prefab: the bake clears the navmesh over and round it.</summary>
+            public bool Blocks;
+
+            /// <summary>Where it reaches its coarsest LOD: its radius × LODBias × its scale in the prefab over the coarsest
+            /// LOD's screen size; × the placement's scale × LODScale × √FoVFactor = the distance (as cull_instances.hlsl
+            /// switches). 0 = no LOD chain: it looks the same at every distance.</summary>
+            public float CoarseTerm;
+
+            /// <summary>What its coarsest LOD (with the parts outside the chain) is made of: tree cards (a far forest or
+            /// merged cards can stand for them), CliffRock shells (a merged far mesh), anything else (no far form).</summary>
+            public bool CoarseCards, CoarseShells, CoarseOther;
+
+            /// <summary>Its world matrix in a copy whose root stands at <paramref name="rootWorld"/>, computed as the
+            /// engine's transforms compute it (local × parent's world, level by level), to the bit.</summary>
+            public Matrix4x4 WorldOf(in Matrix4x4 rootWorld)
+            {
+                var m = rootWorld;
+                for (int i = Chain.Length - 1; i >= 0; i--) m = Chain[i] * m;
+                return m;
+            }
         }
+
+        internal static float MaxAxisScale(in Matrix4x4 m) => MathF.Sqrt(MathF.Max(
+            new Vector3(m.M11, m.M12, m.M13).LengthSquared(),
+            MathF.Max(new Vector3(m.M21, m.M22, m.M23).LengthSquared(), new Vector3(m.M31, m.M32, m.M33).LengthSquared())));
+
+        // A transform's local matrix, as Transform.Matrix makes it
+        private static Matrix4x4 LocalMatrix(Transform t) =>
+            Matrix4x4.CreateScale(t.Scale) * Matrix4x4.CreateFromQuaternion(t.Rotation) * Matrix4x4.CreateTranslation(t.Position);
 
         private static readonly Dictionary<Prefab, Part[]> s_parts = new();
         private static readonly Dictionary<Prefab, Renderer[]> s_renderers = new();
@@ -66,22 +107,69 @@ namespace Freefall.World
         {
             s_parts.Remove(prefab);
             s_renderers.Remove(prefab);
+            s_live.Remove(prefab);
         }
+
+        // Live prefabs, with the first component that makes each one live; record prefabs map to null
+        private static readonly Dictionary<Prefab, string?> s_live = new();
+
+        /// <summary>
+        /// Why a prefab must be an entity wherever it is placed (the type of the first component that is neither drawn,
+        /// solid, nor marked <see cref="CellRecordAttribute"/>), or null: it is kept as a record.
+        /// </summary>
+        public static string? LiveBecause(Prefab prefab)
+        {
+            if (!s_live.ContainsKey(prefab)) Of(prefab);
+            return s_live.GetValueOrDefault(prefab);
+        }
+
+        /// <summary>A component a record stands for: drawn, solid or blocking the navmesh, or marked as needing no copy far away.</summary>
+        internal static bool IsRecordComponent(Component c) =>
+            c is Transform or MeshRenderer or Collider or NavMeshBlocker
+            || c is RigidBody { IsStatic: true }
+            || c.GetType().IsDefined(typeof(CellRecordAttribute), true);
 
         public static Part[] Of(Prefab prefab)
         {
             if (s_parts.TryGetValue(prefab, out var parts)) return parts;
             var list = new List<Part>();
             var renderers = new List<Renderer>();
+            string? live = null;
             var root = prefab.Instantiate();
             if (root != null)
             {
+                // Live: anything a record does not stand for, anywhere in the prefab
+                var stack = new Stack<Transform>();
+                stack.Push(root.Transform);
+                while (stack.Count > 0 && live == null)
+                {
+                    var t = stack.Pop();
+                    foreach (var c in t.Entity.Components)
+                        if (!IsRecordComponent(c)) { live = c.GetType().Name; break; }
+                    for (int i = 0; i < t.Count; i++) stack.Push(t.GetChild(i));
+                }
+
                 foreach (var r in root.GetComponentsInChildren<MeshRenderer>())
                 {
                     var mesh = r.Mesh;
-                    if (mesh == null) continue;
-                    var toRoot = r.Transform?.WorldMatrix ?? Matrix4x4.Identity;   // the copy's root is at the origin
+                    if (mesh == null || r.Entity == null) continue;
                     Material? MaterialOf(int slot) => r.Materials.FirstOrDefault(m => m.MaterialSlot == slot)?.Material ?? r.Material;
+
+                    // Its place under the root, level by level; a body or blocker on its way up
+                    var chain = new List<Matrix4x4>();
+                    bool isStatic = true, bodyFound = false, blocks = false;
+                    for (var t = r.Transform; t != null; t = t.Parent)
+                    {
+                        var e = t.Entity;
+                        // The nearest body up decides, as the bake's GetComponentInParents does; above the root there is
+                        // only the cell's or the output's static body
+                        if (!bodyFound && e?.GetComponent<RigidBody>() is { } body) { bodyFound = true; isStatic = body.IsStatic; }
+                        if (e?.GetComponent<NavMeshBlocker>() is { Enabled: true }) blocks = true;
+                        if (t == root.Transform) break;
+                        chain.Add(LocalMatrix(t));
+                    }
+                    var renderer = new Renderer { Mesh = mesh, Chain = chain.ToArray(), Enabled = r.Enabled, Static = isStatic, Blocks = blocks };
+                    var toRoot = renderer.WorldOf(Matrix4x4.Identity);
 
                     var chains = new List<(int, Material)>();
                     foreach (int head in mesh.DrawPartIndices)
@@ -90,7 +178,32 @@ namespace Freefall.World
                         var material = MaterialOf(mesh.MeshParts[head].MaterialSlot);
                         if (material != null) chains.Add((head, material));
                     }
-                    if (chains.Count > 0) renderers.Add(new Renderer { Mesh = mesh, ToRoot = toRoot, Chains = chains.ToArray() });
+                    renderer.ToRoot = toRoot;
+                    renderer.Chains = chains.ToArray();
+                    renderers.Add(renderer);
+
+                    // Its coarsest LOD: where it starts, and what it is made of (the parts outside the chain draw at every
+                    // distance, so they count as well)
+                    var meshBox = mesh.BoundingBox;
+                    float radius = Vector3.Distance(meshBox.Max, (meshBox.Min + meshBox.Max) * 0.5f) * MaxAxisScale(toRoot);
+                    IEnumerable<int> coarseParts;
+                    if (mesh.LODs.Count > 1)
+                    {
+                        var coarsest = mesh.LODs[^1];
+                        if (coarsest.ScreenSize > 0f && coarsest.ScreenSize < float.MaxValue)
+                            renderer.CoarseTerm = radius * mesh.LODBias / coarsest.ScreenSize;
+                        coarseParts = coarsest.MeshPartIndices.Concat(mesh.NonLodPartIndices ?? Array.Empty<int>());
+                    }
+                    else coarseParts = Enumerable.Range(0, mesh.MeshParts.Count);
+                    foreach (int pi in coarseParts)
+                    {
+                        if (pi < 0 || pi >= mesh.MeshParts.Count || !mesh.MeshParts[pi].Enabled) continue;
+                        var kind = KindOf(MaterialOf(mesh.MeshParts[pi].MaterialSlot));
+                        if (kind == Kind.Card && mesh.CoarseUVs == null) kind = Kind.Skip;
+                        if (kind == Kind.Card) renderer.CoarseCards = true;
+                        else if (kind == Kind.Shell) renderer.CoarseShells = true;
+                        else renderer.CoarseOther = true;
+                    }
 
                     if (mesh.Positions == null || mesh.CpuIndices == null) continue;
                     var last = mesh.LODs.Count > 0 ? mesh.LODs[^1].MeshPartIndices : Enumerable.Range(0, mesh.MeshParts.Count).ToArray();
@@ -136,6 +249,7 @@ namespace Freefall.World
             parts = list.ToArray();
             s_parts[prefab] = parts;
             s_renderers[prefab] = renderers.ToArray();
+            s_live[prefab] = root == null ? "nothing (the prefab made no entity)" : live;
             return parts;
         }
     }

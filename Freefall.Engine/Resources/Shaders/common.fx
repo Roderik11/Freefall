@@ -74,6 +74,7 @@ cbuffer SceneConstants : register(b0)
     float FarTierFrom;                 // metres from the camera where merged far meshes start to take over from instances
     float FarTierBand;                 // over how many metres they dither into each other; 0 = no far tier
     float FarTierCell;                 // metres a side of a cell: the unit a far mesh's vertices and the instances fade by
+    uint FarTierProfilesIdx;           // StructuredBuffer<float2> (from, band) per profile (FarTier.ProfilesSrv); 0 = profile 0 only
 }
 
 // ── Large-scale variation of the ground and what grows on it (gputerrain.fx, grass cards, blades, flowers) ──
@@ -354,10 +355,24 @@ struct MeshPartEntry
 
 // InstanceDescriptor.MeshPartIdx: the part's index in its mesh is the low bits (only the low 8 are read, for picking);
 // this bit marks an instance of the far tier's near side (CommandBuffer.AddPersistent farTier), which gives way to the
-// merged far meshes past FarTierFrom
+// merged far meshes past its profile's distance (bits 8-13, FarTierProfileOfDraw)
 #define DRAW_FAR_TIER (1u << 31)
 
 // ── The far tier: instances near, merged far meshes past FarTierFrom, dithered into each other over FarTierBand ──
+// A draw's profile (Graphics.FarTier profiles) moves both: 0 = FarTierFrom and FarTierBand themselves.
+
+// The far tier profile of an instance (InstanceDescriptor.MeshPartIdx) and of a merged far mesh's part (MeshPartEntry.Flags)
+uint FarTierProfileOfDraw(uint meshPartIdx) { return (meshPartIdx >> 8u) & 63u; }
+uint FarTierProfileOfPart(uint flags) { return (flags >> 8u) & 63u; }
+
+// A profile's distance and band
+float2 FarTierProfile(uint profile)
+{
+    if (profile == 0u || FarTierProfilesIdx == 0u)
+        return float2(FarTierFrom, FarTierBand);
+    StructuredBuffer<float2> profiles = ResourceDescriptorHeap[FarTierProfilesIdx];
+    return profiles[profile];
+}
 
 // The centre of the cell a world point stands in
 float2 FarTierCellOf(float3 p)
@@ -366,19 +381,22 @@ float2 FarTierCellOf(float3 p)
 }
 
 // The far side's share of a cell, 0 (instances only) to 1 (the far mesh only), by the camera's level distance to it
-float FarTierShare(float2 cellCentre)
+float FarTierShare(float2 cellCentre, uint profile)
 {
-    if (FarTierBand <= 0.0)
+    float2 p = FarTierProfile(profile);
+    if (p.y <= 0.0)
         return 0.0;
-    return saturate((length(cellCentre - CamPos.xz) - FarTierFrom) / FarTierBand);
+    return saturate((length(cellCentre - CamPos.xz) - p.x) / p.y);
 }
+
+float FarTierShare(float2 cellCentre) { return FarTierShare(cellCentre, 0u); }
 
 // Whether a draw of the far tier shows in this cell (false: collapse the vertex), and the LodFadeClip word it draws
 // with: the far side on a share of the pixels, the near side on the rest of the same blue noise, so together they
 // cover each pixel once. 0 = every pixel.
-bool FarTierShows(float2 cellCentre, bool farSide, out uint fade)
+bool FarTierShows(float2 cellCentre, bool farSide, uint profile, out uint fade)
 {
-    uint share = (uint)(FarTierShare(cellCentre) * 127.0 + 0.5);
+    uint share = (uint)(FarTierShare(cellCentre, profile) * 127.0 + 0.5);
     fade = 0u;
     if (farSide)
     {
@@ -391,11 +409,15 @@ bool FarTierShows(float2 cellCentre, bool farSide, out uint fade)
     return true;
 }
 
+bool FarTierShows(float2 cellCentre, bool farSide, out uint fade) { return FarTierShows(cellCentre, farSide, 0u, fade); }
+
 // Shadows switch at half way, with no dither (as the LOD crossfade's)
-bool FarTierCasts(float2 cellCentre, bool farSide)
+bool FarTierCasts(float2 cellCentre, bool farSide, uint profile)
 {
-    return (FarTierShare(cellCentre) >= 0.5) == farSide;
+    return (FarTierShare(cellCentre, profile) >= 0.5) == farSide;
 }
+
+bool FarTierCasts(float2 cellCentre, bool farSide) { return FarTierCasts(cellCentre, farSide, 0u); }
 
 // The mesh vertex a mesh draw's vertex shader invocation shades. An indexed draw (InstanceBatch, the effect's push
 // constant IndexedDraw in slot 17 = 1) hands it over in SV_VertexID: the input assembler read the part's indices, and a

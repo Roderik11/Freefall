@@ -31,6 +31,11 @@ namespace Freefall.Graphics
         public int MaterialSlot;  // Index into MeshRenderer.Materials[]
         public BoundingBox BoundingBox;
         public Vector4 BoundingSphere; // Local-space bounding sphere (center.xyz, radius)
+
+        /// <summary>A merged far mesh's part (<see cref="Mesh.CellFade"/>): the far tier profile it takes over at
+        /// (<see cref="FarTier.ProfileFor"/>, MeshPartEntry.Flags bits 8-13); 0 = <see cref="FarTier.From"/>. Set before
+        /// the mesh is drawn.</summary>
+        public int FarProfile;
     }
 
     /// <summary>

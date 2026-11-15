@@ -126,10 +126,10 @@ VSOutput CardVertex(MeshPartEntry part, uint vertexID, row_major matrix World)
 
 // The far tier (common.fx FarTierShows) for a card of the tree at treeOrigin: false = collapse it, else its fade word
 // (0 = keep the LOD crossfade's)
-void FarTierCard(inout VSOutput output, float3 treeOrigin, bool farSide)
+void FarTierCard(inout VSOutput output, float3 treeOrigin, bool farSide, uint profile)
 {
     uint fade;
-    if (!FarTierShows(FarTierCellOf(treeOrigin), farSide, fade))
+    if (!FarTierShows(FarTierCellOf(treeOrigin), farSide, profile, fade))
         output.Position = float4(0.0, 0.0, 0.0, 1.0);
     else if (fade != 0u)
         output.LodFade = fade;
@@ -164,7 +164,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
         StructuredBuffer<float3> normals = ResourceDescriptorHeap[part.NormBufferIdx];
         float3 treeOrigin = (part.Flags & MESH_CARD_ORIGINS) != 0 ? mul(float4(normals[vertexID], 1.0f), World).xyz
                                                                   : float3(World._41, World._42, World._43);
-        FarTierCard(output, treeOrigin, farSide);
+        FarTierCard(output, treeOrigin, farSide, farSide ? FarTierProfileOfPart(part.Flags) : FarTierProfileOfDraw(desc.MeshPartIdx));
     }
     return output;
 }
@@ -187,8 +187,9 @@ VSOutput VS_FarForest(uint primitiveVertexID : SV_VertexID, uint instanceID : SV
     row_major matrix World = FarGrow(FarTreeWorld(tree), FarGrowOf(entry >> 24, 255u));
 
     VSOutput output = CardVertex(part, vertexID, World);
-    output.MaterialID = kinds[FarTreeKind(tree)].MaterialId;
-    FarTierCard(output, tree.Position, true);
+    FarKind kind = kinds[FarTreeKind(tree)];
+    output.MaterialID = kind.MaterialId;
+    FarTierCard(output, tree.Position, true, kind.Profile);
     return output;
 }
 
@@ -410,7 +411,8 @@ ShadowVSOutput ShadowVertex(uint primitiveVertexID, uint instanceID, bool local)
 
     // The far tier: the far mesh or the instances cast, switching at half way
     bool farSide = (part.Flags & MESH_CELL_FADE) != 0;
-    if ((farSide || (desc.MeshPartIdx & DRAW_FAR_TIER) != 0) && !FarTierCasts(FarTierCellOf(treeOrigin), farSide))
+    if ((farSide || (desc.MeshPartIdx & DRAW_FAR_TIER) != 0)
+        && !FarTierCasts(FarTierCellOf(treeOrigin), farSide, farSide ? FarTierProfileOfPart(part.Flags) : FarTierProfileOfDraw(desc.MeshPartIdx)))
         output.Position = float4(0.0, 0.0, 0.0, 1.0);
     return output;
 }

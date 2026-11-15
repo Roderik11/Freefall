@@ -137,6 +137,7 @@ namespace Freefall.Components
             // by DeferredRenderer right after this, before anything is drawn
             uint atmosphereIdx = Graphics.Atmosphere.PrepareFrame(cameraPos.Y);
             uint cloudParamsIdx = Graphics.Clouds.PrepareFrame(cameraPos);
+            uint farProfiles = Graphics.FarTier.ProfilesSrv(Engine.Device);
             float exposure = Graphics.Atmosphere.Exposure;
             float emissiveExposure = Graphics.Atmosphere.EmissiveExposure;
             float sunLightScale = Graphics.Atmosphere.SunLightScale;
@@ -182,6 +183,7 @@ namespace Freefall.Components
                 pair.Value.SetParameter("FarTierFrom", Graphics.FarTier.From);
                 pair.Value.SetParameter("FarTierBand", Graphics.FarTier.Band);
                 pair.Value.SetParameter("FarTierCell", Graphics.FarTier.CellSize);
+                pair.Value.SetParameter("FarTierProfilesIdx", farProfiles);
             }
         }
         

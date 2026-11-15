@@ -13,31 +13,48 @@ namespace Freefall.Editor.Commands
     [CommandRoute("GET", "/api/scene/fingerprint")]
     public class SceneFingerprintCommand : EditorCommand
     {
+        // Per top-level entity: meshes, exact and coarse sums
+        private sealed class Sum { public int Count; public ulong Exact, Coarse; }
+
         public override CommandResult Execute(CommandContext context)
         {
             var entities = new System.Collections.Generic.List<object>();
             int total = 0;
             ulong totalExact = 0, totalCoarse = 0;
+            var sums = new System.Collections.Generic.Dictionary<Entity, Sum>();
 
             foreach (var entity in EntityManager.Entities)
             {
                 if (entity.Transform?.Parent != null) continue;
+                var sum = new Sum();
+                Visit(entity.Transform, sum);
+                sums[entity] = sum;
+            }
 
-                int count = 0;
-                ulong exact = 0, coarse = 0;
-                Visit(entity.Transform, ref count, ref exact, ref coarse);
-                if (count == 0) continue;
+            // The world cells' records count under their generator's top-level entity, each with the matrix its entity
+            // would have, in place of the near cells' copies (skipped above): the scene as with every placement an entity,
+            // wherever the camera stands
+            Freefall.World.WorldCells.VisitRecords((owner, mesh, world) =>
+            {
+                var top = owner?.Entity?.Transform;
+                while (top?.Parent != null) top = top.Parent;
+                if (top?.Entity == null || !sums.TryGetValue(top.Entity, out var sum)) return;
+                Add(sum, mesh, world);
+            });
 
-                total += count;
-                totalExact += exact;
-                totalCoarse += coarse;
+            foreach (var (entity, sum) in sums)
+            {
+                if (sum.Count == 0) continue;
+                total += sum.Count;
+                totalExact += sum.Exact;
+                totalCoarse += sum.Coarse;
                 entities.Add(new
                 {
                     uid = entity.UID.ToString(),
                     name = entity.Name,
-                    meshes = count,
-                    exact = exact.ToString("x16"),
-                    coarse = coarse.ToString("x16"),
+                    meshes = sum.Count,
+                    exact = sum.Exact.ToString("x16"),
+                    coarse = sum.Coarse.ToString("x16"),
                 });
             }
 
@@ -51,36 +68,44 @@ namespace Freefall.Editor.Commands
         }
 
         // Sums, so the order entities are enumerated in does not matter
-        private static void Visit(Transform transform, ref int count, ref ulong exact, ref ulong coarse)
+        private static void Visit(Transform transform, Sum sum)
         {
             if (transform == null) return;
+
+            // A near world cell's copies: their records are counted instead
+            if (Freefall.World.WorldCells.IsCellCopy(transform.Entity)) return;
 
             foreach (var component in transform.Entity.Components)
             {
                 if (component is not MeshRenderer { Enabled: true, Mesh: { } mesh }) continue;
-
-                // Generated meshes (RuntimeMesh) get a new GUID-based name on every build: hash what they contain
-                ulong meshHash = mesh.IsDynamic ? Content(mesh) : Mix(Text(mesh.Name), (ulong)(mesh.Positions?.Length ?? 0));
-                var m = transform.Matrix;
-
-                ulong e = meshHash;
-                e = Mix(e, m.M11); e = Mix(e, m.M12); e = Mix(e, m.M13);
-                e = Mix(e, m.M21); e = Mix(e, m.M22); e = Mix(e, m.M23);
-                e = Mix(e, m.M31); e = Mix(e, m.M32); e = Mix(e, m.M33);
-                e = Mix(e, m.M41); e = Mix(e, m.M42); e = Mix(e, m.M43);
-
-                ulong c = meshHash;
-                c = Mix(c, (ulong)(long)System.MathF.Round(m.M41 * 100f));
-                c = Mix(c, (ulong)(long)System.MathF.Round(m.M42 * 100f));
-                c = Mix(c, (ulong)(long)System.MathF.Round(m.M43 * 100f));
-
-                count++;
-                exact += e;
-                coarse += c;
+                // A world cells' far mesh stands in for records counted on their own
+                if (mesh.CellFade) continue;
+                Add(sum, mesh, transform.Matrix);
             }
 
             for (int i = 0; i < transform.Count; i++)
-                Visit(transform.GetChild(i), ref count, ref exact, ref coarse);
+                Visit(transform.GetChild(i), sum);
+        }
+
+        private static void Add(Sum sum, Freefall.Graphics.Mesh mesh, System.Numerics.Matrix4x4 m)
+        {
+            // Generated meshes (RuntimeMesh) get a new GUID-based name on every build: hash what they contain
+            ulong meshHash = mesh.IsDynamic ? Content(mesh) : Mix(Text(mesh.Name), (ulong)(mesh.Positions?.Length ?? 0));
+
+            ulong e = meshHash;
+            e = Mix(e, m.M11); e = Mix(e, m.M12); e = Mix(e, m.M13);
+            e = Mix(e, m.M21); e = Mix(e, m.M22); e = Mix(e, m.M23);
+            e = Mix(e, m.M31); e = Mix(e, m.M32); e = Mix(e, m.M33);
+            e = Mix(e, m.M41); e = Mix(e, m.M42); e = Mix(e, m.M43);
+
+            ulong c = meshHash;
+            c = Mix(c, (ulong)(long)System.MathF.Round(m.M41 * 100f));
+            c = Mix(c, (ulong)(long)System.MathF.Round(m.M42 * 100f));
+            c = Mix(c, (ulong)(long)System.MathF.Round(m.M43 * 100f));
+
+            sum.Count++;
+            sum.Exact += e;
+            sum.Coarse += c;
         }
 
         private static ulong Content(Freefall.Graphics.Mesh mesh)

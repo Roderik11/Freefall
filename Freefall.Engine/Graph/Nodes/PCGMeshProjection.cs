@@ -175,9 +175,12 @@ namespace Freefall.PCG
             var tris = new List<Tri>();
             foreach (var component in ComponentCache<MeshRenderer>.All)
             {
-                if (component is not MeshRenderer { Enabled: true, Mesh: { Positions: { } pos, CpuIndices: { } idx } mesh } mr) continue;
+                if (component is not MeshRenderer { Enabled: true, Mesh: { Positions: { }, CpuIndices: { } } mesh } mr) continue;
                 var entity = mr.Entity;
                 if (entity == null || IsUnder(entity, IgnoreRoot) || (IgnoreGenerated && entity.DontSave)) continue;
+
+                // A near world cell's copy: its record is taken below
+                if (Freefall.World.WorldCells.IsCellCopy(entity)) continue;
 
                 var worldM = entity.Transform.WorldMatrix;
                 if (!Overlaps(mesh.BoundingBox.Min, mesh.BoundingBox.Max, worldM, min, max)) continue;
@@ -185,6 +188,30 @@ namespace Freefall.PCG
                 // Output of PCG components that run after this one does not count, even while it is in the scene
                 if (Owner != null && !Owner.Sees(entity)) continue;
 
+                AddMesh(tris, mesh, worldM, min, max);
+            }
+
+            // The world cells' records of the generators this one sees, each renderer with the matrix its entity would
+            // have: the same surface whichever cells are spawned
+            if (!IgnoreGenerated)
+                Freefall.World.WorldCells.ForEachRendererIn(new Vector2(min.X, min.Z), new Vector2(max.X, max.Z),
+                    owner => owner is PCGComponent generator && generator != Owner && (Owner == null || Owner.Sees(generator)),
+                    (rd, worldM) =>
+                    {
+                        var mesh = rd.Mesh;
+                        if (!rd.Enabled || mesh.Positions == null || mesh.CpuIndices == null) return;
+                        if (!Overlaps(mesh.BoundingBox.Min, mesh.BoundingBox.Max, worldM, min, max)) return;
+                        AddMesh(tris, mesh, worldM, min, max);
+                    });
+            return tris;
+        }
+
+        // A mesh's LOD0 triangles under a world matrix that reach into the query box
+        private static void AddMesh(List<Tri> tris, Mesh mesh, in Matrix4x4 worldM, Vector3 min, Vector3 max)
+        {
+            var pos = mesh.Positions!;
+            var idx = mesh.CpuIndices!;
+            {
                 var wp = new Vector3[pos.Length];
                 for (int v = 0; v < pos.Length; v++) wp[v] = Vector3.Transform(pos[v], worldM);
 
@@ -212,7 +239,7 @@ namespace Freefall.PCG
                 if (parts.Count == 0)
                 {
                     AddRange(0, 0, idx.Length);
-                    continue;
+                    return;
                 }
                 // Only the highest-detail geometry: LOD0 plus parts outside the LOD chain.
                 IEnumerable<int> partIndices = mesh.LODs.Count > 0
@@ -224,7 +251,6 @@ namespace Freefall.PCG
                     AddRange(parts[pi].BaseVertex, parts[pi].BaseIndex, parts[pi].NumIndices);
                 }
             }
-            return tris;
         }
 
         private static List<Tri>?[] BuildGrid(List<Tri> tris, Vector3 min, Vector3 max, out int cols, out int rows)

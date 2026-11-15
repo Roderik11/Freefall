@@ -454,10 +454,15 @@ namespace Freefall.PCG
             {
                 if (renderer is not { Enabled: true, Mesh: { } mesh }) return;
                 // A world cells' far mesh (Mesh.CellFade) stands in for a whole generator's placements: its box would be
-                // the forest's or the bank's. What it stands for is in the generator's records (WORLD_CELLS_PLAN.md stage 2).
+                // the forest's or the bank's. What it stands for is in the generator's records.
                 if (mesh.CellFade) return;
+                Add(mesh, renderer.Entity.Transform.WorldMatrix);
+            }
+
+            /// <summary>A mesh's box under a world matrix: a renderer's, or a world cells' record's renderer.</summary>
+            public void Add(Mesh mesh, in Matrix4x4 transform)
+            {
                 var bb = mesh.BoundingBox;
-                var transform = renderer.Entity.Transform.WorldMatrix;
                 var min = new Vector3(float.MaxValue);
                 var max = new Vector3(float.MinValue);
                 for (int c = 0; c < 8; c++)
@@ -508,14 +513,23 @@ namespace Freefall.PCG
             return _authored = set;
         }
 
-        /// <summary>The renderers <paramref name="pcg"/> spawned into <paramref name="output"/> (not those of a PCG component nested in it).</summary>
+        /// <summary>
+        /// The renderers <paramref name="pcg"/> spawned into <paramref name="output"/> (not those of a PCG component nested
+        /// in it), and with <see cref="PCGComponent.Cells"/> its records in the world cells, each with the matrix its
+        /// entity would have: the same boxes whichever cells are spawned, and the same as with every placement an entity.
+        /// The near cells' copies are left out, their records stand for them.
+        /// </summary>
         public Set Generated(PCGComponent pcg, Entity output)
         {
             if (_generated.TryGetValue(output, out var set)) return set;
             set = new Set();
             foreach (var renderer in output.GetComponentsInChildren<MeshRenderer>())
-                if (PCGComponent.GeneratorOf(renderer.Entity) == pcg)
+                if (PCGComponent.GeneratorOf(renderer.Entity) == pcg && !Freefall.World.WorldCells.IsCellCopy(renderer.Entity))
                     set.Add(renderer);
+            Freefall.World.WorldCells.ForEachRenderer(pcg, (rd, world) =>
+            {
+                if (rd.Enabled) set.Add(rd.Mesh, world);
+            });
             _generated[output] = set;
             return set;
         }
@@ -873,6 +887,15 @@ namespace Freefall.PCG
 
         public List<PrefabElement> Entities = new List<PrefabElement>();
 
+        /// <summary>With the generator's world cells (PCGComponent.Cells): metres from the camera where these placements'
+        /// instances give way to their far form; 0 = the generator's Ring.</summary>
+        [Description("With the generator's Cells on: metres from the camera where these placements' instances give way to their far form; 0 = the generator's Ring. Small things leave sooner anyway, where they are too small to draw.")]
+        public float Ring;
+
+        /// <summary>With the generator's world cells: these placements' far form, or the generator's.</summary>
+        [Description("With the generator's Cells on: what stands in for these placements past their ring, or the generator's Far.")]
+        public Freefall.World.SpawnFar Far = Freefall.World.SpawnFar.Generator;
+
         /// <summary>
         /// Parent entity for spawned instances. Set by PCGComponent before execution.
         /// </summary>
@@ -915,7 +938,10 @@ namespace Freefall.PCG
 
                 if (Sink != null)
                 {
-                    Sink.Place(prefab, points.position[i], points.rotation[i], points.extents[i]);
+                    if (Ring > 0f || Far != Freefall.World.SpawnFar.Generator)
+                        Sink.Place(prefab, points.position[i], points.rotation[i], points.extents[i], Ring, Far);
+                    else
+                        Sink.Place(prefab, points.position[i], points.rotation[i], points.extents[i]);
                     continue;
                 }
 

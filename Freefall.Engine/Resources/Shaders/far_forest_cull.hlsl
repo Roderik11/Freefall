@@ -1,17 +1,19 @@
 // The far forest's cull (Graphics/FarForest.cs), as the grass's spawn picks its plants each frame: by cell first, then
-// the trees of the cells left.
+// the trees of the cells left. One far forest holds every owner's trees, so this runs once per view for all of them.
 //   CSResetCamera      a thread per kind: its camera draw command with no instances yet; thread 0: no cells yet
-//   CSCullCells        a thread per cell: on the far tier's far side (one share for the whole cell), its box in view and
-//                      not behind last frame's depth (Hi-Z, as grass_compute.hlsl IsCellOccluded): onto the cell list,
-//                      which is the indirect dispatch of CSCullTrees (a group per cell)
-//   CSCullTrees        a group per listed cell, its threads over its trees: in view and at least MinPixels across, a
-//                      tree goes on its kind's visible list; the command's instance count is the list's length
+//   CSCullCells        a thread per cell: on the far side of its nearest hand-over (FarCell.Profile, one share for the
+//                      whole cell), its box in view and not behind last frame's depth (Hi-Z, as grass_compute.hlsl
+//                      IsCellOccluded): onto the cell list, which is the indirect dispatch of CSCullTrees (a group per cell)
+//   CSCullTrees        a group per listed cell, its threads over its trees: on the far side of its own kind's hand-over,
+//                      in view and at least MinPixels across, a tree goes on its kind's visible list; the command's
+//                      instance count is the list's length
 //   CSResetShadow      as CSResetCamera, for the shadow commands and the shadow cell list
 //   CSCullShadowCells  a thread per cell that casts (the far side past half way, common.fx FarTierCasts): the cascades
 //                      its box touches as a mask, onto the shadow cell list
-//   CSCullShadowTrees  a group per listed cell: an entry (far_forest.hlsli) for every cascade of the mask the tree
-//                      touches; past the first cascade only trees covering ShadowMinCasterTexels texels (as
-//                      InstanceBatch's shadow culling, CoversShadowTexels). The camera's thinning applies.
+//   CSCullShadowTrees  a group per listed cell: for a tree past half way through its own kind's band, an entry
+//                      (far_forest.hlsli) for every cascade of the mask the tree touches; past the first cascade only
+//                      trees covering ShadowMinCasterTexels texels (as InstanceBatch's shadow culling,
+//                      CoversShadowTexels). The camera's thinning applies.
 //   CSClampShadow      a thread per kind: a list that ran over its room draws only what it holds
 // A draw command is far_forest.hlsli's FAR_COMMAND_UINTS (an indexed draw of the kind's part); a dispatch is 3 uints.
 
@@ -41,8 +43,13 @@ cbuffer PushConstants : register(b3)
     uint CellArgsUAVIdx;        // RWByteAddressBuffer: CSCullTrees' dispatch (groups, 1, 1)
     uint ShadowCellListUAVIdx;  // RWStructuredBuffer<uint>: the shadow cells left (cell | cascade mask << 24)
     uint ShadowCellArgsUAVIdx;  // RWByteAddressBuffer: CSCullShadowTrees' dispatch
+    uint ProfilesIdx;           // StructuredBuffer<float2>: the far tier profiles' (from, band) (Graphics.FarTier.ProfilesSrv)
+    float MinPixels;            // a tree's radius on screen below this is not drawn
+    float ThinPixels;           // a crown narrower on screen than this is thinned (far_forest.hlsli); 0 = never
+    float MaxGrow;              // how far a kept tree may grow
 };
 
+// The view's (a compute shader's constant buffer is one per frame: anything that differs per dispatch is a push constant)
 cbuffer FarForestView : register(b4)
 {
     row_major float4x4 ViewProjection;
@@ -51,15 +58,10 @@ cbuffer FarForestView : register(b4)
     float ClipSlackX;           // clip units a metre of radius can reach across, at a view depth of one metre (P11 + 1)
     float ClipSlackY;
     float PixelsPerMetre;       // pixels a metre spans at a distance of one metre
-    float MinPixels;            // a tree's radius on screen below this is not drawn
-    float FarFrom;              // the far tier (Graphics.FarTier), as the shaders have it in SceneConstants; its cell is
-    float FarBand;              // in each FarCell (the centre it fades by)
     float MinCasterClip;        // clip units a caster must span in the cascades after the first
     uint HiZTexture;            // the camera's Hi-Z pyramid (linear depth, farthest of 2x2); 0 = none
     float2 HiZSize;
     uint HiZMipCount;
-    float ThinPixels;           // a crown narrower on screen than this is thinned (far_forest.hlsli); 0 = never
-    float MaxGrow;              // how far a kept tree may grow
 };
 
 #include "far_forest.hlsli"
@@ -73,12 +75,14 @@ struct CascadeData
     float4 SplitDistances;
 };
 
-// The far side's share of a cell, quantized as common.fx FarTierShows does (0..127)
-uint FarShare(float2 cellCentre)
+// The far side's share of a cell for a far tier profile, quantized as common.fx FarTierShows does (0..127)
+uint FarShare(float2 cellCentre, uint profile)
 {
-    if (FarBand <= 0.0)
+    StructuredBuffer<float2> profiles = ResourceDescriptorHeap[ProfilesIdx];
+    float2 p = profiles[profile];   // (from, band)
+    if (p.y <= 0.0)
         return 0u;
-    float share = saturate((length(cellCentre - CamPos.xz) - FarFrom) / FarBand);
+    float share = saturate((length(cellCentre - CamPos.xz) - p.x) / p.y);
     return (uint)(share * 127.0 + 0.5);
 }
 
@@ -192,8 +196,8 @@ void CSCullCells(uint3 id : SV_DispatchThreadID)
     StructuredBuffer<FarCell> cells = ResourceDescriptorHeap[CellsIdx];
     FarCell c = cells[id.x];
 
-    // Nearer than the far tier's band its instances draw it
-    if (FarShare(c.Centre) == 0u) return;
+    // Nearer than the band of its nearest hand-over, its instances draw all of it
+    if (FarShare(c.Centre, c.Profile) == 0u) return;
 
     float3 centre = (c.Min + c.Max) * 0.5;
     float radius = length(c.Max - c.Min) * 0.5 * max(MaxGrow, 1.0);   // its trees may grow (thinning)
@@ -223,6 +227,7 @@ void CSCullTrees(uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
         FarTree t = trees[index];
         uint kind = FarTreeKind(t);
         FarKind k = kinds[kind];
+        if (k.Profile != c.Profile && FarShare(c.Centre, k.Profile) == 0u) continue;   // its own instances still draw it
         float3 centre; float radius;
         TreeSphere(t, k, centre, radius);
         float distance = max(length(centre - CamPos), 1.0);
@@ -272,8 +277,8 @@ void CSCullShadowCells(uint3 id : SV_DispatchThreadID)
     StructuredBuffer<FarCell> cells = ResourceDescriptorHeap[CellsIdx];
     FarCell c = cells[id.x];
 
-    // The far side casts from half way through the band (the instances before)
-    if (FarShare(c.Centre) < 64u) return;
+    // The far side casts from half way through the band (the instances before): the nearest hand-over's for the cell
+    if (FarShare(c.Centre, c.Profile) < 64u) return;
 
     float3 centre = (c.Min + c.Max) * 0.5;
     float radius = length(c.Max - c.Min) * 0.5;
@@ -314,6 +319,7 @@ void CSCullShadowTrees(uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
         FarTree t = trees[index];
         uint kind = FarTreeKind(t);
         FarKind k = kinds[kind];
+        if (k.Profile != c.Profile && FarShare(c.Centre, k.Profile) < 64u) continue;   // its own instances still cast
         float3 centre; float radius;
         TreeSphere(t, k, centre, radius);
         // The trees the camera keeps cast, grown as it draws them (thinned by its distance)

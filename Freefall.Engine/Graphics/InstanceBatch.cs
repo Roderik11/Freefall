@@ -377,7 +377,10 @@ namespace Freefall.Graphics
                 TransformSlot = (uint)call.TransformSlot,
                 MaterialId = (uint)call.Material.MaterialID,
                 CustomDataIdx = (uint)(call.InstanceSlot > 0 ? call.InstanceSlot : call.Material.Effect?.DefaultInstanceSlot ?? 0),
-                MeshPartIdx = (uint)call.MeshPartIndex | (call.FarTier ? InstanceDescriptor.DrawFarTier : 0u),
+                // The far tier's near side and its profile (common.fx FarTierProfileOfDraw): the part's index keeps the low 8 bits
+                MeshPartIdx = call.FarTier
+                    ? ((uint)call.MeshPartIndex & 0xFFu) | ((uint)call.FarProfile << 8) | InstanceDescriptor.DrawFarTier
+                    : (uint)call.MeshPartIndex,
                 BoneBufferIdx = call.BoneBufferIdx
             };
             WriteCore(DrawBucket.DescriptorsHash, 20, index, descriptor);

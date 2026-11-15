@@ -18,6 +18,11 @@ namespace Freefall.Components
         /// <summary>One prefab placed: position, rotation and scale in the container's frame.</summary>
         void Place(Prefab prefab, Vector3 position, Quaternion rotation, Vector3 scale);
 
+        /// <summary>One prefab placed by an output that sets its own ring (metres, 0 = the generator's) and far form
+        /// (SpawnPrefab Ring, Far). A sink that knows nothing of them takes the placement as it is.</summary>
+        void Place(Prefab prefab, Vector3 position, Quaternion rotation, Vector3 scale, float ring, Freefall.World.SpawnFar far)
+            => Place(prefab, position, rotation, scale);
+
         /// <summary>The run is done.</summary>
         void PlacementsEnd();
     }

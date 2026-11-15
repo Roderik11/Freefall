@@ -40,7 +40,7 @@ namespace Freefall.World
             public bool Cards;            // has merged cards: the normal stream holds tree origins (Mesh.CardOrigins)
             public long CardTriangles;
             public List<Material> Materials = new();
-            public List<(int Material, int BaseIndex, int Count, BoundingBox Box)> Parts = new();
+            public List<(int Material, int Profile, int BaseIndex, int Count, BoundingBox Box)> Parts = new();
             public double TotalMs;
         }
 
@@ -50,14 +50,16 @@ namespace Freefall.World
             public Vector3[] Pos = Array.Empty<Vector3>();
             public int[] Tri = Array.Empty<int>();
             public Material?[] TriMaterial = Array.Empty<Material?>();   // per triangle
+            public int Profile;                                          // its kind's far tier profile
             public Vector3 Min, Max;
             public Columns? Columns;
         }
 
-        // One cell's output for one material
+        // One cell's output for one material and far tier profile
         private sealed class Output
         {
             public Material Material = null!;
+            public int Profile;
             public Vector3[] Pos = Array.Empty<Vector3>(), Nrm = Array.Empty<Vector3>();
             public Vector2[] UV = Array.Empty<Vector2>();
             public Vector4[] Tan = Array.Empty<Vector4>();
@@ -127,10 +129,14 @@ namespace Freefall.World
         }
 
         /// <summary>Main thread: copies what the build needs and starts it on a worker; the result is made into the scene by <see cref="WorldCellSystem"/>.</summary>
-        public static void Start(WorldCells.Owner o, PrefabShapes.Part[][] shapes, bool mergeCards)
+        // What the worker needs of a placement kind: whether its far form takes shells, takes cards merged, and its profile
+        private readonly record struct KindIn(bool Shells, bool Cards, int Profile);
+
+        public static void Start(WorldCells.Owner o, PrefabShapes.Part[][] shapes)
         {
             var records = o.Records.ToArray();
             var cells = o.Slices.Select(s => new CellIn { Key = s.Cell.Key, Centre = s.Cell.Centre, Records = s.Records.ToArray() }).ToArray();
+            var kinds = o.Kinds.Select(k => new KindIn(k.Far is FarForm.Auto or FarForm.Merged, k.Far == FarForm.Merged, k.Profile)).ToArray();
             var toWorld = o.ToWorld;
             Matrix4x4.Invert(toWorld, out var toLocal);
             var terrain = ComponentCache<TerrainRenderer>.All.FirstOrDefault();
@@ -140,7 +146,7 @@ namespace Freefall.World
             {
                 try
                 {
-                    var result = Build(o, generation, records, cells, shapes, toWorld, toLocal, terrain, mergeCards);
+                    var result = Build(o, generation, records, cells, shapes, kinds, toWorld, toLocal, terrain);
                     WorldCellSystem.Built.Enqueue(result);
                 }
                 catch (Exception ex) { Debug.LogWarning("WorldCells", $"'{name}': far mesh build failed: {ex}"); }
@@ -148,7 +154,7 @@ namespace Freefall.World
         }
 
         private static Result Build(WorldCells.Owner owner, int generation, WorldCells.Record[] records, CellIn[] cells,
-            PrefabShapes.Part[][] shapes, Matrix4x4 toWorld, Matrix4x4 toLocal, TerrainRenderer? terrain, bool mergeCards)
+            PrefabShapes.Part[][] shapes, KindIn[] kinds, Matrix4x4 toWorld, Matrix4x4 toLocal, TerrainRenderer? terrain)
         {
             var total = Stopwatch.StartNew();
             // Every piece's shells in world space, made once before the cells look at them
@@ -157,11 +163,12 @@ namespace Freefall.World
             Piece MakePiece(int i)
             {
                 var r = records[i];
+                var kind = kinds[r.Kind];
                 var m = WorldCells.LocalOf(r) * toWorld;
                 var pos = new List<Vector3>(); var tri = new List<int>(); var mats = new List<Material?>();
-                foreach (var part in shapes[r.Prefab])
+                foreach (var part in shapes[r.Kind])
                 {
-                    if (part.Kind != PrefabShapes.Kind.Shell) continue;   // cards are merged as they are
+                    if (!kind.Shells || part.Kind != PrefabShapes.Kind.Shell) continue;   // cards are merged as they are
                     int baseV = pos.Count;
                     foreach (var v in part.Pos) pos.Add(Vector3.Transform(v, m));
                     for (int t = 0; t < part.Tri.Length; t += 3)
@@ -170,7 +177,7 @@ namespace Freefall.World
                         mats.Add(part.Material);
                     }
                 }
-                var p = new Piece { Pos = pos.ToArray(), Tri = tri.ToArray(), TriMaterial = mats.ToArray() };
+                var p = new Piece { Pos = pos.ToArray(), Tri = tri.ToArray(), TriMaterial = mats.ToArray(), Profile = kind.Profile };
                 p.Min = new Vector3(float.MaxValue); p.Max = new Vector3(float.MinValue);
                 foreach (var v in p.Pos) { p.Min = Vector3.Min(p.Min, v); p.Max = Vector3.Max(p.Max, v); }
                 return p;
@@ -188,16 +195,18 @@ namespace Freefall.World
 
                 // Cards, merged as they are, in the owner's frame: their UVs, each vertex naming its tree's origin (the
                 // normal stream) and its card's centre (the tangent stream), as the tree's own cards take them (Mesh.CardOrigins)
-                var cards = new Dictionary<Material, (List<Vector3> P, List<Vector3> O, List<Vector2> U, List<Vector4> C, List<uint> I)>();
+                var cards = new Dictionary<(Material, int), (List<Vector3> P, List<Vector3> O, List<Vector2> U, List<Vector4> C, List<uint> I)>();
                 foreach (int ri in cell.Records)
                 {
                     var r = records[ri];
+                    var kind = kinds[r.Kind];
                     Matrix4x4? local = null;
-                    foreach (var part in shapes[r.Prefab])
+                    foreach (var part in shapes[r.Kind])
                     {
-                        if (!mergeCards || part.Kind != PrefabShapes.Kind.Card || part.Material == null) continue;
+                        if (!kind.Cards || part.Kind != PrefabShapes.Kind.Card || part.Material == null) continue;
                         var lm = local ??= WorldCells.LocalOf(r);
-                        if (!cards.TryGetValue(part.Material, out var c)) cards[part.Material] = c = (new(), new(), new(), new(), new());
+                        var key = (part.Material, kind.Profile);
+                        if (!cards.TryGetValue(key, out var c)) cards[key] = c = (new(), new(), new(), new(), new());
                         uint baseV = (uint)c.P.Count;
                         var centre = Vector3.Transform(part.Centre, lm);
                         for (int v = 0; v < part.Pos.Length; v++)
@@ -210,8 +219,8 @@ namespace Freefall.World
                         foreach (int t in part.Tri) c.I.Add(baseV + (uint)t);
                     }
                 }
-                foreach (var (material, c) in cards)
-                    outputs.Add(new Output { Material = material, Pos = c.P.ToArray(), Nrm = c.O.ToArray(), UV = c.U.ToArray(), Tan = c.C.ToArray(), Idx = c.I.ToArray() });
+                foreach (var ((material, profile), c) in cards)
+                    outputs.Add(new Output { Material = material, Profile = profile, Pos = c.P.ToArray(), Nrm = c.O.ToArray(), UV = c.U.ToArray(), Tan = c.C.ToArray(), Idx = c.I.ToArray() });
 
                 if (own.Any(p => p.Tri.Length > 0))
                 {
@@ -259,9 +268,9 @@ namespace Freefall.World
                         }
                     }
 
-                    // Per material: the visible triangles welded, simplified, normals split at creases, all within the cell;
-                    // each vertex's UV the cell's centre
-                    foreach (var material in own.SelectMany(p => p.TriMaterial).Distinct())
+                    // Per material and profile: the visible triangles welded, simplified, normals split at creases, all
+                    // within the cell; each vertex's UV the cell's centre
+                    foreach (var (material, profile) in own.SelectMany(p => p.TriMaterial.Select(m => (m, p.Profile))).Distinct())
                     {
                         if (material == null) continue;
                         var weld = new Dictionary<(int, int, int), uint>();
@@ -270,6 +279,7 @@ namespace Freefall.World
                         for (int o = 0; o < own.Length; o++)
                         {
                             var p = own[o]; var h = hidden[o];
+                            if (p.Profile != profile) continue;
                             for (int t = 0; t < p.Tri.Length; t += 3)
                             {
                                 if (p.TriMaterial[t / 3] != material) continue;
@@ -293,16 +303,16 @@ namespace Freefall.World
                         var (vs, ns, ins) = CreaseNormals(positions, dst, count);
                         var uvs = new Vector2[vs.Length];
                         Array.Fill(uvs, cellUV);
-                        outputs.Add(new Output { Material = material, Pos = vs, Nrm = ns, UV = uvs, Tan = new Vector4[vs.Length], Idx = ins });
+                        outputs.Add(new Output { Material = material, Profile = profile, Pos = vs, Nrm = ns, UV = uvs, Tan = new Vector4[vs.Length], Idx = ins });
                     }
                 }
                 perCell[ci] = outputs;
             });
 
-            // All cells in one mesh, a part per chunk and material
+            // All cells in one mesh, a part per chunk, material and far tier profile
             var result = new Result { Owner = owner, Generation = generation };
             var materialIndex = new Dictionary<Material, int>();
-            var byChunk = new Dictionary<(int, int, int), List<Output>>();
+            var byChunk = new Dictionary<(int, int, int, int), List<Output>>();
             for (int ci = 0; ci < cells.Length; ci++)
             {
                 var centre = cells[ci].Centre;
@@ -310,14 +320,14 @@ namespace Freefall.World
                 foreach (var o in perCell[ci])
                 {
                     if (!materialIndex.TryGetValue(o.Material, out int mi)) { mi = result.Materials.Count; materialIndex[o.Material] = mi; result.Materials.Add(o.Material); }
-                    var key = (ck.Item1, ck.Item2, mi);
+                    var key = (ck.Item1, ck.Item2, mi, o.Profile);
                     if (!byChunk.TryGetValue(key, out var list)) byChunk[key] = list = new List<Output>();
                     list.Add(o);
                 }
             }
             var allPos = new List<Vector3>(); var allNrm = new List<Vector3>(); var allIdx = new List<uint>();
             var allUV = new List<Vector2>(); var allTan = new List<Vector4>();
-            foreach (var ((_, _, mi), outputs) in byChunk)
+            foreach (var ((_, _, mi, profile), outputs) in byChunk)
             {
                 int baseI = allIdx.Count;
                 var min = new Vector3(float.MaxValue); var max = new Vector3(float.MinValue);
@@ -328,7 +338,7 @@ namespace Freefall.World
                     allPos.AddRange(o.Pos); allNrm.AddRange(o.Nrm); allUV.AddRange(o.UV); allTan.AddRange(o.Tan);
                     foreach (var i in o.Idx) allIdx.Add(i + baseV);
                 }
-                result.Parts.Add((mi, baseI, allIdx.Count - baseI, new BoundingBox(min, max)));
+                result.Parts.Add((mi, profile, baseI, allIdx.Count - baseI, new BoundingBox(min, max)));
                 if (PrefabShapes.KindOf(result.Materials[mi]) == PrefabShapes.Kind.Card) { result.Cards = true; result.CardTriangles += (allIdx.Count - baseI) / 3; }
             }
             result.Pos = allPos.ToArray(); result.Nrm = allNrm.ToArray(); result.Idx = allIdx.ToArray();
@@ -413,12 +423,13 @@ namespace Freefall.World
             mesh.Name = $"{o.Name} far";
             for (int p = 0; p < r.Parts.Count; p++)
             {
-                var (material, baseIndex, count, box) = r.Parts[p];
+                var (material, profile, baseIndex, count, box) = r.Parts[p];
                 var center = (box.Min + box.Max) * 0.5f;
                 mesh.MeshParts.Add(new MeshPart
                 {
                     Name = $"chunk {p}", BaseIndex = baseIndex, NumIndices = count, MaterialSlot = material,
                     BoundingBox = box, BoundingSphere = new Vector4(center, (box.Max - center).Length()),
+                    FarProfile = profile,
                 });
             }
             mesh.ComputeNonLodPartIndices();   // the parts came after the constructor worked out which to draw

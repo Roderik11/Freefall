@@ -60,6 +60,9 @@ namespace Freefall.Graphics
         /// meshes (InstanceDescriptor.DrawFarTier). Only effects that read it fade (gbuffer_crossmesh, CliffRock).
         /// </summary>
         public bool FarTier;
+        /// <summary>With <see cref="FarTier"/>: the far tier profile it gives way at (InstanceDescriptor.MeshPartIdx bits
+        /// 8-13, <see cref="Graphics.FarTier.ProfileFor"/>); 0 = <see cref="Graphics.FarTier.From"/>.</summary>
+        public byte FarProfile;
     }
 
     /// <summary>
@@ -776,9 +779,10 @@ namespace Freefall.Graphics
         /// Register a draw that stays in its batches until the group is removed: nothing is enqueued
         /// per frame for it. Same parameters as Enqueue. Thread-safe (callable from parallel Draw());
         /// takes effect at the next pass execution. To change a registered draw, remove the group and
-        /// add a new one. <paramref name="farTier"/>: an instance of the far tier's near side (DrawCall.FarTier).
+        /// add a new one. <paramref name="farTier"/>: an instance of the far tier's near side (DrawCall.FarTier), giving
+        /// way at <paramref name="farProfile"/> (DrawCall.FarProfile).
         /// </summary>
-        public static void AddPersistent(DrawGroup group, Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot, uint boneBufferIdx = 0, bool lodManaged = false, int instanceSlot = 0, bool farTier = false)
+        public static void AddPersistent(DrawGroup group, Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot, uint boneBufferIdx = 0, bool lodManaged = false, int instanceSlot = 0, bool farTier = false, int farProfile = 0)
         {
             var op = new PersistentOp
             {
@@ -795,7 +799,8 @@ namespace Freefall.Graphics
                     BoneBufferIdx = boneBufferIdx,
                     LodManaged = lodManaged,
                     InstanceSlot = instanceSlot,
-                    FarTier = farTier
+                    FarTier = farTier,
+                    FarProfile = (byte)(farProfile & (Graphics.FarTier.MaxProfiles - 1)),
                 }
             };
 

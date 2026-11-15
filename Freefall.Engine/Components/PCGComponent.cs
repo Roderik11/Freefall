@@ -44,16 +44,30 @@ namespace Freefall.Components
         /// <summary>
         /// What the graph places goes into the world's cells as records (<see cref="Freefall.World.WorldCells"/>) instead of
         /// being instantiated: entities only within <see cref="EngineSettings.WorldCellsNear"/> of a viewer, instances round
-        /// the camera out to the far tier, and <see cref="Far"/> beyond. WORLD_CELLS_PLAN.md stage 1: off by default, since
-        /// the navmesh bake and graphs that keep clear of this one's output (ExcludeObstacles, MeshProjection onto
-        /// generated geometry) see only the cells spawned at the moment (stage 2).
+        /// the camera out to the far tier, and <see cref="Far"/> beyond. The navmesh bake and graphs that keep clear of
+        /// this one's output (ExcludeObstacles, MeshProjection onto generated geometry) read the records, exactly as they
+        /// would read the entities (WORLD_CELLS_PLAN.md stage 2). Only prefabs a record can stand for go in: those whose
+        /// components are all drawn, solid, a static body, a navmesh blocker or marked <see cref="World.CellRecordAttribute"/>;
+        /// a live prefab (a light, a sound, an NPC place, a script that acts) is an entity at once, as without cells
+        /// (stage 3). On by default since stage 3.
         /// </summary>
-        [System.ComponentModel.Description("Keep what the graph places as records in the world's cells instead of entities: entities only near a viewer, instances round the camera out to the far tier, the Far form beyond. For forests and rocks; the navmesh bake and graphs that avoid this output see only the cells spawned at the time.")]
-        public bool Cells;
+        [System.ComponentModel.Description("Keep what the graph places as records in the world's cells: entities only near a viewer, instances round the camera out to the far tier, the Far form beyond. Prefabs with lights, sounds, NPC places or scripts that act are entities as before. The navmesh bake and graphs that avoid this output read the records. Off: every placement an entity.")]
+        [System.ComponentModel.DefaultValue(true)]
+        public bool Cells = true;
 
         /// <summary>What stands in for the placements past the far tier when <see cref="Cells"/> is on.</summary>
         [System.ComponentModel.Description("With Cells on, what stands in for the placements past the far tier (800 m): Auto takes it from each part's material (trees' cards as a far forest, CliffRock shells merged into a far mesh, nothing for the rest), Cards only the far forest, Merged everything merged into a far mesh, None nothing.")]
         public Freefall.World.FarForm Far = Freefall.World.FarForm.Auto;
+
+        /// <summary>
+        /// With <see cref="Cells"/>: metres from the camera where the placements' instances give way to <see cref="Far"/>
+        /// (a far tier profile, <see cref="Graphics.FarTier.ProfileFor"/>). 0 = by itself: a kind whose coarsest LOD is
+        /// all tree cards gives way where that LOD starts (the far forest draws the same cards), everything else at the
+        /// far tier's own distance (<see cref="Graphics.FarTier.From"/>, 800 m); small things leave sooner anyway, where
+        /// the GPU stops drawing them. A SpawnPrefab output may set its own.
+        /// </summary>
+        [System.ComponentModel.Description("With Cells on: metres from the camera where the placements' instances give way to the Far form. 0 = by itself: a tree whose coarsest LOD is all cards gives way where that LOD starts, since the far forest draws the same cards; everything else at the far tier's 800 m. Small things leave sooner anyway, where they are too small to draw. A Spawn Prefab node can set its own.")]
+        public float Ring;
 
         private Freefall.World.WorldCells.Sink? _cellSink;
 
@@ -256,8 +270,11 @@ namespace Freefall.Components
         public bool Sees(Entity? entity)
         {
             var generator = GeneratorOf(entity);
-            return generator == null || (generator != this && CompareOrder(generator, this) < 0);
+            return generator == null || Sees(generator);
         }
+
+        /// <summary>Whether another generator's output (its entities or its world cells' records) counts for this one: it runs before.</summary>
+        public bool Sees(PCGComponent generator) => generator != this && CompareOrder(generator, this) < 0;
 
         /// <summary>World XZ area this component works in. False if it has no spline: then it may be anywhere.</summary>
         internal bool TryGetRegion(out Vector2 min, out Vector2 max)
@@ -378,7 +395,7 @@ namespace Freefall.Components
             foreach (var component in Entity.Components)
                 if (component is IPlacementSink sink && component.Enabled)
                     return sink;
-            if (Cells) return _cellSink ??= new Freefall.World.WorldCells.Sink(this, () => Far);
+            if (Cells) return _cellSink ??= new Freefall.World.WorldCells.Sink(this, () => Far, () => Ring);
             return null;
         }
 

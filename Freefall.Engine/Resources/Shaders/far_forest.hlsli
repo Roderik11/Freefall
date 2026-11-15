@@ -1,12 +1,12 @@
-// The far forest (Graphics/FarForest.cs): trees drawn past the far tier's start as the grass is, from a static buffer
-// of 16 bytes a tree, picked each frame on the GPU (far_forest_cull.hlsl) and drawn by gbuffer_crossmesh.fx's FarForest
-// passes. Shared by both.
+// The far forest (Graphics/FarForest.cs): every owner's trees drawn past their hand-over as the grass is, from one
+// buffer of 16 bytes a tree, picked each frame on the GPU (far_forest_cull.hlsl) and drawn by gbuffer_crossmesh.fx's
+// FarForest passes. Shared by both.
 
 #ifndef FAR_FOREST_HLSLI
 #define FAR_FOREST_HLSLI
 
-// One tree: its world position, and packed: yaw (12 bits, of a turn), scale across (7 bits) and up (7 bits, in
-// FAR_TREE_SCALE_STEP), its kind (6 bits)
+// One tree: its world position, and packed: yaw (10 bits, of a turn), scale across (7 bits) and up (7 bits, in
+// FAR_TREE_SCALE_STEP), its kind (8 bits)
 struct FarTree
 {
     float3 Position;
@@ -31,7 +31,8 @@ struct FarKind
     uint IndexBytes;
     uint BaseIndex;           // the part's first index
     float HalfWidth;          // what thinning measures on screen
-    uint3 _pad;
+    uint Profile;             // the far tier profile it hands over at (common.fx FarTierProfile; 0 = FarTierFrom)
+    uint2 _pad;
 };
 
 // Thinning (as the grass's plants, stochastic simplification): a tree whose crown is narrower on screen than ThinPixels
@@ -67,8 +68,9 @@ row_major float4x4 FarGrow(row_major float4x4 world, float grow)
 #define FAR_COMMAND_UINTS 12u
 #define FAR_COMMAND_INSTANCES 28u   // the instance count's byte offset in a command
 
-// A cell of the far tier (Graphics.FarTier.CellSize) and its trees, which the buffer holds together from First on: the
-// box round their bounding spheres, and the cell's centre the far tier fades it by (every tree of it alike)
+// A cell of the far tier (Graphics.FarTier.CellSize) with one owner's trees, which the buffer holds together from First
+// on: the box round their bounding spheres, the cell's centre the far tier fades it by (every tree of it alike), and the
+// nearest hand-over of its trees' kinds (a far tier profile): the cell cull goes by it, each tree then by its own kind's
 struct FarCell
 {
     float3 Min;
@@ -76,22 +78,23 @@ struct FarCell
     float3 Max;
     uint Count;
     float2 Centre;
-    uint2 _pad;
+    uint Profile;
+    uint _pad;
 };
 
 #define FAR_TREE_SCALE_STEP 0.025
 
 uint FarTreeKind(FarTree t)
 {
-    return t.Packed >> 26;
+    return t.Packed >> 24;
 }
 
 // The tree's world matrix: scale, then a turn about up, then its position (as the placement's)
 row_major float4x4 FarTreeWorld(FarTree t)
 {
-    float yaw = (float)(t.Packed & 0xFFFu) * (6.28318530718 / 4096.0);
-    float across = (float)((t.Packed >> 12) & 0x7Fu) * FAR_TREE_SCALE_STEP;
-    float up = (float)((t.Packed >> 19) & 0x7Fu) * FAR_TREE_SCALE_STEP;
+    float yaw = (float)(t.Packed & 0x3FFu) * (6.28318530718 / 1024.0);
+    float across = (float)((t.Packed >> 10) & 0x7Fu) * FAR_TREE_SCALE_STEP;
+    float up = (float)((t.Packed >> 17) & 0x7Fu) * FAR_TREE_SCALE_STEP;
     float s, c;
     sincos(yaw, s, c);
     return float4x4(c * across, 0, -s * across, 0,
@@ -103,7 +106,7 @@ row_major float4x4 FarTreeWorld(FarTree t)
 // The larger of the two scales: what the bounding sphere grows by
 float FarTreeScale(FarTree t)
 {
-    return max((float)((t.Packed >> 12) & 0x7Fu), (float)((t.Packed >> 19) & 0x7Fu)) * FAR_TREE_SCALE_STEP;
+    return max((float)((t.Packed >> 10) & 0x7Fu), (float)((t.Packed >> 17) & 0x7Fu)) * FAR_TREE_SCALE_STEP;
 }
 
 #endif

@@ -16,12 +16,13 @@ namespace Freefall.World
     /// Every 0.25 s it looks at the active slices and the grid squares within reach of the viewers
     /// (<see cref="Vicinity.Viewers"/>, else the camera) and of the camera, never at the whole map:
     /// <list type="bullet">
-    /// <item>a viewer within <see cref="EngineSettings.WorldCellsNear"/> (left 15 % further out): entities, nearest first;</item>
-    /// <item>the camera within <see cref="FarTier.From"/> + <see cref="FarTier.Band"/> and a margin: instances;</item>
+    /// <item>a viewer within <see cref="EngineSettings.WorldCellsNear"/> (left 15 % further out): a slice's entities, nearest first;</item>
+    /// <item>the camera within a group's ring (its kind's far tier distance and band, or where the GPU stops drawing it if
+    /// nearer, <see cref="WorldCells.RingOf"/>) and a margin: the group's instances;</item>
     /// <item>beyond: the far form alone.</item>
     /// </list>
-    /// A slice whose entities are made keeps its instances two more frames, until the entities draw: they draw the same
-    /// meshes, so the swap shows nothing.
+    /// A slice whose entities are made keeps its groups' instances two more frames, until the entities draw: they draw
+    /// the same meshes, so the swap shows nothing.
     /// </summary>
     [UpdateInEditor]
     [UpdateAfter(typeof(ScriptGroup))]
@@ -30,8 +31,8 @@ namespace Freefall.World
         /// <summary>Far meshes built on workers, made into the scene here, one a frame.</summary>
         internal static readonly ConcurrentQueue<FarBuilder.Result> Built = new();
 
-        /// <summary>Slices whose instances go in a frame or two.</summary>
-        internal static readonly List<Slice> Dropping = new();
+        /// <summary>Groups whose instances go in a frame or two.</summary>
+        internal static readonly List<Group> Dropping = new();
 
         private const float LookEvery = 0.25f;
         private const float RingMargin = 128f;   // the camera may move this far between two looks before a cell it fades in lacks instances
@@ -42,8 +43,8 @@ namespace Freefall.World
         private int _stamp;
         private readonly List<(Slice Slice, float Distance)> _toSpawn = new();
         private readonly List<Slice> _toDespawn = new();
-        private readonly List<(Slice Slice, float Distance)> _toInstance = new();
-        private readonly List<Slice> _toDrop = new();
+        private readonly List<(Group Group, float Distance)> _toInstance = new();
+        private readonly List<Group> _toDrop = new();
         private readonly List<Vector3> _viewers = new();
         private readonly List<Slice> _candidates = new();
 
@@ -68,9 +69,9 @@ namespace Freefall.World
             // Instances of slices spawned two frames ago go: their entities draw by now
             for (int i = Dropping.Count - 1; i >= 0; i--)
             {
-                var slice = Dropping[i];
-                if (!slice.Gone && slice.DropInstancesIn > 0 && --slice.DropInstancesIn == 0) RemoveInstances(slice);
-                if (slice.Gone || slice.DropInstancesIn <= 0)
+                var g = Dropping[i];
+                if (!g.Slice.Gone && g.DropInstancesIn > 0 && --g.DropInstancesIn == 0) RemoveInstances(g);
+                if (g.Slice.Gone || g.DropInstancesIn <= 0)
                 {
                     Dropping[i] = Dropping[^1];
                     Dropping.RemoveAt(Dropping.Count - 1);
@@ -79,7 +80,8 @@ namespace Freefall.World
 
             if (OwnerCount == 0) return;
 
-            _sinceLook += Time.Delta;
+            // Real time: the camera moves while the game clock stands still (a pause, slow motion, a stopped clock)
+            _sinceLook += Time.RealDelta;
             if (_sinceLook >= LookEvery)
             {
                 _sinceLook = 0;
@@ -98,27 +100,27 @@ namespace Freefall.World
                 _toDespawn.RemoveAt(_toDespawn.Count - 1);
                 if (slice.Gone || slice.Near || slice.Spawned == null) continue;
                 int draws = Despawn(slice);
-                if (draws > 0) { Stats.InstanceSlicesMade++; Stats.InstanceDrawsMade += draws; }
+                if (draws > 0) { Stats.InstanceGroupsMade++; Stats.InstanceDrawsMade += draws; }
                 Stats.Despawned++;
                 done++;
             }
             while (_toDrop.Count > 0)
             {
-                var slice = _toDrop[^1];
+                var g = _toDrop[^1];
                 _toDrop.RemoveAt(_toDrop.Count - 1);
-                if (slice.Gone || slice.InRing || slice.Group == null) continue;
-                RemoveInstances(slice);
-                Stats.InstanceSlicesDropped++;
+                if (g.Slice.Gone || g.InRing || g.Draws == null) continue;
+                RemoveInstances(g);
+                Stats.InstanceGroupsDropped++;
             }
             int next = 0;
             while (next < _toInstance.Count && Within())
             {
-                var slice = _toInstance[next++].Slice;
-                if (slice.Gone || !slice.InRing || slice.Group != null || slice.Spawned != null) continue;
+                var g = _toInstance[next++].Group;
+                if (g.Slice.Gone || !g.InRing || g.Draws != null || g.Slice.Spawned != null) continue;
                 long t0 = Stopwatch.GetTimestamp();
-                int draws = AddInstances(slice);
+                int draws = AddInstances(g);
                 Stats.InstanceMs += Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
-                Stats.InstanceSlicesMade++;
+                Stats.InstanceGroupsMade++;
                 Stats.InstanceDrawsMade += draws;
                 done++;
             }
@@ -135,31 +137,37 @@ namespace Freefall.World
                 Stats.SpawnedEntities += slice.Records.Count;
                 Stats.Spawned++;
                 done++;
-                if (slice.Group != null)
-                {
-                    slice.DropInstancesIn = 2;
-                    Dropping.Add(slice);
-                }
+                foreach (var g in slice.Groups)
+                    if (g.Draws != null)
+                    {
+                        g.DropInstancesIn = 2;
+                        Dropping.Add(g);
+                    }
             }
             _toSpawn.RemoveRange(0, next);
 
             Stats.MaxFrameMs = Math.Max(Stats.MaxFrameMs, Stopwatch.GetElapsedTime(start).TotalMilliseconds);
         }
 
-        // Which slices want entities (a viewer within A) and which instances (the camera within the far tier, its band and a margin)
+        // Which slices want entities (a viewer within A) and which groups instances (the camera within their ring and a margin)
         private void Look()
         {
             _viewers.Clear();
             foreach (var v in Vicinity.Viewers) if (v != null) _viewers.Add(v.WorldPosition);
-            var camera = Camera.Main?.Transform?.WorldPosition;
+            var cam = Camera.Main;
+            var camera = cam?.Transform?.WorldPosition;
             if (_viewers.Count == 0 && camera != null) _viewers.Add(camera.Value);
             if (_viewers.Count == 0) return;
             var eye = camera ?? _viewers[0];
 
+            // Where the GPU stops drawing a mesh: its radius over the cull size × LODScale × √FoVFactor (cull_instances.hlsl)
+            float cullFactor = cam != null ? Engine.Settings.LODScale * MathF.Sqrt(MathF.Max(cam.FoVFactor, 0f)) : 0f;
+
             float a = Engine.Settings.WorldCellsNear;
             float enter = a * a, leave = enter * Leave * Leave;
-            float ring = FarTier.From + FarTier.Band + RingMargin;
-            float ringEnter = ring * ring, ringLeave = ringEnter * Leave * Leave;
+            float reach = FarTier.From + FarTier.Band;
+            foreach (var o in Owners) reach = MathF.Max(reach, o.MaxRing);
+            reach += RingMargin;
 
             _toSpawn.Clear(); _toDespawn.Clear(); _toInstance.Clear(); _toDrop.Clear();
             _stamp++;
@@ -167,7 +175,7 @@ namespace Freefall.World
             foreach (var slice in Active) { slice.Stamp = _stamp; _candidates.Add(slice); }
             int nearReach = (int)MathF.Ceiling(a * Leave / CellSize) + 1;
             foreach (var p in _viewers) Gather(p.X, p.Z, nearReach);
-            Gather(eye.X, eye.Z, (int)MathF.Ceiling(ring * Leave / CellSize) + 1);
+            Gather(eye.X, eye.Z, (int)MathF.Ceiling(reach * Leave / CellSize) + 1);
 
             foreach (var slice in _candidates)
             {
@@ -184,14 +192,21 @@ namespace Freefall.World
                 else if (!near && slice.Spawned != null) _toDespawn.Add(slice);
                 slice.Near = near;
 
-                // By the cell's centre, as the shaders fade it
+                // By the cell's centre, as the shaders fade it; each group by its own ring
                 float cx = slice.Cell.Centre.X - eye.X, cz = slice.Cell.Centre.Y - eye.Z, c = cx * cx + cz * cz;
-                bool inRing = slice.InRing ? c < ringLeave : c < ringEnter;
-                slice.InRing = inRing;
-                if (inRing && slice.Group == null && slice.Spawned == null) _toInstance.Add((slice, c));
-                else if (!inRing && slice.Group != null) _toDrop.Add(slice);
+                bool wanted = near || slice.Spawned != null;
+                foreach (var g in slice.Groups)
+                {
+                    float ring = RingOf(g, cullFactor) + RingMargin;
+                    float ringEnter = ring * ring;
+                    bool inRing = g.InRing ? c < ringEnter * Leave * Leave : c < ringEnter;
+                    g.InRing = inRing;
+                    if (inRing && g.Draws == null && slice.Spawned == null) _toInstance.Add((g, c));
+                    else if (!inRing && g.Draws != null) _toDrop.Add(g);
+                    wanted |= inRing || g.Draws != null;
+                }
 
-                if (near || inRing || slice.Spawned != null || slice.Group != null) Active.Add(slice);
+                if (wanted) Active.Add(slice);
                 else Active.Remove(slice);
             }
             _toSpawn.Sort((x, y) => x.Distance.CompareTo(y.Distance));
@@ -219,16 +234,14 @@ namespace Freefall.World
         }
     }
 
-    /// <summary>Draws the owners' far forests, once per view, as the render group runs.</summary>
+    /// <summary>
+    /// The world cells' drawing, once per view as the render group runs: the one far forest of every owner's trees, one
+    /// cull and one draw for all of them (instances and near entities draw through the engine's batches).
+    /// </summary>
     [UpdateInEditor]
     [UpdateInGroup(typeof(RenderGroup))]
     public sealed class WorldCellDrawSystem : EntitySystem
     {
-        public override void Update()
-        {
-            if (OwnerCount == 0) return;
-            foreach (var o in Owners)
-                o.Forest?.Draw();
-        }
+        public override void Update() => Forest.Draw();
     }
 }

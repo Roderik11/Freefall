@@ -376,6 +376,26 @@ namespace Freefall.Navigation
                     blocked.Add(renderer);
             }
 
+            void Add(Mesh mesh, in Matrix4x4 world, bool blocks)
+            {
+                if (!geometryOf.TryGetValue(mesh, out int geometry))
+                {
+                    var prepared = MeshGeometry.FromMesh(mesh);
+                    geometry = prepared != null ? input.Geometries.Count : -1;
+                    if (prepared != null) input.Geometries.Add(prepared);
+                    geometryOf[mesh] = geometry;
+                }
+                if (geometry < 0) return;
+
+                instances.Add(new MeshInstance
+                {
+                    Geometry = geometry,
+                    World = world,
+                    Mirrored = world.GetDeterminant() < 0,
+                    Blocks = blocks,
+                });
+            }
+
             foreach (var renderer in ComponentCache<MeshRenderer>.All)
             {
                 var mesh = renderer.Mesh;
@@ -385,28 +405,22 @@ namespace Freefall.Navigation
                 // Placement ghosts are not part of the scene yet
                 if (renderer.ReplacementMaterial != null) continue;
 
+                // A near world cell's copy: its record is taken below, wherever the viewers are
+                if (World.WorldCells.IsCellCopy(entity)) continue;
+
                 // Only static geometry: no RigidBody, or a static one
                 var body = entity.GetComponentInParents<RigidBody>();
                 if (body != null && !body.IsStatic) continue;
 
-                if (!geometryOf.TryGetValue(mesh, out int geometry))
-                {
-                    var prepared = MeshGeometry.FromMesh(mesh);
-                    geometry = prepared != null ? input.Geometries.Count : -1;
-                    if (prepared != null) input.Geometries.Add(prepared);
-                    geometryOf[mesh] = geometry;
-                }
-                if (geometry < 0) continue;
-
-                var world = renderer.Transform?.Matrix ?? Matrix4x4.Identity;
-                instances.Add(new MeshInstance
-                {
-                    Geometry = geometry,
-                    World = world,
-                    Mirrored = world.GetDeterminant() < 0,
-                    Blocks = blocked.Contains(renderer),
-                });
+                Add(mesh, renderer.Transform?.Matrix ?? Matrix4x4.Identity, blocked.Contains(renderer));
             }
+
+            // The world cells' records, each renderer with the matrix its entity would have: a tile's input (and hash) is
+            // the same whichever cells are spawned, and the same as with every placement an entity
+            World.WorldCells.ForEachRenderer((rd, world) =>
+            {
+                if (rd.Enabled && rd.Static) Add(rd.Mesh, world, rd.Blocks);
+            });
 
             input.Instances = instances.ToArray();
 

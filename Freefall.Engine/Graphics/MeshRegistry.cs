@@ -196,7 +196,8 @@ namespace Freefall.Graphics
                     IndexBufferAddressHi = (uint)(mesh.IndexBufferView.BufferLocation >> 32),
                     IndexBufferBytes = mesh.IndexBufferView.SizeInBytes,
                     CullBone = mesh.CullBoneOf(partIndex),
-                    Flags = (uint)((mesh.CardOrigins ? MeshFlags.CardOrigins : MeshFlags.None) | (mesh.CellFade ? MeshFlags.CellFade : MeshFlags.None)),
+                    Flags = (uint)((mesh.CardOrigins ? MeshFlags.CardOrigins : MeshFlags.None) | (mesh.CellFade ? MeshFlags.CellFade : MeshFlags.None))
+                            | ((uint)(part.FarProfile & (FarTier.MaxProfiles - 1)) << 8),   // common.fx FarTierProfileOfPart
                 };
                 var lodEntry = BuildLodEntry(mesh, partIndex);
 
