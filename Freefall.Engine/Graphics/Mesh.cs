@@ -360,6 +360,14 @@ namespace Freefall.Graphics
         public Vector3[]? Positions { get; private set; }
         public uint[]? CpuIndices { get; private set; }
 
+        /// <summary>Lets go of the CPU copies a mesh keeps for physics cooking and the navmesh bake: a world cells' far
+        /// mesh is never cooked or baked (its stand-in shells would block the bake where the real rocks stand).</summary>
+        internal void DropCpuCopies()
+        {
+            Positions = null;
+            CpuIndices = null;
+        }
+
         /// <summary>
         /// The UVs of the vertices the coarsest LOD uses, vertex <see cref="CoarseUVBase"/> first, kept on the CPU for
         /// merging far meshes from it (a forest's far cards); null when the mesh has no LODs or its coarsest LOD is not

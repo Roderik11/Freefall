@@ -42,6 +42,22 @@ namespace Freefall.Components
         public int Seed;
 
         /// <summary>
+        /// What the graph places goes into the world's cells as records (<see cref="Freefall.World.WorldCells"/>) instead of
+        /// being instantiated: entities only within <see cref="EngineSettings.WorldCellsNear"/> of a viewer, instances round
+        /// the camera out to the far tier, and <see cref="Far"/> beyond. WORLD_CELLS_PLAN.md stage 1: off by default, since
+        /// the navmesh bake and graphs that keep clear of this one's output (ExcludeObstacles, MeshProjection onto
+        /// generated geometry) see only the cells spawned at the moment (stage 2).
+        /// </summary>
+        [System.ComponentModel.Description("Keep what the graph places as records in the world's cells instead of entities: entities only near a viewer, instances round the camera out to the far tier, the Far form beyond. For forests and rocks; the navmesh bake and graphs that avoid this output see only the cells spawned at the time.")]
+        public bool Cells;
+
+        /// <summary>What stands in for the placements past the far tier when <see cref="Cells"/> is on.</summary>
+        [System.ComponentModel.Description("With Cells on, what stands in for the placements past the far tier (800 m): Auto takes it from each part's material (trees' cards as a far forest, CliffRock shells merged into a far mesh, nothing for the rest), Cards only the far forest, Merged everything merged into a far mesh, None nothing.")]
+        public Freefall.World.FarForm Far = Freefall.World.FarForm.Auto;
+
+        private Freefall.World.WorldCells.Sink? _cellSink;
+
+        /// <summary>
         /// Child entity that holds all spawned output.
         /// Destroyed and recreated on each Execute() call.
         /// </summary>
@@ -115,6 +131,7 @@ namespace Freefall.Components
 
             int childCount = OutputEntity.Transform.GetChildCount();
             Debug.Log($"[PCG] '{Entity?.Name}' ran '{Graph.Name}' (tick {Engine.TickCount}): {Graph.Nodes.Count} nodes, {childCount} children spawned." +
+                      (sink is Freefall.World.WorldCells.Sink ? $" {Freefall.World.WorldCells.RecordsOf(this)} records in the world cells." : "") +
                       (TraceNodes ? " Points per node: " + DescribeNodeOutputs() : ""));
 
             // What the nodes put out was taken during the run: the graph (an asset all its users share) holds none of it
@@ -159,6 +176,7 @@ namespace Freefall.Components
         /// </summary>
         public void DestroyOutput()
         {
+            Freefall.World.WorldCells.Clear(this);
             if (OutputEntity == null) return;
 
             _generators.Remove(OutputEntity);
@@ -351,12 +369,16 @@ namespace Freefall.Components
             Invalidate();
         }
 
-        /// <summary>The enabled component on this entity that takes the placed prefabs instead of instances, or null.</summary>
+        /// <summary>
+        /// What takes the placed prefabs instead of instances: an enabled component on this entity that is a sink of its
+        /// own, else the world cells when <see cref="Cells"/> is on, else nothing (they are instantiated).
+        /// </summary>
         private IPlacementSink? PlacementSink()
         {
             foreach (var component in Entity.Components)
                 if (component is IPlacementSink sink && component.Enabled)
                     return sink;
+            if (Cells) return _cellSink ??= new Freefall.World.WorldCells.Sink(this, () => Far);
             return null;
         }
 

@@ -17,6 +17,7 @@
 #include "sky_common.fx"
 #include "particle_common.hlsli"
 #include "oit.hlsli"
+#include "underwater.hlsli"
 
 // ────────────── Push Constants ──────────────
 
@@ -31,6 +32,7 @@ cbuffer PushConstants : register(b3)
     uint DepthGBufIdx;         // DWORD 6   SRV: depth buffer for soft particles
     float LightScale;          // DWORD 7   Forward mode: EmissiveExposure (a light source's nits); Transparent (an albedo): 1
     uint ApplyFog;             // DWORD 8   1 in Forward mode: aerial perspective here (Transparent: the composition does it)
+    uint UnderwaterFrameIdx;   // DWORD 9   the eye under water, the OIT draws (after the underwater pass): StructuredBuffer<UnderwaterFrame>; else 0
 };
 
 #define BILLBOARD_CAMERA   0
@@ -101,6 +103,32 @@ float3 PyroBlackbody(float t)
     return rgb / max(max(rgb.r, rgb.g), max(rgb.b, 1e-4));
 }
 
+// A particle seen by an eye under water (UnderwaterFrameIdx): what the underwater pass does to what is opaque, which it
+// runs before the OIT draws. A lit one gets the daylight the water lets down to its depth; the way to it fades into the
+// water's own light, over the part of it under the surface (a particle in the air above is seen through the surface).
+// Before, bubbles and what floats in the water glowed through murky water at any distance
+float4 UnderwaterParticle(float3 position, float4 color, bool lit)
+{
+    StructuredBuffer<UnderwaterFrame> frames = ResourceDescriptorHeap[UnderwaterFrameIdx];
+    UnderwaterFrame f = frames[0];
+    float3 rel = position - CamPos;
+    float depth = f.SurfaceY + dot(f.Slope, rel.xz) - position.y;      // under the surface over it (< 0: above)
+    float eyeDepth = max(f.SurfaceY - CamPos.y, 0.0);
+    float dist = length(rel);
+    float path = depth >= 0.0 ? dist : dist * eyeDepth / max(eyeDepth - depth, 1e-3);
+    float3 dir = rel / max(dist, 1e-4);
+    if (lit && depth > 0.0)
+        color.rgb *= WaterDaylightAt(depth, f.ShallowColor, f.Visibility);
+    float3 sunRadiance = f.SunColor * f.SunIntensity * SunLightScale;
+    float midDepth = 0.5 * (eyeDepth + max(depth, 0.0));
+    float3 T = WaterTransmittance(path, f.ShallowColor, f.Visibility);
+    float3 fog = WaterInscatter(f.WaterColor, sunRadiance, f.SunUp, SkyAmbient(float3(0.0, 1.0, 0.0)), midDepth, dir,
+                                f.ShallowColor, f.Visibility);
+    color.rgb = color.rgb * T + fog * (1.0 - T) * color.a;
+    // Right at the eye a speck would be out of focus, a faint blur: drawn sharp, a mote a hand's width away was a blot
+    return color * smoothstep(0.25, 0.7, dist);
+}
+
 #define DRAW_SORTED   0     // the Transparent and Forward passes
 #define DRAW_COVERAGE 1     // OITMoments: only what the particle hides, no light
 #define DRAW_OIT      2     // OIT: both modes lit as Forward-mode particles
@@ -164,6 +192,9 @@ VSOutput DrawVS(uint vertexID, uint instanceID, uint draw)
         output.Color.rgb *= output.Color.a;
         output.Color *= lerp(0.3, 1.0, vis.Random);
     }
+    // The eye under water: the water's light and fog on the way to it (the OIT draws come after the underwater pass)
+    if (UnderwaterFrameIdx != 0 && draw != DRAW_SORTED)
+        output.Color = UnderwaterParticle(core.Position, output.Color, lit && forward);
     if (e.FadeInRate > 0.0)
         output.Color *= saturate(t * e.FadeInRate);
     // Volumetric: inside its range the near fog volume carries the particle (volumetric_fog_cs.hlsl CSFogInject), the

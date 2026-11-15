@@ -118,16 +118,22 @@ namespace Freefall.Base
 
         /// <summary>
         /// Internal constructor. When register is false, the entity is NOT added
-        /// to EntityManager — used by importers to build temp entities for
-        /// serialization without polluting the live scene.
+        /// to EntityManager and its components join no ComponentCache — used by importers to build temp entities for
+        /// serialization without polluting the live scene. (Until 2026-11-15 the components did join the caches and
+        /// were never taken out: every model import left a MeshRenderer at the origin in ComponentCache&lt;MeshRenderer&gt;,
+        /// which the navmesh bake and PCG's authored obstacles walk, and with GenerateCollider a MeshCollider too.)
         /// </summary>
         public Entity(string name, bool register)
         {
             Name = name;
+            _inCaches = register;
             Transform = AddComponent<Transform>();
             if (register)
                 EntityManager.AddEntity(this);
         }
+
+        // Whether its components are in their ComponentCache<T> (a registered entity's)
+        private readonly bool _inCaches;
 
         public T AddComponent<T>() where T : Component, new()
         {
@@ -140,9 +146,15 @@ namespace Freefall.Base
             ParallelWork.AssertSerial("Entity.AddComponent");   // the component caches other threads iterate
             _components.Add(component);
             component.Entity = this;
-            
-            ComponentCache<T>.Add(this, component);
-            
+
+            // Into its own type's cache, as InsertComponent and Destroy go by the runtime type: a component passed as a
+            // base type went into that base's cache and stayed there after Destroy
+            if (_inCaches)
+            {
+                if (component.GetType() == typeof(T)) ComponentCache<T>.Add(this, component);
+                else OpsFor(component.GetType()).Add(this, component);
+            }
+
             if (component is Transform t)
             {
                 Transform = t;
@@ -238,7 +250,8 @@ namespace Freefall.Base
                 Transform = t;
             }
 
-            OpsFor(component.GetType()).Add(this, component);
+            if (_inCaches)
+                OpsFor(component.GetType()).Add(this, component);
 
             component.Attached();
 

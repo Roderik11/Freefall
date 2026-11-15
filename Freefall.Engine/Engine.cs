@@ -840,6 +840,20 @@ namespace Freefall
          public float TerrainCollisionRadius { get; set; } = 1024f;
 
          /// <summary>
+         /// World cells (<see cref="Freefall.World.WorldCells"/>): a generator's cells are entities within this many
+         /// metres of a viewer, the "A" of WORLD_CELLS_PLAN.md.
+         /// </summary>
+         [Category("World Cells")]
+         [ValueRange(16f, 2048f)]
+         [System.ComponentModel.Description("Metres from a viewer (the player, else the camera) within which the cells of a generator with Cells on are entities, with their colliders and scripts; they go again 15 % further out. Past it they are drawn as instances, without entities.")]
+         public float WorldCellsNear { get; set; } = 200f;
+
+         /// <summary>Time a frame for making and dropping cells' entities and instances (at least one a frame).</summary>
+         [ValueRange(0.1f, 50f)]
+         [System.ComponentModel.Description("Milliseconds a frame for making and dropping the world cells' entities and instances; at least one cell is done each frame whatever it takes.")]
+         public float WorldCellsBudgetMs { get; set; } = 2f;
+
+         /// <summary>
          /// Characters are posed less often the smaller they are on screen and when out of view, and not at all
          /// once too small to be drawn (AnimatorSystem). Off = every character every frame.
          /// </summary>

@@ -938,6 +938,8 @@ namespace Freefall.Graphics
             float lightScale = mode == 0 || oit ? Atmosphere.EmissiveExposure : 1f;
             cmd.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(lightScale), 7);  // LightScale
             cmd.SetGraphicsRoot32BitConstant(0, mode == 0 || oit ? 1u : 0u, 8);                   // ApplyFog
+            // The eye under water: the OIT draws come after the underwater pass and fade into the water themselves
+            cmd.SetGraphicsRoot32BitConstant(0, oit ? Underwater.FrameSrv : 0u, 9);              // UnderwaterFrameIdx
 
             cmd.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
 

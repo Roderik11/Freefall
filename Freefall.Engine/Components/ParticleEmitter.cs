@@ -50,7 +50,9 @@ namespace Freefall.Components
     {
         None,
         Plane,   // Infinite horizontal plane at PlaneHeight (world Y)
-        Depth    // Screen-space collision against the depth GBuffer (opaque geometry)
+        Depth,   // Screen-space collision against the depth GBuffer (opaque geometry)
+        Ceiling  // A horizontal plane at PlaneHeight met from below, none born over it: a water surface for bubbles and
+                 // what floats in the water
     }
 
     public enum ParticleCollisionResponse

@@ -12,8 +12,13 @@ namespace Freefall.Graphics
         /// <summary>Metres from the camera (level) where the far meshes start to take over.</summary>
         public static float From = 800f;
 
-        /// <summary>Metres over which instances and far meshes dither into each other; 0 = off.</summary>
+        /// <summary>Metres over which instances and far meshes dither into each other; 0 = off. The world cells
+        /// (<see cref="Freefall.World.WorldCellSystem"/>) set it to <see cref="DefaultBand"/> while any generator keeps
+        /// its placements in cells, and back to 0 when none does.</summary>
         public static float Band;
+
+        /// <summary>The band while the far tier is on.</summary>
+        public const float DefaultBand = 100f;
 
         /// <summary>Metres a side of a cell, the unit they fade by: a cell's centre is at (floor(x / CellSize) + 0.5) × CellSize.</summary>
         public static float CellSize = 64f;

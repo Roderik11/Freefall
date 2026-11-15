@@ -31,6 +31,16 @@ namespace Freefall.Graphics
             float* attribute_weights, nuint attribute_count,
             byte* vertex_lock, nuint target_index_count, float target_error, uint options, float* result_error);
 
+        /// <summary>
+        /// Simplify an indexed triangle list by position alone (no attributes): the world cells' far meshes, whose rock
+        /// shells are welded by position first. Same contract as <see cref="meshopt_simplifyWithAttributes"/>.
+        /// </summary>
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern nuint meshopt_simplify(
+            uint* destination, uint* indices, nuint index_count,
+            float* vertex_positions, nuint vertex_count, nuint vertex_positions_stride,
+            nuint target_index_count, float target_error, uint options, float* result_error);
+
         /// <summary>The factor that turns a relative simplification error into an absolute one (the mesh extent).</summary>
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
         public static extern float meshopt_simplifyScale(float* vertex_positions, nuint vertex_count, nuint vertex_positions_stride);

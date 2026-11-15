@@ -69,9 +69,10 @@ cbuffer PushConstants : register(b3)
     uint OceanDataIdx;           // 14  StructuredBuffer<OceanData>, the ocean drawn this frame (shape Surf), 0 = none
 };
 
-#define COLL_NONE   0
-#define COLL_PLANE  1
-#define COLL_DEPTH  2
+#define COLL_NONE    0
+#define COLL_PLANE   1
+#define COLL_DEPTH   2
+#define COLL_CEILING 3      // a plane from below: a water surface for bubbles and what floats in the water
 
 #define RESP_KILL   0
 #define RESP_BOUNCE 1
@@ -640,6 +641,15 @@ bool integrate(ParticleEmitter e, inout ParticleCore p)
             newPos.y = e.PlaneHeight;
         }
     }
+    else if (e.CollisionMode == COLL_CEILING)
+    {
+        if (newPos.y >= e.PlaneHeight && p.Velocity.y > 0.0)
+        {
+            hit = true;
+            hitNormal = float3(0, -1, 0);
+            newPos.y = e.PlaneHeight;
+        }
+    }
     else if (e.CollisionMode == COLL_DEPTH && DepthTexIdx != 0)
     {
         float4 clip = mul(float4(newPos, 1.0), CollisionViewProjection);
@@ -752,8 +762,11 @@ void CSSimulate(uint3 gid : SV_GroupID, uint3 dtid : SV_DispatchThreadID)
             ParticleVisual v;
             spawn(e, pcg_hash(e.RandomSeed + local * 7919u + slot * 6271u), ringPos, p, v);
 
-            // None born under a roof (the box over a camera in a hall)
+            // None born under a roof (the box over a camera in a hall), none over a ceiling (what floats in the water, born
+            // in a box round the camera that reaches out of the water)
             if ((e.Flags & PARTICLE_FLAG_COVER) != 0 && UnderCover(p.Position))
+                p.Lifetime = 0.0;
+            if (e.CollisionMode == COLL_CEILING && p.Position.y >= e.PlaneHeight)
                 p.Lifetime = 0.0;
 
             RWStructuredBuffer<ParticleVisual> Visuals = ResourceDescriptorHeap[ParticleVisualUAVIdx];

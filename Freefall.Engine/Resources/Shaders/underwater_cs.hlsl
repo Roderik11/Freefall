@@ -26,28 +26,7 @@ cbuffer PushConstants : register(b3)
 #include "ocean_surf.hlsli"
 #include "underwater.hlsli"
 
-// Underwater.Frame (112 bytes)
-struct UnderwaterFrame
-{
-    float2 Slope;           // how the surface rises per metre of x and z near the camera
-    float SurfaceY;         // its height over the camera's xz (world)
-    uint Sea;               // 1: the sea's, from the probe's first place instead
-    float3 ShallowColor;    // the water's look (WaterBody.ShallowColor / OceanRenderer.ShallowColor)
-    float Visibility;       // metres (WaterBody.Visibility / OceanRenderer.ShoreFadeDepth)
-    float3 WaterColor;      // its deep colour (WaterBody.WaterColor / OceanRenderer.OceanColor)
-    float Caustics;         // EngineSettings.UnderwaterCaustics
-    float3 SunDirection;    // the way the directional light travels
-    float SunUp;            // how high it stands (−SunDirection.y, ≥ 0)
-    float3 SunColor;
-    float SunIntensity;     // × SunLightScale: pre-exposed E / π, as the water shaders take it
-    uint DepthSrv;          // the hardware depth, with the water in it (reverse Z: 0 = sky)
-    uint NormalsSrv;        // the G-buffer's world normals
-    uint ProbeCount;
-    uint OceanData;         // StructuredBuffer<OceanData> of this frame (OceanRenderer.SurfDataSrv); 0 = no sea
-    uint LinearDepthSrv;    // the opaque scene's view depth (0 = sky): where the full depth is nearer, the water was drawn
-    float Shafts;           // EngineSettings.UnderwaterShafts
-    uint2 _pad;
-};
+// Underwater.Frame (112 bytes): UnderwaterFrame in underwater.hlsli
 
 // ── The sea at a place ──
 

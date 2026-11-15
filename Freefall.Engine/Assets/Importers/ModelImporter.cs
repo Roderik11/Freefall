@@ -157,6 +157,14 @@ namespace Freefall.Assets.Importers
         public bool ImportAnimations = true;
         public bool CreateMaterials = true;
 
+        /// <summary>
+        /// A <see cref="MeshCollider"/> on every prefab this file makes, so the piece is solid wherever it is placed (a
+        /// kit's walls and roofs, a ruin's stones) and no generator has to add one to each copy. A prefab saved with edits
+        /// of its own (<see cref="Prefabs"/>) keeps its own components. Applied at import: a change needs a reimport.
+        /// </summary>
+        [Description("A mesh collider on every prefab this file makes, so the piece is solid wherever it is placed. A prefab saved with edits of its own keeps its own components. Applied at import.")]
+        public bool GenerateCollider = false;
+
 
         [ValueRange(0, 180)]
         public float SmoothingAngle = 66f;
@@ -507,6 +515,7 @@ namespace Freefall.Assets.Importers
 
 
                 entity.AddComponent(renderer);
+                if (GenerateCollider) entity.AddComponent(new MeshCollider());
 
                 // Serialize via EntitySerializer
                 var serializer = new EntitySerializer();

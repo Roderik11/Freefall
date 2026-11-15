@@ -149,6 +149,8 @@ namespace Freefall.Editor.Commands
                 // Where video memory goes: every committed resource by its maker, the largest ones, texture assets by
                 // folder, and what the ledger cannot see (swap chain, pipelines, the driver's own)
                 gpuMemory = Engine.Device != null ? Freefall.Graphics.GpuMemory.Describe(Engine.Device) : null,
+                // The world cells (PCGComponent.Cells): records, cells, what is made of them near and round the camera, far forms
+                worldCells = Freefall.World.WorldCells.Describe(),
                 // System tree in update order, one "Name  ms" line per system (indent = nesting)
                 systems = Freefall.Base.Systems.Describe().Split('\n', StringSplitOptions.RemoveEmptyEntries)
             });

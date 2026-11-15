@@ -58,11 +58,12 @@
     <None Update="Resources\**">
       <CopyToPublishDirectory>Never</CopyToPublishDirectory>
     </None>
-    <!-- meshoptimizer (LOD generation at import), built from ThirdParty/meshoptimizer with build.cmd; import only, so not published -->
+    <!-- meshoptimizer (LOD generation at import, and the world cells' far meshes, which a game builds when a generator
+         with Cells runs), built from ThirdParty/meshoptimizer with build.cmd -->
     <None Include="..\ThirdParty\meshoptimizer\win-x64\meshoptimizer.dll">
       <Link>meshoptimizer.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </None>
   </ItemGroup>
 

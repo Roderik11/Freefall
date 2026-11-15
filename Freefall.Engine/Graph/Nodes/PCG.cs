@@ -453,6 +453,9 @@ namespace Freefall.PCG
             public void Add(MeshRenderer renderer)
             {
                 if (renderer is not { Enabled: true, Mesh: { } mesh }) return;
+                // A world cells' far mesh (Mesh.CellFade) stands in for a whole generator's placements: its box would be
+                // the forest's or the bank's. What it stands for is in the generator's records (WORLD_CELLS_PLAN.md stage 2).
+                if (mesh.CellFade) return;
                 var bb = mesh.BoundingBox;
                 var transform = renderer.Entity.Transform.WorldMatrix;
                 var min = new Vector3(float.MaxValue);

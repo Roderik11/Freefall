@@ -54,6 +54,12 @@ namespace Freefall.Graphics
         /// </summary>
         public static bool CameraUnder { get; private set; }
 
+        /// <summary>
+        /// This frame's water at the camera (StructuredBuffer of UnderwaterFrame, underwater.hlsli) while the eye is under,
+        /// else 0: the particles drawn after the pass (the OIT draws) fade into the water with it, as what is opaque does.
+        /// </summary>
+        public static uint FrameSrv { get; private set; }
+
         public Underwater()
         {
             _shader = new ComputeShader("underwater_cs.hlsl");
@@ -99,6 +105,7 @@ namespace Freefall.Graphics
                 ? ocean != null && surface.Ocean == ocean && eye.Y < surface.Height + 4f
                 : eye.Y < surface.Height + 0.3f);
             CameraUnder = near && eye.Y < surface.Height;
+            FrameSrv = 0;
 
             // The world's sounds as through water while the eye is under (Engine.Muffled), eased over about a tenth of a second
             float muffled = Engine.Muffled + ((CameraUnder ? 1f : 0f) - Engine.Muffled) * MathF.Min(1f, Base.Time.SmoothDelta * 10f);
@@ -167,6 +174,7 @@ namespace Freefall.Graphics
                 LinearDepthSrv = linearDepth.BindlessIndex,
                 Shafts = Engine.Settings.UnderwaterShafts,
             };
+            if (CameraUnder) FrameSrv = _frames[slot].SrvIndex;
 
             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
             list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
