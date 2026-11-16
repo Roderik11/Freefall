@@ -110,6 +110,8 @@ namespace Freefall.World
             public Action? OnMoved;
             public readonly List<Slice> LongSlices = new();   // slices whose ring reaches past the far tier's (WorldCellSystem looks at them by distance)
             public int StatefulRecords;         // records with an id (their prefab keeps state)
+            public Dictionary<int, int>? RecordSlots;   // record → an instance slot its owner keeps and writes (a lit window's)
+            public List<int>? Slots;            // every instance slot handed over with a placement, record or live: freed when they go
             public Dictionary<int, ulong>? IdOverrides;   // ids of records that stand on the spot of an earlier one of the same prefab
 
             public Entity? FarEntity;
@@ -202,6 +204,7 @@ namespace Freefall.World
             o.Open = true;
             o.Generation++;
             o.Records.Clear();
+            o.RecordSlots = null;
             o.Kinds.Clear();
             o.KindIndex.Clear();
             o.LiveBecause.Clear();
@@ -216,10 +219,18 @@ namespace Freefall.World
         public static void Place(Component owner, Prefab prefab, Vector3 position, Quaternion rotation, Vector3 scale)
             => Place(owner, prefab, position, rotation, scale, 0f, SpawnFar.Generator);
 
-        /// <summary>One placement drawn with <paramref name="swap"/>'s materials in place of its prefab's (a house's palette;
-        /// null = its own). A live prefab's copy gets the swap as well.</summary>
-        public static void Place(Component owner, Prefab prefab, Vector3 position, Quaternion rotation, Vector3 scale, MaterialSwap? swap)
-            => Place(owner, prefab, position, rotation, scale, 0f, SpawnFar.Generator, swap);
+        /// <summary>
+        /// One placement drawn with <paramref name="swap"/>'s materials in place of its prefab's (a house's palette;
+        /// null = its own). A live prefab's copy gets the swap as well.
+        /// <para><paramref name="instanceSlot"/>: an InstanceData slot the caller allocated (filled with its effect's
+        /// defaults) and writes, drawn with for the prefab's effect that takes instance values, by the record's instances and
+        /// its copies near a viewer alike: a lit window's room light, switched for the record without an entity. It is freed
+        /// here when the owner's placements go (<see cref="Begin"/> again, <see cref="Clear"/>): the caller stops writing it
+        /// then, and after a script reload nobody else would still know it. 0 = the effect's defaults (instances) and each
+        /// copy's own slots.</para>
+        /// </summary>
+        public static void Place(Component owner, Prefab prefab, Vector3 position, Quaternion rotation, Vector3 scale, MaterialSwap? swap, int instanceSlot = 0)
+            => Place(owner, prefab, position, rotation, scale, 0f, SpawnFar.Generator, swap, instanceSlot);
 
         /// <summary>
         /// Whether placements of <paramref name="prefab"/> become records (else they are live: an entity everywhere, as
@@ -232,8 +243,8 @@ namespace Freefall.World
         public static void Place(Component owner, Prefab prefab, Vector3 position, Quaternion rotation, Vector3 scale, float ring, SpawnFar far)
             => Place(owner, prefab, position, rotation, scale, ring, far, null);
 
-        /// <summary>One placement with a ring, a far form and materials of its own.</summary>
-        public static void Place(Component owner, Prefab prefab, Vector3 position, Quaternion rotation, Vector3 scale, float ring, SpawnFar far, MaterialSwap? swap)
+        /// <summary>One placement with a ring, a far form, materials of its own and an instance slot of its own (above).</summary>
+        public static void Place(Component owner, Prefab prefab, Vector3 position, Quaternion rotation, Vector3 scale, float ring, SpawnFar far, MaterialSwap? swap, int instanceSlot = 0)
         {
             if (prefab == null) return;
             if (!s_owners.TryGetValue(owner.UID, out var o) || !o.Open)
@@ -247,6 +258,11 @@ namespace Freefall.World
                 e.Transform.Rotation = rotation;
                 e.Transform.Scale = scale;
                 swap?.ApplyTo(e);
+                if (instanceSlot > 0)
+                {
+                    ShareInstanceSlot(e, instanceSlot);
+                    (o.Slots ??= new()).Add(instanceSlot);
+                }
                 o.Live.Add(e);
                 o.LiveBecause[because] = o.LiveBecause.GetValueOrDefault(because) + 1;
                 return;
@@ -262,7 +278,31 @@ namespace Freefall.World
             }
             o.Kinds[index].MaxScale = MathF.Max(o.Kinds[index].MaxScale, MathF.Max(MathF.Abs(scale.X), MathF.Max(MathF.Abs(scale.Y), MathF.Abs(scale.Z))));
             o.Records.Add(new Record { Kind = index, Position = position, Rotation = rotation, Scale = scale });
+            if (instanceSlot > 0)
+            {
+                (o.RecordSlots ??= new())[o.Records.Count - 1] = instanceSlot;
+                (o.Slots ??= new()).Add(instanceSlot);
+            }
         }
+
+        // Every renderer of a copy draws with a slot its record's owner keeps (PersistentRenderer.ShareInstanceSlot)
+        private static void ShareInstanceSlot(Entity copy, int slot)
+        {
+            var stack = new Stack<Transform>();
+            stack.Push(copy.Transform);
+            while (stack.Count > 0)
+            {
+                var t = stack.Pop();
+                if (t.Entity != null)
+                    foreach (var c in t.Entity.Components)
+                        if (c is PersistentRenderer r) r.ShareInstanceSlot(slot);
+                for (int i = 0; i < t.Count; i++) stack.Push(t.GetChild(i));
+            }
+        }
+
+        // The instance slot a record's owner gave it (0: none)
+        private static int SlotOf(Owner o, int record) =>
+            o.RecordSlots != null && o.RecordSlots.TryGetValue(record, out int slot) ? slot : 0;
 
         /// <summary>
         /// The ring of a kind: the one asked for; with Auto, where its coarsest LOD starts when its far form draws that LOD
@@ -634,6 +674,12 @@ namespace Freefall.World
         {
             Unwatch(o);
             Unslice(o);
+            // The placements' own instance slots go with them (the owner allocated them; after a script reload nobody else
+            // still knows them)
+            if (o.Slots != null)
+                foreach (int slot in o.Slots) InstanceData.Release(slot);
+            o.Slots = null;
+            o.RecordSlots = null;
             foreach (var e in o.Live)
                 if (!e.IsBeingDestroyed) e.Destroy();   // gone already when the output was destroyed
             o.Live.Clear();
@@ -728,6 +774,7 @@ namespace Freefall.World
             foreach (int i in g.Records)
             {
                 var world = LocalOf(o.Records[i]) * o.ToWorld;
+                int recordSlot = SlotOf(o, i);
                 foreach (var rd in renderers)
                 {
                     if (!rd.Enabled || rd.Chains.Length == 0) continue;
@@ -737,8 +784,9 @@ namespace Freefall.World
                     foreach (var (part, own) in rd.Chains)
                     {
                         var material = kind.Swap?.Map(own) ?? own;
+                        int instanceSlot = recordSlot > 0 && material.Effect is { InstanceParams.Count: > 0 } ? recordSlot : InstanceSlotFor(material);
                         CommandBuffer.AddPersistent(g.Draws, rd.Mesh, part, material, NoParams, slot, lodManaged: true,
-                            instanceSlot: InstanceSlotFor(material), farTier: !kind.NoFar, farProfile: kind.Profile);
+                            instanceSlot: instanceSlot, farTier: !kind.NoFar, farProfile: kind.Profile);
                         draws++;
                     }
                 }
@@ -779,6 +827,7 @@ namespace Freefall.World
                 e.Transform.Rotation = r.Rotation;
                 e.Transform.Scale = r.Scale;
                 kind.Swap?.ApplyTo(e);
+                if (SlotOf(o, i) is > 0 and var recordSlot) ShareInstanceSlot(e, recordSlot);
                 if (kind.Stateful)
                 {
                     (slice.Stateful ??= new()).Add((e, i));

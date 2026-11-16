@@ -57,6 +57,26 @@ namespace Freefall.Components
 
         private List<(Effect effect, int slot)> InstanceSlots => _instanceSlots ?? NoSlots;
 
+        // A slot someone else owns and writes (a world cells record's: WorldCells.Place with an instance slot), drawn with
+        // for the effects that take instance values in place of slots of this renderer's own; 0 = none
+        private int _sharedInstanceSlot;
+
+        /// <summary>The slot this renderer draws with that someone else owns and writes (<see cref="ShareInstanceSlot"/>); 0 = none.</summary>
+        public int SharedInstanceSlot => _sharedInstanceSlot;
+
+        /// <summary>
+        /// Draw with <paramref name="slot"/> for every effect with instance values, in place of slots of its own: the
+        /// copy of a world cells record whose instance values its owner keeps and writes (a lit window), so the copy near a
+        /// viewer and the record's instances further out show the same. This renderer neither writes nor frees it. 0 = its
+        /// own slots again.
+        /// </summary>
+        internal void ShareInstanceSlot(int slot)
+        {
+            if (_sharedInstanceSlot == slot) return;
+            _sharedInstanceSlot = slot;
+            Invalidate();
+        }
+
         /// <summary>The mesh the draws are built from (null = nothing to draw).</summary>
         protected abstract Mesh? RenderMesh { get; }
 
@@ -235,6 +255,7 @@ namespace Freefall.Components
         {
             var effect = material?.Effect;
             if (effect == null || effect.InstanceParams.Count == 0) return 0;
+            if (_sharedInstanceSlot > 0) return _sharedInstanceSlot;   // its owner's; slots of its own stay unused (freed below)
 
             (_instanceSlotsUsed ??= new HashSet<string>()).Add(effect.Key);
             foreach (var (known, slot) in InstanceSlots)
