@@ -259,19 +259,29 @@ float3 GetNormal(float2 terrainUV)
 // at the same small offset (DecoEdgeWarp), then cubed; times the decorators' strength. Cubing after interpolating
 // keeps the tint to where the cards are: cubing each texel first spread a lime fringe a metre past every patch edge.
 // A decorator whose plants grow in strong clumps (ferns) also takes the spawn's clump field here, cubed as the spawn's
-// density, so the far ground shows the patches; one noise per decorator per pixel, and only where the clumped part
-// weighs (> 0.25).
+// density, so the far ground shows the patches; one noise per decorator per pixel (kept for two decorators: the loop
+// meets a decorator again in each of the four texels, and until 2026-11-16 it worked the 3-octave noise out again each
+// time, 4-5 times a pixel over most decorated ground), and only where the clumped part weighs (> 0.25).
 // How much the tint shows with distance: even plants (grass) lerp(0.2, 1) over 10..70 m, the ground between blades
 // staying for texture near the camera; clumped plants (ferns, between them bare floor) nothing while they are drawn,
 // then exactly as the spawn thins them out over the last 30% of their range, so they hand over without a band.
 // Returns rgb and that strength; 'growth' is the strength without the distance ramp (where something grows).
+
+// The edge offset (DecoEdgeWarp, under a metre) fades out over these distances and is left out past them: its four
+// noises were 0.08 ms of the far terrain in a TestWorld view, the grass that shares the edge ends at 120..140 m, and
+// out there it moved the patches' edges by one or two levels of 255 on a tenth of the pixels (2026-11-16)
+static const float WARP_FADE_START = 400.0;
+static const float WARP_FADE_END = 500.0;
+
 float4 DecoratorGroundTint(float2 terrainUV, float2 terrainLocal, float dist, out float growth)
 {
     growth = 0;
     TerrainDecoParams deco = LoadDeco(DecoControlMapIdx);
     if (!DecoPresent(deco)) return 0;
     StructuredBuffer<float4> tints = ResourceDescriptorHeap[DecoTintIdx];      // 2 per decorator (CS_DecoratorTints)
-    terrainUV += DecoEdgeWarp(terrainLocal) / TerrainSize;   // the pages run with terrain Z (the map before 5c against it)
+    float warpFade = 1.0 - smoothstep(WARP_FADE_START, WARP_FADE_END, dist);
+    if (warpFade > 0)
+        terrainUV += DecoEdgeWarp(terrainLocal) * warpFade / TerrainSize;   // the pages run with terrain Z (the map before 5c against it)
     // The four texels round the point in the finest page resident there, at that page's level (a coarse page far off:
     // its texels are 2^level metres); edges clamp as the whole map's did
     float2 c = terrainUV * float(deco.Texels);
@@ -290,6 +300,11 @@ float4 DecoratorGroundTint(float2 terrainUV, float2 terrainLocal, float dist, ou
     uint cachedGroup = 0xFFFFFFFFu;
     float4 cached = 0;          // the last decorator's colour and ramped strength here
     float cachedGrowth = 0;
+    // The clump masks worked out so far, for two decorators (the one used longer ago replaced when a third comes): the mask
+    // depends only on the point and the decorator, so this gives the same tint (to rounding) with one noise each
+    uint maskGroup0 = 0xFFFFFFFFu, maskGroup1 = 0xFFFFFFFFu;
+    float mask0 = 0, mask1 = 0;
+    bool maskNewest1 = false;
     [unroll] for (uint k = 0; k < 4; k++)
     {
         int2 offset = int2(k & 1, k >> 1);
@@ -313,7 +328,15 @@ float4 DecoratorGroundTint(float2 terrainUV, float2 terrainLocal, float dist, ou
                 {
                     float seed = floor(clumps.y * 0.5);
                     float amount = clumps.y - 2.0 * seed;
-                    float m = lerp(1.0, DecoClusterMask(clumpPos, clumps.x, (uint)seed), amount);
+                    float m;
+                    if (group == maskGroup0) { m = mask0; maskNewest1 = false; }
+                    else if (group == maskGroup1) { m = mask1; maskNewest1 = true; }
+                    else
+                    {
+                        m = lerp(1.0, DecoClusterMask(clumpPos, clumps.x, (uint)seed), amount);
+                        if (maskNewest1) { maskGroup0 = group; mask0 = m; maskNewest1 = false; }
+                        else { maskGroup1 = group; mask1 = m; maskNewest1 = true; }
+                    }
                     // Plants dropped at random cover 1 - e^-(leaf area) of the ground: ~0.85 in a fern patch's core,
                     // softly less towards its edge. Saturating the area made flat, opaque, hard-edged patches. x 0.75:
                     // at full cover the far patches were "a bit too present" (user)
@@ -467,6 +490,24 @@ float HexHeight(Texture2D heights, HexTiles h, out float3 weights)
     return dot(weights, hs);
 }
 
+// A layer's height where only its far scale shows (PS: past 90 m, nearShows false): one plain tap of the near tiling,
+// giving way over HEIGHT_MEAN_START..END to the map's mean (its smallest mip, one texel every pixel shares), alone
+// past that. Out there the tap reads mips of 16 x 16 texels and less, nearly the mean already, and what the height
+// still does (the blend between layers by their heights, SSDM's few centimetres) is under a pixel. Tapped to 2 km, it
+// was 0.17 ms of a TestWorld view's 2.09 (2026-11-16, with the near hexagons below), and shots of the far hills with
+// and without it differed no more than two shots of the same shader.
+static const float HEIGHT_MEAN_START = 400.0;
+static const float HEIGHT_MEAN_END = 500.0;
+float FarLayerHeight(Texture2D heights, float2 texuv, float2 dx, float2 dy, float meanBlend)
+{
+    float h = 0;
+    if (meanBlend < 1)
+        h = heights.SampleGrad(sampTrilinear, texuv, dx, dy).r;
+    if (meanBlend > 0)
+        h = lerp(h, heights.SampleLevel(sampTrilinear, float2(0.5, 0.5), 16).r, meanBlend);
+    return h;
+}
+
 // A layer's colour and normal tilt through the hexagons: with the given weights (from its height), or with weights from
 // the colours' brightness when 'byColor'
 void HexColorNormal(Texture2D diffuse, Texture2D normals, HexTiles h, float3 weights, bool byColor,
@@ -595,6 +636,7 @@ FragmentOutput PS(VertexOutput input)
     // Beyond the near scale (farBlend 1) a layer's height comes from one plain sample: the hexagons only matter where
     // the near texture shows, and three rotated height taps per layer, twice, were most of hex-tiling's cost far out
     bool nearShows = farBlend < 0.999;
+    float heightMean = smoothstep(HEIGHT_MEAN_START, HEIGHT_MEAN_END, viewDist);    // FarLayerHeight
 
     // Find max(effectiveWeight * (1 + heightVal))
     float maxCombined = -1;
@@ -614,7 +656,7 @@ FragmentOutput PS(VertexOutput input)
                 float3 unusedWeights;
                 heightVal = nearShows
                     ? HexHeight(heights, HexSetup(texuv, uvDdx * LayerTiling[layer].xy, uvDdy * LayerTiling[layer].xy, HEX_DOMINANT, LayerTint[layer].w), unusedWeights)
-                    : heights.SampleGrad(sampTrilinear, texuv, uvDdx * LayerTiling[layer].xy, uvDdy * LayerTiling[layer].xy).r;
+                    : FarLayerHeight(heights, texuv, uvDdx * LayerTiling[layer].xy, uvDdy * LayerTiling[layer].xy, heightMean);
             }
             maxCombined = max(maxCombined, ew + ew * heightVal);
         }
@@ -673,7 +715,9 @@ FragmentOutput PS(VertexOutput input)
                 float2 texuv = uv * LayerTiling[layer].xy;
                 float2 texDdx = uvDdx * LayerTiling[layer].xy, texDdy = uvDdy * LayerTiling[layer].xy;
                 float maxAngle = LayerTint[layer].w;
-                HexTiles hex = HexSetup(texuv, texDdx, texDdy, HEX_DOMINANT, maxAngle);
+                HexTiles hex = (HexTiles)0;     // the near scale's hexagons, only where it is sampled (SampleTwoScale)
+                if (farBlend < 1)
+                    hex = HexSetup(texuv, texDdx, texDdy, HEX_DOMINANT, maxAngle);
                 float2x2 farRot = FarRotation(maxAngle);
 
                 float heightVal = 0;
@@ -688,7 +732,7 @@ FragmentOutput PS(VertexOutput input)
                         hexByColor = false;
                     }
                     else
-                        heightVal = heights.SampleGrad(sampTrilinear, texuv, texDdx, texDdy).r;
+                        heightVal = FarLayerHeight(heights, texuv, texDdx, texDdy, heightMean);
                 }
 
                 float bd = max(ew + ew * heightVal - dispThreshold, 0);    // a layer without a height map is flat
