@@ -27,7 +27,7 @@ struct TerrainPaintParams
     uint   Texels;          // paint texels a side of the whole map at level 0
     uint   LayerSlices;     // array slices of a slot's weights
     uint   LayerCount;
-    uint   _pad0;
+    uint   Shape;           // Texture2DArray<float> R8_SNORM: the shape of the land (GroundShape), slices as TopLayer's; 0 = none
     float4 _pad1;
     float4 _pad2;
 };
@@ -104,6 +104,19 @@ uint PaintWeightsGrad(TerrainPaintParams p, float2 terrainUV, float2 dUVdx, floa
     [unroll] for (uint i = 0; i < 8; i++)
         if (i < slices) w[i] = pool.SampleGrad(s, float3(at.uv, at.slice0 + i), gx, gy);
     return slices;
+}
+
+// The shape of the land at a place (ground_shape.hlsli GroundShape, held to -1..1, all GroundShapeTint uses), as the page
+// bake left it beside the weights (terrain_splat_bake.hlsl), bilinear: one read where computing it takes nine heights 6
+// and 24 m apart. A coarse page's texel holds the mean over its footprint. False without it (no paint, or a pool without).
+bool PaintShape(TerrainPaintParams p, float2 terrainUV, SamplerState linearClamp, out float shape)
+{
+    shape = 0;
+    if (p.Shape == 0 || !PaintPresent(p)) return false;
+    PaintPlace at = PaintAt(p, terrainUV);
+    Texture2DArray<float> pool = ResourceDescriptorHeap[p.Shape];
+    shape = pool.SampleLevel(linearClamp, float3(at.uv, at.topSlice), 0);
+    return true;
 }
 
 #endif // TERRAIN_PAINT_HLSLI

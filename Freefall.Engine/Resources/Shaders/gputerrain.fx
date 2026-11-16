@@ -228,17 +228,19 @@ struct FragmentOutput
 	float2 Displacement	: SV_TARGET5;
 };
 
-// The terrain's normal at a terrain UV, from the height samples a step either side
+// The terrain's normal at a terrain UV, from the height samples a step either side (one table read for the four where
+// they share a page, a gather each: terrain_pages_near.hlsli TerrainHeight01Near)
 float3 GetNormal(float2 terrainUV)
 {
 	float4 h;
     TerrainPagesParams pages = LoadTerrain(TerrainPagesIdx);
     float2 s = terrainUV * (float)pages.Cells;
+    TerrainPageCursor cursor = TerrainCursorAt(pages, s);
 
-    h[0] = TerrainHeight01AtSample(pages, s + float2(0, -1));
-    h[1] = TerrainHeight01AtSample(pages, s + float2(-1, 0));
-    h[2] = TerrainHeight01AtSample(pages, s + float2(1, 0));
-    h[3] = TerrainHeight01AtSample(pages, s + float2(0, 1));
+    h[0] = TerrainHeight01Near(pages, cursor, s + float2(0, -1), sampHeight);
+    h[1] = TerrainHeight01Near(pages, cursor, s + float2(-1, 0), sampHeight);
+    h[2] = TerrainHeight01Near(pages, cursor, s + float2(1, 0), sampHeight);
+    h[3] = TerrainHeight01Near(pages, cursor, s + float2(0, 1), sampHeight);
 
     // Central difference spans two samples (h[1]-h[2], h[0]-h[3])
     float heightScale = MaxHeight / (2.0 * pages.Spacing);
@@ -808,9 +810,15 @@ FragmentOutput PS(VertexOutput input)
     variation = lerp(dot(variation, LUMA).xxx, variation, growing);
     color.rgb *= lerp(1.0.xxx, variation, macroReach);
 
-    // The shape of the land in its colour (ground_shape.hlsli; the grass standing here takes the same tint)
+    // The shape of the land in its colour (ground_shape.hlsli; the grass standing here takes the same tint), as the paint's
+    // page bake left it (terrain_paint.hlsli PaintShape). Computed here it read nine heights 6 and 24 m apart, and those
+    // scattered reads were 0.5 ms of a TestWorld view's 2.9 (2026-11-16); without the baked shape it still is. A split
+    // frame (computed left, baked right) showed no seam on the mountain from 1-2 km nor on its slopes from 150 m
     TerrainPagesParams pages = LoadTerrain(TerrainPagesIdx);
-    color.rgb *= GroundShapeTint(GroundShape(pages, pages.Origin.xz + input.UV2 * pages.Size), growing);
+    float shape;
+    if (!PaintShape(paint, input.UV2, sampHeightFilter, shape))
+        shape = GroundShape(pages, pages.Origin.xz + input.UV2 * pages.Size, sampHeight);
+    color.rgb *= GroundShapeTint(shape, growing);
     output.Albedo = float4(color.rgb, 0);
     output.Normals = float4(terrainNormal.xyz, 1);
     output.Data = float4(0.95, 0.0, 1.0, lerp(1.0, 0.5, swardLighting)); // matte, metal 0, ao 1, lit: PBR .. vegetation

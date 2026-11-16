@@ -869,8 +869,10 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             float3 groundTint = 1.0.xxx;
             if (SplatLayerCount > 0 && LayerPlantTintIdx != 0)
                 groundTint = LayerPlantTint(texelUV);
-            groundTint *= GroundShapeTint(GroundShape(pages, pages.Origin.xz + texelUV * pages.Size),
-                                          smoothstep(0.7, 0.9, terrainNormal.y));
+            float shape;    // as the paint's page bake left it, the same the ground under the plant reads
+            if (!PaintShape(LoadPaint(pages), texelUV, ClampSampler, shape))
+                shape = GroundShape(pages, pages.Origin.xz + texelUV * pages.Size, ClampSampler);
+            groundTint *= GroundShapeTint(shape, smoothstep(0.7, 0.9, terrainNormal.y));
             groundTint *= SwardGrain(localXZ);       // the sward's grain, as the ground under it from afar
 
             float instanceRot = float(pcg(instSeed + 731u)) / 4294967295.0 * 6.2831853;

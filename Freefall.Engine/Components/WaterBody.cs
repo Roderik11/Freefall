@@ -1436,6 +1436,11 @@ namespace Freefall.Components
                 _ice = Weather.StepIce(_ice, _iceHeight);
             }
 
+            // Out of the camera's view: nothing to fill in or enqueue (and no reflection pyramids asked for). Every water did
+            // it every frame, seen or not: TestWorld's 53 took 0.78 ms of CPU a frame with one in view (2026-11-16). The
+            // ice above still steps for all of them
+            if (!InView(mesh)) return;
+
             var sunDir = Vector3.UnitY;
             var sunColor = Vector3.One;
             float sunIntensity = 1.0f;
@@ -1515,6 +1520,35 @@ namespace Freefall.Components
             });
 
             CommandBuffer.Enqueue(mesh, _material, _params, Transform.TransformSlot);
+        }
+
+        // The main camera's frustum, made once a frame for every water (as ClothSystem culls)
+        private static int _frustumTick = -1;
+        private static Frustum _frustum;
+
+        /// <summary>The surface's bounds, in the world and a metre wider, touch the main camera's view (true without one).</summary>
+        private bool InView(Mesh mesh)
+        {
+            var camera = Camera.Main;
+            if (camera == null) return true;
+            if (_frustumTick != Engine.TickCount)
+            {
+                _frustumTick = Engine.TickCount;
+                _frustum = new Frustum(camera.ViewProjection);
+            }
+            var local = mesh.BoundingBox;
+            var world = Transform.WorldMatrix;
+            var min = new Vector3(float.MaxValue);
+            var max = new Vector3(float.MinValue);
+            for (int i = 0; i < 8; i++)
+            {
+                var corner = Vector3.Transform(new Vector3((i & 1) != 0 ? local.Max.X : local.Min.X,
+                                                           (i & 2) != 0 ? local.Max.Y : local.Min.Y,
+                                                           (i & 4) != 0 ? local.Max.Z : local.Min.Z), world);
+                min = Vector3.Min(min, corner);
+                max = Vector3.Max(max, corner);
+            }
+            return _frustum.Intersects(new BoundingBox(min - Vector3.One, max + Vector3.One)) != ContainmentType.Disjoint;
         }
     }
 }

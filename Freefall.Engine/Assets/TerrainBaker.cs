@@ -2606,6 +2606,7 @@ namespace Freefall.Assets
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.ResourceBarrierTransition(pool.Weights, ResourceStates.Common, ResourceStates.UnorderedAccess);
             cmd.ResourceBarrierTransition(pool.TopLayer, ResourceStates.Common, ResourceStates.UnorderedAccess);
+            cmd.ResourceBarrierTransition(pool.Shape, ResourceStates.Common, ResourceStates.UnorderedAccess);
 
             var k = _kernelSplatBake;
             _splatCS.SetBuffer(k, "StampBuf", _splatStampBuffer);
@@ -2619,6 +2620,7 @@ namespace Freefall.Assets
             _splatCS.SetParam(k, "MaxHeight", terrain.MaxHeight);
             _splatCS.SetParam(k, "TerrainSizeX", terrain.TerrainSize.X);
             _splatCS.SetPushConstant(k, "TopLayer", pool.TopUav);
+            _splatCS.SetPushConstant(k, "Shape", pool.ShapeUav);   // the shape of the land, beside the weights
 
             // Each page walks only the spline segments near it (terrain_coverage.hlsli PageShape)
             BuildPageShapes(plan, pages, pool.Texels, Graphics.PaintPool.Border, _pageShapes, _pageList);
@@ -2653,6 +2655,7 @@ namespace Freefall.Assets
             cmd.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(pool.Weights)));
             cmd.ResourceBarrierTransition(pool.Weights, ResourceStates.UnorderedAccess, ResourceStates.Common);
             cmd.ResourceBarrierTransition(pool.TopLayer, ResourceStates.UnorderedAccess, ResourceStates.Common);
+            cmd.ResourceBarrierTransition(pool.Shape, ResourceStates.UnorderedAccess, ResourceStates.Common);
         }
 
         // The splat plan whose stamps are in the upload buffers

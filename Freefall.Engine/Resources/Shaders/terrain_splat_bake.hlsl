@@ -24,6 +24,7 @@
 
 #include "terrain_stamp_common.hlsli"
 #include "terrain_coverage.hlsli"
+#include "ground_shape.hlsli"       // GroundShape: baked beside the weights, so the terrain and the plants read it once
 
 cbuffer PushConstants : register(b3)
 {
@@ -56,6 +57,7 @@ cbuffer PushConstants : register(b3)
     uint  PageStampCount;   // slot 26
     uint  RowStart;         // slot 27 — page: the slot's texel rows this dispatch bakes, from RowStart (a coarse page goes
     uint  RowCount;         // slot 28     over several frames, TerrainMapResidency); 0 rows = the whole slot
+    uint  ShapeIdx;         // slot 29 — page: UAV RWTexture2DArray<float> R8_SNORM, the shape of the land (0 = none)
 };
 
 #define PAINT_PAGE_TEXELS 256
@@ -176,10 +178,18 @@ uint TopOf(float raw[MAX_LAYERS], uint layerCount)
     return top;
 }
 
+// The shape of the land at a place (terrain UV), held to the -1..1 GroundShapeTint uses; 0 before there are heights
+float ShapeAt(TerrainPagesParams t, float2 terrainUV)
+{
+    if (ShapeIdx == 0 || !TerrainPresent(t)) return 0;
+    return clamp(GroundShape(t, t.Origin.xz + terrainUV * t.Size, sampHeightFilter), -1.0, 1.0);
+}
+
 // One page of the paint pool, border included: texel t of slot texels is level-L texel page * 256 + t - border. A level 0
 // texel is its centre's composite; a coarser one averages the visible weights of a 4 x 4 grid of points over its
 // footprint (2^L level 0 texels a side) and stacks them back into raw weights, so a road narrower than the texel still
-// shows (point-sampled, thin roads broke up, stage 0). Every slice and the top layer are written every bake.
+// shows (point-sampled, thin roads broke up, stage 0). Every slice and the top layer are written every bake, and the
+// shape of the land (the mean of the grid's on a coarse page): the terrain's shader read its nine heights per pixel.
 [numthreads(8, 8, 1)]
 void CS_SplatBakePage(uint3 dtid : SV_DispatchThreadID)
 {
@@ -192,10 +202,15 @@ void CS_SplatBakePage(uint3 dtid : SV_DispatchThreadID)
     float2 j = float2(int2(PageX, PageY) * PAINT_PAGE_TEXELS + int2(dtid.xy) - PAINT_BORDER);   // level L texel
     float span = float(1u << Level);
     float invTexels = 1.0 / float(Resolution);
+    TerrainPagesParams terrain = LoadTerrain(TerrainPagesIdx);
 
     float raw[MAX_LAYERS];
+    float shape = 0;
     if (Level == 0)
+    {
         Composite((j + 0.5) * invTexels, layerCount, true, dtid.y, raw);
+        shape = ShapeAt(terrain, (j + 0.5) * invTexels);
+    }
     else
     {
         const uint S = 4;
@@ -207,6 +222,7 @@ void CS_SplatBakePage(uint3 dtid : SV_DispatchThreadID)
                 float2 c = (j + (float2(a, b) + 0.5) / S) * span;   // level 0 texels
                 float sub[MAX_LAYERS];
                 Composite(c * invTexels, layerCount, true, dtid.y * S + b, sub);
+                shape += ShapeAt(terrain, c * invTexels) / float(S * S);
                 float cover = 1.0;
                 for (int k = int(layerCount) - 1; k >= 0; k--)
                 {
@@ -232,6 +248,11 @@ void CS_SplatBakePage(uint3 dtid : SV_DispatchThreadID)
     {
         RWTexture2DArray<uint> topLayer = ResourceDescriptorHeap[TopLayerIdx];
         topLayer[uint3(at, OutTopSlice)] = TopOf(raw, layerCount);
+    }
+    if (ShapeIdx != 0)
+    {
+        RWTexture2DArray<float> shapes = ResourceDescriptorHeap[ShapeIdx];
+        shapes[uint3(at, OutTopSlice)] = shape;
     }
 }
 

@@ -15,7 +15,10 @@ namespace Freefall.Graphics
     /// each texel the average of 2^L × 2^L level 0 texels' ground. Pages lie in terrain UV, +Z up (the whole-map array was
     /// Y-flipped). Four slots to a slice, 2 × 2, like the heights; a slot's layer slice g (four layers each) is array
     /// slice (slot / 4) · LayerSlices + g of <see cref="Weights"/> (RGBA8), and its top layer (the channel that shows most,
-    /// R8_UINT, 255 = none) array slice slot / 4 of <see cref="TopLayer"/>. Which page is in which slot, and the page table,
+    /// R8_UINT, 255 = none) array slice slot / 4 of <see cref="TopLayer"/>, and so is its shape of the land in
+    /// <see cref="Shape"/> (R8_SNORM, ground_shape.hlsli GroundShape held to −1..1: the terrain and the plants read it
+    /// once instead of nine heights 6 and 24 m apart, which cost 0.5 ms of a TestWorld view's terrain in scattered reads,
+    /// 2026-11-16). Which page is in which slot, and the page table,
     /// are <see cref="PageSlots"/>'s. Shaders read it only through terrain_paint.hlsli, from <c>TerrainPaintParams</c>,
     /// whose index the terrain's height params carry (<c>TerrainPagesParams.PaintIdx</c>).
     /// </summary>
@@ -40,7 +43,7 @@ namespace Freefall.Graphics
         public struct Params
         {
             public uint Weights, TopLayer, PageTable, PagesAcross;
-            public uint Texels, LayerSlices, LayerCount, Pad0;
+            public uint Texels, LayerSlices, LayerCount, Shape;
             public Vector4 Pad1, Pad2;
         }
 
@@ -55,14 +58,18 @@ namespace Freefall.Graphics
 
         public int Capacity => Weights != null ? Slots.Capacity : 0;
 
-        /// <summary>The weights (Texture2DArray RGBA8_UNorm) and the top layer (Texture2DArray R8_UInt). Rest in Common.</summary>
+        /// <summary>The weights (Texture2DArray RGBA8_UNorm), the top layer (Texture2DArray R8_UInt) and the shape of the land
+        /// (Texture2DArray R8_SNorm, slices as the top layer's). Rest in Common.</summary>
         public ID3D12Resource? Weights { get; private set; }
         public ID3D12Resource? TopLayer { get; private set; }
+        public ID3D12Resource? Shape { get; private set; }
 
         public uint WeightsSrv { get; private set; }
         public uint WeightsUav { get; private set; }
         public uint TopSrv { get; private set; }
         public uint TopUav { get; private set; }
+        public uint ShapeSrv { get; private set; }
+        public uint ShapeUav { get; private set; }
 
         private readonly GraphicsBuffer?[] _params = new GraphicsBuffer?[FrameCount];
 
@@ -108,9 +115,13 @@ namespace Freefall.Graphics
             TopLayer = device.CreateTexture2D(Format.R8_UInt, SliceTexels, SliceTexels, topSlices, 1,
                 ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
             TopLayer.Name = "Terrain paint top layer";
+            Shape = device.CreateTexture2D(Format.R8_SNorm, SliceTexels, SliceTexels, topSlices, 1,
+                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+            Shape.Name = "Terrain paint shape";
 
             (WeightsSrv, WeightsUav) = Views(Weights, Format.R8G8B8A8_UNorm, weightSlices);
             (TopSrv, TopUav) = Views(TopLayer, Format.R8_UInt, topSlices);
+            (ShapeSrv, ShapeUav) = Views(Shape, Format.R8_SNorm, topSlices);
 
             Slots.Reset(across, all ? 0 : capacity, 0, all);
             if (cmd != null) Slots.RecordTable(cmd);
@@ -163,6 +174,7 @@ namespace Freefall.Graphics
                     Texels = (uint)Texels,
                     LayerSlices = (uint)LayerSlices,
                     LayerCount = (uint)layerCount,
+                    Shape = ShapeSrv,
                 };
             }
             return buffer.SrvIndex;
@@ -183,9 +195,15 @@ namespace Freefall.Graphics
                 device.DeferReleaseBindlessIndex(TopSrv);
                 device.DeferReleaseBindlessIndex(TopUav);
             }
+            if (Shape != null)
+            {
+                device.DeferDispose(Shape);
+                device.DeferReleaseBindlessIndex(ShapeSrv);
+                device.DeferReleaseBindlessIndex(ShapeUav);
+            }
             Slots.Release();
-            Weights = TopLayer = null;
-            WeightsSrv = WeightsUav = TopSrv = TopUav = 0;
+            Weights = TopLayer = Shape = null;
+            WeightsSrv = WeightsUav = TopSrv = TopUav = ShapeSrv = ShapeUav = 0;
             Texels = LayerSlices = 0;
         }
 
