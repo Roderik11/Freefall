@@ -191,11 +191,13 @@ namespace Freefall.PCG
                 AddMesh(tris, mesh, worldM, min, max);
             }
 
-            // The world cells' records of the generators this one sees, each renderer with the matrix its entity would
-            // have: the same surface whichever cells are spawned
+            // The world cells' records of the generators this one sees, and of the spawners that are not PCG (the kits,
+            // whose output is generated as theirs is), each renderer with the matrix its entity would have: the same
+            // surface whichever cells are spawned
             if (!IgnoreGenerated)
                 Freefall.World.WorldCells.ForEachRendererIn(new Vector2(min.X, min.Z), new Vector2(max.X, max.Z),
-                    owner => owner is PCGComponent generator && generator != Owner && (Owner == null || Owner.Sees(generator)),
+                    owner => owner is not PCGComponent
+                             || owner is PCGComponent generator && generator != Owner && (Owner == null || Owner.Sees(generator)),
                     (rd, worldM) =>
                     {
                         var mesh = rd.Mesh;

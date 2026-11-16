@@ -65,6 +65,7 @@ namespace Freefall.World
             }
 
             if (Built.TryDequeue(out var result)) FarBuilder.Apply(result);
+            ApplyMoves();   // spawners whose output moved: their records' cells where it stands now
 
             // Instances of slices spawned two frames ago go: their entities draw by now
             for (int i = Dropping.Count - 1; i >= 0; i--)
@@ -165,9 +166,9 @@ namespace Freefall.World
 
             float a = Engine.Settings.WorldCellsNear;
             float enter = a * a, leave = enter * Leave * Leave;
-            float reach = FarTier.From + FarTier.Band;
-            foreach (var o in Owners) reach = MathF.Max(reach, o.MaxRing);
-            reach += RingMargin;
+            // The grid round the camera as far as the far tier's ring; slices wanted from further away (drawn until the
+            // GPU drops them: rocks, logs, a town) come from their owners' lists below, by distance
+            float reach = MathF.Max(FarTier.From + FarTier.Band, FarTier.From + FarTier.DefaultBand) + RingMargin;
 
             _toSpawn.Clear(); _toDespawn.Clear(); _toInstance.Clear(); _toDrop.Clear();
             _stamp++;
@@ -176,6 +177,16 @@ namespace Freefall.World
             int nearReach = (int)MathF.Ceiling(a * Leave / CellSize) + 1;
             foreach (var p in _viewers) Gather(p.X, p.Z, nearReach);
             Gather(eye.X, eye.Z, (int)MathF.Ceiling(reach * Leave / CellSize) + 1);
+            foreach (var o in Owners)
+                foreach (var slice in o.LongSlices)
+                {
+                    if (slice.Stamp == _stamp) continue;
+                    float dx = slice.Cell.Centre.X - eye.X, dz = slice.Cell.Centre.Y - eye.Z;
+                    float far = (slice.MaxRing + RingMargin) * Leave;
+                    if (dx * dx + dz * dz > far * far) continue;
+                    slice.Stamp = _stamp;
+                    _candidates.Add(slice);
+                }
 
             foreach (var slice in _candidates)
             {

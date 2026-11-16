@@ -130,13 +130,13 @@ namespace Freefall.World
 
         /// <summary>Main thread: copies what the build needs and starts it on a worker; the result is made into the scene by <see cref="WorldCellSystem"/>.</summary>
         // What the worker needs of a placement kind: whether its far form takes shells, takes cards merged, and its profile
-        private readonly record struct KindIn(bool Shells, bool Cards, int Profile);
+        private readonly record struct KindIn(bool Shells, bool Cards, int Profile, MaterialSwap? Swap);
 
         public static void Start(WorldCells.Owner o, PrefabShapes.Part[][] shapes)
         {
             var records = o.Records.ToArray();
             var cells = o.Slices.Select(s => new CellIn { Key = s.Cell.Key, Centre = s.Cell.Centre, Records = s.Records.ToArray() }).ToArray();
-            var kinds = o.Kinds.Select(k => new KindIn(k.Far is FarForm.Auto or FarForm.Merged, k.Far == FarForm.Merged, k.Profile)).ToArray();
+            var kinds = o.Kinds.Select(k => new KindIn(k.Far is FarForm.Auto or FarForm.Merged, k.Far == FarForm.Merged, k.Profile, k.Swap)).ToArray();
             var toWorld = o.ToWorld;
             Matrix4x4.Invert(toWorld, out var toLocal);
             var terrain = ComponentCache<TerrainRenderer>.All.FirstOrDefault();
@@ -174,7 +174,7 @@ namespace Freefall.World
                     for (int t = 0; t < part.Tri.Length; t += 3)
                     {
                         tri.Add(part.Tri[t] + baseV); tri.Add(part.Tri[t + 1] + baseV); tri.Add(part.Tri[t + 2] + baseV);
-                        mats.Add(part.Material);
+                        mats.Add(part.Material == null ? null : kind.Swap?.Map(part.Material) ?? part.Material);
                     }
                 }
                 var p = new Piece { Pos = pos.ToArray(), Tri = tri.ToArray(), TriMaterial = mats.ToArray(), Profile = kind.Profile };
@@ -205,7 +205,7 @@ namespace Freefall.World
                     {
                         if (!kind.Cards || part.Kind != PrefabShapes.Kind.Card || part.Material == null) continue;
                         var lm = local ??= WorldCells.LocalOf(r);
-                        var key = (part.Material, kind.Profile);
+                        var key = (kind.Swap?.Map(part.Material) ?? part.Material, kind.Profile);
                         if (!cards.TryGetValue(key, out var c)) cards[key] = c = (new(), new(), new(), new(), new());
                         uint baseV = (uint)c.P.Count;
                         var centre = Vector3.Transform(part.Centre, lm);

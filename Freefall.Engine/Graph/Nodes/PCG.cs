@@ -502,14 +502,23 @@ namespace Freefall.PCG
             if (_depth > 0 && --_depth == 0) _batch = null;
         }
 
-        /// <summary>Renderers no PCG component spawned.</summary>
+        /// <summary>
+        /// Renderers no PCG component spawned, with the world cells' records of the spawners that are not PCG components
+        /// (the kits' houses, walls and holds), each with the matrix its entity would have; the near cells' copies are left
+        /// out, their records stand for them.
+        /// </summary>
         public Set Authored()
         {
             if (_authored != null) return _authored;
             var set = new Set();
             foreach (var renderer in ComponentCache<MeshRenderer>.All)
-                if (renderer.Enabled && renderer.Mesh != null && PCGComponent.GeneratorOf(renderer.Entity) == null)
+                if (renderer.Enabled && renderer.Mesh != null && PCGComponent.GeneratorOf(renderer.Entity) == null
+                    && !Freefall.World.WorldCells.IsCellCopy(renderer.Entity))
                     set.Add(renderer);
+            Freefall.World.WorldCells.ForEachRenderer(owner => owner is not PCGComponent, (rd, world) =>
+            {
+                if (rd.Enabled) set.Add(rd.Mesh, world);
+            });
             return _authored = set;
         }
 

@@ -84,6 +84,8 @@ namespace Freefall.World
             public float MaxScale;              // its placements' largest axis scale (in the output frame)
             public bool Coarse;                 // the ring is where its coarsest LOD starts, which its far form draws as it is
             public bool Stateful;               // its prefab keeps state of its own (IRecordState): its records have ids
+            public MaterialSwap? Swap;          // materials it draws with in place of its prefab's (a house's palette)
+            public bool NoFar;                  // nothing stands in for it far away: its instances draw until the GPU's size cull drops them, with no far tier fade
         }
 
         internal sealed class Owner
@@ -96,7 +98,7 @@ namespace Freefall.World
             public Matrix4x4 ToWorld = Matrix4x4.Identity;
             public float FrameScale = 1f;       // the output frame's largest axis scale
             public readonly List<Kind> Kinds = new();
-            public readonly Dictionary<(Prefab, float, FarForm), int> KindIndex = new();
+            public readonly Dictionary<(Prefab, float, FarForm, MaterialSwap?), int> KindIndex = new();
             public readonly List<Record> Records = new();
             public readonly List<Slice> Slices = new();
             public readonly List<Entity> Live = new();           // live prefabs, made as entities under the container at once
@@ -104,6 +106,9 @@ namespace Freefall.World
             public bool Open;                   // between Begin and End
             public int Generation;              // a far build of an earlier generation is dropped
             public float MaxRing;               // the farthest any of its kinds reaches (from + band)
+            public readonly List<Transform> Watched = new();  // its output and everything above it, whose moves it hears of
+            public Action? OnMoved;
+            public readonly List<Slice> LongSlices = new();   // slices whose ring reaches past the far tier's (WorldCellSystem looks at them by distance)
             public int StatefulRecords;         // records with an id (their prefab keeps state)
             public Dictionary<int, ulong>? IdOverrides;   // ids of records that stand on the spot of an earlier one of the same prefab
 
@@ -138,6 +143,7 @@ namespace Freefall.World
             public bool Near;                           // a viewer within A: its entities
             public Entity? Spawned;
             public List<(Entity Copy, int Record)>? Stateful;   // its copies that keep state, while it is spawned
+            public float MaxRing;                       // the farthest any of its groups is wanted from (its kinds' rings)
             public int Stamp;                           // the look that last visited it
         }
 
@@ -210,8 +216,24 @@ namespace Freefall.World
         public static void Place(Component owner, Prefab prefab, Vector3 position, Quaternion rotation, Vector3 scale)
             => Place(owner, prefab, position, rotation, scale, 0f, SpawnFar.Generator);
 
+        /// <summary>One placement drawn with <paramref name="swap"/>'s materials in place of its prefab's (a house's palette;
+        /// null = its own). A live prefab's copy gets the swap as well.</summary>
+        public static void Place(Component owner, Prefab prefab, Vector3 position, Quaternion rotation, Vector3 scale, MaterialSwap? swap)
+            => Place(owner, prefab, position, rotation, scale, 0f, SpawnFar.Generator, swap);
+
+        /// <summary>
+        /// Whether placements of <paramref name="prefab"/> become records (else they are live: an entity everywhere, as
+        /// <see cref="Place(Component, Prefab, Vector3, Quaternion, Vector3)"/> makes them). For a spawner that keeps its live
+        /// pieces itself, under entities of its own (a house's door leaves and lit windows under the house).
+        /// </summary>
+        public static bool IsRecord(Prefab prefab) => prefab != null && PrefabShapes.LiveBecause(prefab) == null;
+
         /// <summary>One placement with a ring (metres; 0 = the owner's) and a far form of its own.</summary>
         public static void Place(Component owner, Prefab prefab, Vector3 position, Quaternion rotation, Vector3 scale, float ring, SpawnFar far)
+            => Place(owner, prefab, position, rotation, scale, ring, far, null);
+
+        /// <summary>One placement with a ring, a far form and materials of its own.</summary>
+        public static void Place(Component owner, Prefab prefab, Vector3 position, Quaternion rotation, Vector3 scale, float ring, SpawnFar far, MaterialSwap? swap)
         {
             if (prefab == null) return;
             if (!s_owners.TryGetValue(owner.UID, out var o) || !o.Open)
@@ -224,17 +246,18 @@ namespace Freefall.World
                 e.Transform.Position = position;
                 e.Transform.Rotation = rotation;
                 e.Transform.Scale = scale;
+                swap?.ApplyTo(e);
                 o.Live.Add(e);
                 o.LiveBecause[because] = o.LiveBecause.GetValueOrDefault(because) + 1;
                 return;
             }
             float kindRing = ring > 0f ? ring : o.Ring;   // 0 = Auto, resolved at End
             var kindFar = far == SpawnFar.Generator ? o.Far : (FarForm)((int)far - 1);
-            var key = (prefab, kindRing, kindFar);
+            var key = (prefab, kindRing, kindFar, swap);
             if (!o.KindIndex.TryGetValue(key, out int index))
             {
                 index = o.Kinds.Count;
-                o.Kinds.Add(new Kind { Prefab = prefab, RingSet = kindRing, Far = kindFar, CullTerm = CullTermOf(prefab), Stateful = PrefabShapes.IsStateful(prefab) });
+                o.Kinds.Add(new Kind { Prefab = prefab, RingSet = kindRing, Far = kindFar, CullTerm = CullTermOf(prefab), Stateful = PrefabShapes.IsStateful(prefab), Swap = swap });
                 o.KindIndex[key] = index;
             }
             o.Kinds[index].MaxScale = MathF.Max(o.Kinds[index].MaxScale, MathF.Max(MathF.Abs(scale.X), MathF.Max(MathF.Abs(scale.Y), MathF.Abs(scale.Z))));
@@ -250,7 +273,21 @@ namespace Freefall.World
         private static void ResolveRing(Owner o, Kind k)
         {
             k.Coarse = false;
+            k.NoFar = false;
             float ring = k.RingSet > 0f ? k.RingSet : FarTier.From;
+
+            // Nothing stands in for it far away (no far form, or none of its parts are what its far form takes): it is drawn
+            // as an entity would be, until the GPU's size cull drops it, wherever that is (logs, rocks, a town's pieces)
+            if (k.RingSet <= 0f && !HasFarForm(k) && k.CullTerm > 0f)
+            {
+                float fovFactor = Camera.Main is { FoVFactor: > 0f } c ? c.FoVFactor : 5.8284f;   // 45° when there is no camera
+                float cull = k.CullTerm * k.MaxScale * o.FrameScale * Engine.Settings.LODScale * MathF.Sqrt(fovFactor) * 1.1f;
+                k.NoFar = true;
+                k.Ring = MathF.Max(2f * CellSize, MathF.Ceiling(cull / 16f) * 16f);
+                k.Profile = 0;
+                return;
+            }
+
             if (k.RingSet <= 0f && k.Far != FarForm.None)
             {
                 float coarseTerm = 0f;
@@ -285,6 +322,18 @@ namespace Freefall.World
             k.Profile = FarTier.ProfileFor(ring);
         }
 
+        // How far from the camera a kind's instances are wanted at most: its ring and band, or where the GPU stops drawing it
+        private static float ReachOf(Kind k) => k.NoFar ? k.Ring : FarTier.FromOf(k.Profile) + FarTier.BandOf(k.Profile);
+
+        // Whether its far form takes any of its parts: cards (Auto, Cards, Merged) or CliffRock shells (Auto, Merged)
+        private static bool HasFarForm(Kind k)
+        {
+            if (k.Far == FarForm.None) return false;
+            foreach (var part in PrefabShapes.Of(k.Prefab))
+                if (k.Far != FarForm.Cards || part.Kind == PrefabShapes.Kind.Card) return true;
+            return false;
+        }
+
         // The largest radius among a prefab's drawn renderers, in the prefab's frame, over the GPU's cull size: the factor
         // that gives the distance past which none of it is drawn (cull_instances.hlsl CullK)
         private static float CullTermOf(Prefab prefab)
@@ -313,14 +362,63 @@ namespace Freefall.World
                 if (o.Records.Count == 0 && o.Live.Count == 0) s_owners.Remove(o.Uid);
                 return;
             }
+            Build(o);
+            Watch(o);
+        }
 
+        // ── Moving a spawner ──
+
+        // Owners whose output (or something above it) moved since the last frame: re-sliced by the system
+        private static readonly HashSet<Owner> s_moved = new();
+
+        // The owner hears of its output and everything above it moving (Transform.OnChanged is a transform's own change)
+        private static void Watch(Owner o)
+        {
+            Unwatch(o);
+            o.OnMoved ??= () => s_moved.Add(o);
+            for (var t = o.Container?.Transform; t != null; t = t.Parent)
+            {
+                t.OnChanged += o.OnMoved;
+                o.Watched.Add(t);
+            }
+        }
+
+        private static void Unwatch(Owner o)
+        {
+            foreach (var t in o.Watched) t.OnChanged -= o.OnMoved;
+            o.Watched.Clear();
+        }
+
+        /// <summary>
+        /// The owners whose output moved (a house dragged, its street's group turned): their records stay where they are in
+        /// the output's frame, so their cells, instances and far forms are made again where the output now stands. Once a
+        /// frame, from <see cref="WorldCellSystem"/>.
+        /// </summary>
+        internal static void ApplyMoves()
+        {
+            if (s_moved.Count == 0) return;
+            var moved = s_moved.ToArray();
+            s_moved.Clear();
+            foreach (var o in moved)
+            {
+                if (o.Open || !o.Alive || o.Records.Count == 0 || !s_owners.TryGetValue(o.Uid, out var current) || current != o) continue;
+                if (o.Container!.Transform.WorldMatrix == o.ToWorld) continue;   // its own child changed, or a change that moved nothing
+                Unslice(o);
+                Build(o);
+                Watch(o);
+            }
+        }
+
+        // The records into their cells where the output stands now, their rings resolved, and the far forms made
+        private static void Build(Owner o)
+        {
             o.ToWorld = o.Container!.Transform.WorldMatrix;
             o.FrameScale = MaxAxisScale(o.ToWorld);
             o.MaxRing = 0f;
             foreach (var k in o.Kinds)
             {
                 ResolveRing(o, k);
-                o.MaxRing = MathF.Max(o.MaxRing, FarTier.FromOf(k.Profile) + FarTier.BandOf(k.Profile));
+                o.MaxRing = MathF.Max(o.MaxRing, ReachOf(k));
             }
 
             var byKey = new Dictionary<(int, int), Slice>();
@@ -350,6 +448,17 @@ namespace Freefall.World
                 if (group == null) slice.Groups.Add(group = new Group { Slice = slice, Kind = r.Kind });
                 group.Records.Add(i);
                 group.MaxScale = MathF.Max(group.MaxScale, MathF.Max(MathF.Abs(r.Scale.X), MathF.Max(MathF.Abs(r.Scale.Y), MathF.Abs(r.Scale.Z))) * o.FrameScale);
+            }
+
+            // The slices wanted from further away than the far tier's ring: the system looks at them by distance, not
+            // through the grid round the camera (which reaches only as far as the far tier)
+            o.LongSlices.Clear();
+            float shortReach = FarTier.From + FarTier.DefaultBand;
+            foreach (var s in o.Slices)
+            {
+                s.MaxRing = 0f;
+                foreach (var g in s.Groups) s.MaxRing = MathF.Max(s.MaxRing, ReachOf(o.Kinds[g.Kind]));
+                if (s.MaxRing > shortReach) o.LongSlices.Add(s);
             }
 
             // Far forms: cards as a far forest per profile, shells (and Merged kinds' cards) in one far mesh
@@ -523,6 +632,16 @@ namespace Freefall.World
 
         private static void Drop(Owner o)
         {
+            Unwatch(o);
+            Unslice(o);
+            foreach (var e in o.Live)
+                if (!e.IsBeingDestroyed) e.Destroy();   // gone already when the output was destroyed
+            o.Live.Clear();
+        }
+
+        // What its records were made into goes (near copies, instances, far forms); the records and the live entities stay
+        private static void Unslice(Owner o)
+        {
             foreach (var slice in o.Slices)
             {
                 slice.Gone = true;
@@ -540,9 +659,7 @@ namespace Freefall.World
                 if (cell.Slices.Count == 0) s_cells.Remove(cell.Key);
             }
             o.Slices.Clear();
-            foreach (var e in o.Live)
-                if (!e.IsBeingDestroyed) e.Destroy();   // gone already when the output was destroyed
-            o.Live.Clear();
+            o.LongSlices.Clear();
             DropFar(o);
             Forest.Remove(o);
             o.Generation++;
@@ -573,6 +690,8 @@ namespace Freefall.World
         internal static float RingOf(Group g, float cullFactor)
         {
             var kind = g.Slice.Owner.Kinds[g.Kind];
+            if (kind.NoFar)   // where the GPU stops drawing the largest of them, with the camera as it is now
+                return cullFactor > 0f ? kind.CullTerm * g.MaxScale * cullFactor + 0.71f * CellSize : kind.Ring;
             float ring = FarTier.FromOf(kind.Profile) + FarTier.BandOf(kind.Profile);
             if (kind.CullTerm > 0f && cullFactor > 0f)
                 ring = MathF.Min(ring, kind.CullTerm * g.MaxScale * cullFactor + 0.71f * CellSize);
@@ -615,10 +734,11 @@ namespace Freefall.World
                     int slot = TransformBuffer.Instance.AllocateSlot();
                     TransformBuffer.Instance.SetTransform(slot, rd.ToRoot * world);
                     g.Slots.Add(slot);
-                    foreach (var (part, material) in rd.Chains)
+                    foreach (var (part, own) in rd.Chains)
                     {
+                        var material = kind.Swap?.Map(own) ?? own;
                         CommandBuffer.AddPersistent(g.Draws, rd.Mesh, part, material, NoParams, slot, lodManaged: true,
-                            instanceSlot: InstanceSlotFor(material), farTier: true, farProfile: kind.Profile);
+                            instanceSlot: InstanceSlotFor(material), farTier: !kind.NoFar, farProfile: kind.Profile);
                         draws++;
                     }
                 }
@@ -658,6 +778,7 @@ namespace Freefall.World
                 e.Transform.Position = r.Position;
                 e.Transform.Rotation = r.Rotation;
                 e.Transform.Scale = r.Scale;
+                kind.Swap?.ApplyTo(e);
                 if (kind.Stateful)
                 {
                     (slice.Stateful ??= new()).Add((e, i));
@@ -737,6 +858,13 @@ namespace Freefall.World
                 });
         }
 
+        /// <summary>Every renderer of the records of the owners <paramref name="takes"/> agrees to, with its world matrix.</summary>
+        internal static void ForEachRenderer(Func<Component, bool> takes, Action<PrefabShapes.Renderer, Matrix4x4> visit)
+        {
+            foreach (var o in s_owners.Values.OrderBy(o => o.Uid))
+                if (takes(o.Component)) ForEachRenderer(o, visit);
+        }
+
         /// <summary>The records' renderers of a component that keeps its placements here (none if it does not).</summary>
         internal static void ForEachRenderer(Component owner, Action<PrefabShapes.Renderer, Matrix4x4> visit)
         {
@@ -799,7 +927,7 @@ namespace Freefall.World
                 foreach (var part in shapes[r.Kind])
                 {
                     if (part.Kind != PrefabShapes.Kind.Card || part.Material == null || part.Mesh == null) continue;
-                    var key = new FarForest.Kind(part.Mesh, part.PartIndex, part.Material, placed.Profile);
+                    var key = new FarForest.Kind(part.Mesh, part.PartIndex, placed.Swap?.Map(part.Material) ?? part.Material, placed.Profile);
                     if (!kindOf.TryGetValue(key, out int kind))
                     {
                         kind = kinds.Count;
@@ -927,8 +1055,9 @@ namespace Freefall.World
                         prefab = k.Prefab.Name,
                         records = count,
                         instanced,
-                        ring = FarTier.FromOf(k.Profile),
+                        ring = k.NoFar ? k.Ring : FarTier.FromOf(k.Profile),
                         coarse = k.Coarse,          // the ring is where its coarsest LOD starts (Auto)
+                        noFar = k.NoFar,            // no far form: drawn until the GPU drops it, the ring is where that is
                         cullsAt = Math.Round(k.CullTerm * maxScale * cullFactor),
                         far = k.Far.ToString(),
                     };
