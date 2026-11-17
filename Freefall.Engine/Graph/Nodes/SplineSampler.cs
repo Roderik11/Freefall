@@ -25,7 +25,15 @@ namespace Freefall.PCG
         /// Rows over the closed spline's area, Spacing apart and Spacing between the points of a row, the rows along
         /// the longest control edge: an orchard, a vineyard, a planted copse.
         /// </summary>
-        Rows
+        Rows,
+
+        /// <summary>
+        /// Pieces end to end round the outline of the control points, moved EdgeInset in (closed splines) with
+        /// mitred corners. The outline splits into runs where it turns 20° or more, and each run is divided evenly
+        /// into segments no longer than Spacing, one point at the middle of each, facing along its run. The runs
+        /// end at the corners, so a hedge or fence round a plot meets itself there instead of crossing.
+        /// </summary>
+        Outline
     }
 
     /// <summary>
@@ -55,15 +63,21 @@ namespace Freefall.PCG
         /// <summary>
         /// PerEdge / EvenSpacing on a closed spline: move each sample this far toward the polygon interior
         /// (negative = outward), independent of winding. E.g. props on a sidewalk just inside a curb.
+        /// Outline: the outline itself moves in (mitred corners). Area / Rows: points nearer the outline than this
+        /// are left out, so what grows there keeps inside the area (bushes and trees in a yard).
         /// </summary>
         [ValueRange(-20f, 20f)]
+        [Description("How far in from the outline (m). PerEdge / EvenSpacing: each sample moves in. Outline: the outline moves in, mitred at the corners. Area / Rows: points nearer the outline are left out.")]
         public float EdgeInset = 0f;
 
         /// <summary>
-        /// PerEdge / EvenSpacing on a closed spline: turn samples so their local +X points out of the polygon
+        /// PerEdge / EvenSpacing / Outline on a closed spline: turn samples so their local +X points out of the polygon
         /// (by default +X is the right-hand side of travel, which flips with winding). E.g. lantern arms over the street.
         /// </summary>
         public bool OrientOutward = false;
+
+        /// <summary>Outline: a turn of the outline at least this sharp ends a run (degrees).</summary>
+        private const float OutlineCornerDegrees = 20f;
 
         [Output]
         public SamplePointSet Output;
@@ -82,11 +96,17 @@ namespace Freefall.PCG
                 SamplingMode.PerEdge => SamplePerEdge(Spline),
                 SamplingMode.Area => SampleArea(Spline),
                 SamplingMode.Rows => SampleRows(Spline),
+                SamplingMode.Outline => SampleOutline(Spline),
                 _ => SamplePointSet.Empty()
             };
 
-            if ((EdgeInset != 0f || OrientOutward) && Mode != SamplingMode.Area && Mode != SamplingMode.Rows && Spline.Closed)
+            if ((EdgeInset != 0f || OrientOutward) && (Mode == SamplingMode.EvenSpacing || Mode == SamplingMode.PerEdge) && Spline.Closed)
                 ApplyEdgeFrame(result, Spline);
+
+            // Area and Rows keep EdgeInset clear of the outline (until 2026-11-17 they ignored it: a yard's bushes
+            // set 2.8 m in grew over its curb)
+            if (EdgeInset > 0f && (Mode == SamplingMode.Area || Mode == SamplingMode.Rows) && Spline.Closed)
+                result = KeepClearOfOutline(result, Spline.Points, EdgeInset);
 
             SetOutput("Output", result);
             Debug.Log($"[SplineSampler] Produced {result.Count} samples (mode={Mode}, spacing={Spacing}m)");
@@ -403,6 +423,148 @@ namespace Freefall.PCG
                 if (OrientOutward && side < 0)
                     set.rotation[i] = Quaternion.Normalize(set.rotation[i] * Quaternion.CreateFromAxisAngle(Vector3.UnitY, MathF.PI));
             }
+        }
+
+        /// <summary>The points at least <paramref name="clearance"/> from every edge of the closed control polygon.</summary>
+        private static SamplePointSet KeepClearOfOutline(SamplePointSet set, IList<Vector3> polygon, float clearance)
+        {
+            int n = polygon.Count;
+            float clearanceSq = clearance * clearance;
+            return set.Filter(i =>
+            {
+                var p = new Vector2(set.position[i].X, set.position[i].Z);
+                for (int k = 0; k < n; k++)
+                {
+                    var a = new Vector2(polygon[k].X, polygon[k].Z);
+                    var b = new Vector2(polygon[(k + 1) % n].X, polygon[(k + 1) % n].Z);
+                    var ab = b - a;
+                    float t = Math.Clamp(Vector2.Dot(p - a, ab) / Math.Max(ab.LengthSquared(), 1e-6f), 0f, 1f);
+                    if (Vector2.DistanceSquared(p, a + ab * t) < clearanceSq) return false;
+                }
+                return true;
+            });
+        }
+
+        /// <summary>
+        /// Outline mode: the control polygon (moved EdgeInset in when closed) split into runs at its corners, each run
+        /// divided evenly into segments no longer than Spacing, a point at the middle of each facing along the run.
+        /// </summary>
+        private SamplePointSet SampleOutline(Spline spline)
+        {
+            var points = new List<Vector3>(spline.Points.Count);
+            foreach (var p in spline.Points)
+                if (points.Count == 0 || Vector3.DistanceSquared(points[^1], p) > 1e-4f) points.Add(p);
+            bool closed = spline.Closed && points.Count >= 3;
+            if (closed && Vector3.DistanceSquared(points[0], points[^1]) <= 1e-4f) points.RemoveAt(points.Count - 1);
+            int count = points.Count;
+            var positions = new List<Vector3>();
+            var rotations = new List<Quaternion>();
+            if (count < 2) return BuildResult(positions, rotations);
+
+            // Winding as ApplyEdgeFrame reads it: side > 0 = the inside is on the left of travel
+            float side = 1f;
+            if (closed)
+            {
+                float area = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    var a = points[i];
+                    var b = points[(i + 1) % count];
+                    area += a.X * b.Z - b.X * a.Z;
+                }
+                side = area > 0 ? 1f : -1f;
+                if (EdgeInset != 0f) points = MitredOffset(points, EdgeInset * side);
+            }
+
+            // Corners: turns of OutlineCornerDegrees or more (an open line's ends too)
+            float cosLimit = MathF.Cos(OutlineCornerDegrees * MathF.PI / 180f);
+            var corner = new bool[count];
+            int corners = 0;
+            for (int i = 0; i < count; i++)
+            {
+                if (!closed && (i == 0 || i == count - 1)) { corner[i] = true; continue; }
+                var d0 = FlatDir(points[(i - 1 + count) % count], points[i]);
+                var d1 = FlatDir(points[i], points[(i + 1) % count]);
+                if (Vector2.Dot(d0, d1) < cosLimit) { corner[i] = true; corners++; }
+            }
+
+            void Run(List<Vector3> run)
+            {
+                var cumulative = new float[run.Count];
+                for (int k = 1; k < run.Count; k++) cumulative[k] = cumulative[k - 1] + Vector3.Distance(run[k - 1], run[k]);
+                float length = cumulative[^1];
+                if (length < 0.01f) return;
+                int segments = Math.Max(1, (int)MathF.Ceiling(length / MathF.Max(Spacing, 0.1f) - 1e-3f));
+                float step = length / segments;
+                int seg = 0;
+                for (int s = 0; s < segments; s++)
+                {
+                    float d = (s + 0.5f) * step;
+                    while (seg < run.Count - 2 && cumulative[seg + 1] < d) seg++;
+                    float span = cumulative[seg + 1] - cumulative[seg];
+                    float f = span > 1e-5f ? (d - cumulative[seg]) / span : 0f;
+                    var dir = run[seg + 1] - run[seg];
+                    var rotation = LookRotation(new Vector3(dir.X, 0f, dir.Z), Vector3.UnitY);
+                    if (OrientOutward && closed && side < 0)
+                        rotation = Quaternion.Normalize(rotation * Quaternion.CreateFromAxisAngle(Vector3.UnitY, MathF.PI));
+                    positions.Add(Vector3.Lerp(run[seg], run[seg + 1], f));
+                    rotations.Add(rotation);
+                }
+            }
+
+            if (closed && corners == 0)
+            {
+                // A smooth loop: one run all the way round
+                var loop = new List<Vector3>(points) { points[0] };
+                Run(loop);
+            }
+            else
+            {
+                int start = 0;
+                if (closed) while (!corner[start]) start++;
+                int i = start;
+                do
+                {
+                    var run = new List<Vector3> { points[i] };
+                    int j = i;
+                    do
+                    {
+                        j = closed ? (j + 1) % count : j + 1;
+                        run.Add(points[j]);
+                    } while (!corner[j]);
+                    Run(run);
+                    i = j;
+                } while (closed ? i != start : i < count - 1);
+            }
+            return BuildResult(positions, rotations);
+        }
+
+        private static Vector2 FlatDir(Vector3 a, Vector3 b)
+        {
+            var d = new Vector2(b.X - a.X, b.Z - a.Z);
+            return d.LengthSquared() > 1e-10f ? Vector2.Normalize(d) : Vector2.UnitX;
+        }
+
+        /// <summary>
+        /// A closed polygon moved <paramref name="distance"/> to the left of travel (XZ, z-up 2D), each corner on the
+        /// bisector of its two edges at the mitre length (capped at three times the distance for very sharp corners).
+        /// </summary>
+        private static List<Vector3> MitredOffset(List<Vector3> polygon, float distance)
+        {
+            int n = polygon.Count;
+            var result = new List<Vector3>(n);
+            for (int i = 0; i < n; i++)
+            {
+                var d0 = FlatDir(polygon[(i - 1 + n) % n], polygon[i]);
+                var d1 = FlatDir(polygon[i], polygon[(i + 1) % n]);
+                var n0 = new Vector2(-d0.Y, d0.X);
+                var n1 = new Vector2(-d1.Y, d1.X);
+                var bisector = n0 + n1;
+                bisector = bisector.LengthSquared() > 1e-8f ? Vector2.Normalize(bisector) : n0;
+                float mitre = distance / MathF.Max(Vector2.Dot(bisector, n0), 1f / 3f);
+                result.Add(polygon[i] + new Vector3(bisector.X, 0f, bisector.Y) * mitre);
+            }
+            return result;
         }
 
         private static SamplePointSet BuildResult(List<Vector3> positions, List<Quaternion> rotations)

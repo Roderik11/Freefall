@@ -918,6 +918,24 @@ namespace Freefall.PCG
         [Browsable(false)]
         public IPlacementSink? Sink;
 
+        /// <summary>
+        /// Closed spline only: every placement keeps its whole footprint inside the outline, <see cref="InsideMargin"/>
+        /// in from it. A piece's footprint is the circle round its pivot that holds its mesh bounds, at the point's
+        /// scale. Where the piece drawn does not fit, one of the list that fits is drawn by weight (a full oak where
+        /// there is room, an apple nearer the edge); where none fits, the point is left out.
+        /// </summary>
+        [Description("Closed spline only: each placement keeps its whole footprint (the circle round its pivot that holds its bounds, at its scale) inside the outline. Where the piece drawn does not fit, one of the list that fits is drawn by weight; where none fits, the point is left out.")]
+        public bool KeepInside;
+
+        /// <summary>With KeepInside: how far inside the outline the footprints stay (metres).</summary>
+        [Description("With Keep Inside: how far in from the outline the footprints stay (m), e.g. clear of a hedge round the area.")]
+        [ValueRange(0f, 20f)]
+        public float InsideMargin;
+
+        /// <summary>The PCG entity's spline, for KeepInside. Set by PCGComponent before execution.</summary>
+        [Browsable(false)]
+        public Spline Spline;
+
         public override void Process()
         {
             var points = GetInputValue<SamplePointSet>("Input");
@@ -935,15 +953,45 @@ namespace Freefall.PCG
             var rng = CreateRandom();
             var parent = SpawnParent ?? new Entity("PCG_Spawned");
 
+            // KeepInside: each piece's footprint radius, measured once
+            float[] footprint = null;
+            IList<Vector3> outline = null;
+            if (KeepInside && Spline is { Closed: true } && Spline.Points.Count >= 3)
+            {
+                outline = Spline.Points;
+                footprint = new float[Entities.Count];
+                for (int k = 0; k < Entities.Count; k++)
+                    footprint[k] = Entities[k]?.Prefab is { } piece && PrefabBounds.Measure(piece) is { } b ? FootprintRadius(b.min, b.max) : 0f;
+            }
+
+            int left = 0;
             for (int i = 0; i < points.Count; i++)
             {
                 // A point that names its prefab ("prefab=N", an index into Entities: BankWall) gets that one
-                var prefab = PickWeighted(rng, totalWeight);
+                int drawn = PickIndex(rng, totalWeight);
+                var prefab = drawn >= 0 ? Entities[drawn].Prefab : null;
+                bool named = false;
                 if (points.tags != null && i < points.tags.Length && points.tags[i] is { } t && t.StartsWith("prefab=")
                     && int.TryParse(t.AsSpan(7), out int chosen) && chosen >= 0 && chosen < Entities.Count
                     && Entities[chosen]?.Prefab != null)
+                {
                     prefab = Entities[chosen].Prefab;
+                    named = true;
+                }
                 if (prefab == null) continue;
+
+                if (footprint != null && !named)
+                {
+                    var ext = points.extents[i];
+                    float scale = MathF.Max(MathF.Abs(ext.X), MathF.Abs(ext.Z));
+                    float room = RoomInside(points.position[i], outline) - InsideMargin;
+                    if (footprint[drawn] * scale > room)
+                    {
+                        int fit = PickFitting(rng, footprint, scale, room);
+                        if (fit < 0) { left++; continue; }
+                        prefab = Entities[fit].Prefab;
+                    }
+                }
 
                 if (Sink != null)
                 {
@@ -963,20 +1011,70 @@ namespace Freefall.PCG
                 instance.Transform.Scale = points.extents[i];
             }
 
-            Debug.Log($"[SpawnPrefab] {(Sink != null ? "Placed" : "Spawned")} {points.Count} instances under '{parent.Name}'");
+            Debug.Log($"[SpawnPrefab] {(Sink != null ? "Placed" : "Spawned")} {points.Count - left} instances under '{parent.Name}'" +
+                      (left > 0 ? $" ({left} left out: nothing fitted inside)" : ""));
         }
 
-        private Prefab PickWeighted(Random rng, float totalWeight)
+        // The same draw as before KeepInside existed (one roll per point), as an index into Entities
+        private int PickIndex(Random rng, float totalWeight)
         {
             float roll = (float)rng.NextDouble() * totalWeight;
             float cumulative = 0;
-            foreach (var e in Entities)
+            for (int k = 0; k < Entities.Count; k++)
             {
-                if (e.Prefab == null) continue;
-                cumulative += e.Weight;
-                if (roll <= cumulative) return e.Prefab;
+                if (Entities[k]?.Prefab == null) continue;
+                cumulative += Entities[k].Weight;
+                if (roll <= cumulative) return k;
             }
-            return Entities[Entities.Count - 1].Prefab;
+            for (int k = Entities.Count - 1; k >= 0; k--)
+                if (Entities[k]?.Prefab != null) return k;
+            return -1;
+        }
+
+        // A draw by weight among the pieces whose footprint fits the room; -1 if none does
+        private int PickFitting(Random rng, float[] footprint, float scale, float room)
+        {
+            float total = 0;
+            for (int k = 0; k < Entities.Count; k++)
+                if (Entities[k]?.Prefab != null && footprint[k] * scale <= room) total += Entities[k].Weight;
+            if (total <= 0) return -1;
+            float roll = (float)rng.NextDouble() * total, cumulative = 0;
+            int last = -1;
+            for (int k = 0; k < Entities.Count; k++)
+            {
+                if (Entities[k]?.Prefab == null || footprint[k] * scale > room) continue;
+                cumulative += Entities[k].Weight;
+                last = k;
+                if (roll <= cumulative) return k;
+            }
+            return last;
+        }
+
+        /// <summary>The circle round the pivot (XZ) that holds a footprint box: its centre's distance plus half its longer side.</summary>
+        private static float FootprintRadius(Vector3 min, Vector3 max)
+        {
+            var centre = new Vector2((min.X + max.X) * 0.5f, (min.Z + max.Z) * 0.5f);
+            return centre.Length() + 0.5f * MathF.Max(max.X - min.X, max.Z - min.Z);
+        }
+
+        /// <summary>How far a point lies inside a closed outline (XZ): its distance to the nearest edge, negative outside.</summary>
+        private static float RoomInside(Vector3 p, IList<Vector3> outline)
+        {
+            int n = outline.Count;
+            bool inside = false;
+            float nearestSq = float.MaxValue;
+            for (int i = 0, j = n - 1; i < n; j = i++)
+            {
+                var a = new Vector2(outline[i].X, outline[i].Z);
+                var b = new Vector2(outline[j].X, outline[j].Z);
+                if ((a.Y > p.Z) != (b.Y > p.Z) && p.X < (b.X - a.X) * (p.Z - a.Y) / (b.Y - a.Y) + a.X) inside = !inside;
+                var ab = b - a;
+                var q = new Vector2(p.X, p.Z);
+                float t = Math.Clamp(Vector2.Dot(q - a, ab) / MathF.Max(ab.LengthSquared(), 1e-6f), 0f, 1f);
+                nearestSq = MathF.Min(nearestSq, Vector2.DistanceSquared(q, a + ab * t));
+            }
+            float d = MathF.Sqrt(nearestSq);
+            return inside ? d : -d;
         }
     }
 

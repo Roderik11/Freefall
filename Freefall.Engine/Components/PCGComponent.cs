@@ -415,6 +415,7 @@ namespace Freefall.Components
                 {
                     spawner.SpawnParent = OutputEntity;
                     spawner.Sink = sink;
+                    spawner.Spline = spline;
                 }
 
                 if (node is ExcludeObstacles exclude)
