@@ -171,6 +171,7 @@ namespace Freefall.Navigation
 
                 Debug.Log($"[NavMesh] Baking {context.Tiles.TilesX}x{context.Tiles.TilesZ} tiles of {context.TileWorld:0.#} m from " +
                           $"{input.Terrains.Count} terrain(s), {input.Instances.Length} mesh instance(s) of {input.Geometries.Count} mesh(es), {threads} threads" +
+                          (context.Wanted != null ? $", {context.WantedCount} tiles in {input.Regions.Count} region(s)" : "") +
                           (context.Previous != null ? " (incremental)" : ""));
 
                 // ── Tiles ──
@@ -360,6 +361,10 @@ namespace Freefall.Navigation
             public required int[] CellStart;
             public required int[] CellItems;
 
+            /// <summary>The cells a NavMeshRegion reaches, when the scene has regions: only these are built.</summary>
+            public bool[]? Wanted;
+            public int WantedCount;
+
             public static BakeContext Create(BakeSettings settings, NavMeshBakeInput input, NavMeshTileSet? previous)
             {
                 int walkableRadius = (int)MathF.Ceiling(settings.AgentRadius / settings.CellSize);
@@ -429,6 +434,31 @@ namespace Freefall.Navigation
 
                 BinInstances(input.Instances, tiles, pad, out var cellStart, out var cellItems);
 
+                // ── Regions: the cells a NavMeshRegion reaches (a tile's middle within half its diagonal of the area) ──
+                bool[]? wanted = null;
+                int wantedCount = 0;
+                if (input.Regions.Count > 0)
+                {
+                    wanted = new bool[tiles.CellCount];
+                    float reach = tileWorld * 0.7072f + pad;
+                    foreach (var region in input.Regions)
+                    {
+                        region.Bounds(out var rmin, out var rmax);
+                        int x0 = Math.Max(0, (int)MathF.Floor((rmin.X - reach - origin.X) / tileWorld));
+                        int x1 = Math.Min(tiles.TilesX - 1, (int)MathF.Floor((rmax.X + reach - origin.X) / tileWorld));
+                        int z0 = Math.Max(0, (int)MathF.Floor((rmin.Y - reach - origin.Z) / tileWorld));
+                        int z1 = Math.Min(tiles.TilesZ - 1, (int)MathF.Floor((rmax.Y + reach - origin.Z) / tileWorld));
+                        for (int z = z0; z <= z1; z++)
+                            for (int x = x0; x <= x1; x++)
+                            {
+                                int cell = z * tiles.TilesX + x;
+                                if (wanted[cell]) continue;
+                                var middle = new Vector2(origin.X + (x + 0.5f) * tileWorld, origin.Z + (z + 0.5f) * tileWorld);
+                                if (region.Near(middle, reach)) { wanted[cell] = true; wantedCount++; }
+                            }
+                    }
+                }
+
                 float walkableThreshold = MathF.Cos(settings.MaxSlope / 180f * MathF.PI);
 
                 return new BakeContext
@@ -446,6 +476,8 @@ namespace Freefall.Navigation
                     WalkableArea = config.WalkableAreaMod.Apply(0),
                     CellStart = cellStart,
                     CellItems = cellItems,
+                    Wanted = wanted,
+                    WantedCount = wantedCount,
                 };
             }
 

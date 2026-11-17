@@ -342,12 +342,64 @@ namespace Freefall.Navigation
     /// Everything a bake reads from the scene, captured on the main thread so the bake itself can
     /// run on worker threads. Holds references to mesh and height arrays, never copies of them.
     /// </summary>
+    /// <summary>A NavMeshRegion as the bake took it: a closed outline, or a circle, grown by Margin.</summary>
+    internal readonly struct BakeRegion
+    {
+        public readonly Vector2[]? Outline;
+        public readonly Vector2 Center;
+        public readonly float Radius;
+        public readonly float Margin;
+
+        public BakeRegion(Vector2[]? outline, Vector2 center, float radius, float margin)
+        {
+            Outline = outline; Center = center; Radius = radius; Margin = margin;
+        }
+
+        /// <summary>The region's bounds on the ground plane, margin included.</summary>
+        public void Bounds(out Vector2 min, out Vector2 max)
+        {
+            if (Outline == null)
+            {
+                min = Center - new Vector2(Radius + Margin);
+                max = Center + new Vector2(Radius + Margin);
+                return;
+            }
+            min = new Vector2(float.MaxValue); max = new Vector2(float.MinValue);
+            foreach (var p in Outline) { min = Vector2.Min(min, p); max = Vector2.Max(max, p); }
+            min -= new Vector2(Margin); max += new Vector2(Margin);
+        }
+
+        /// <summary>Whether a point is in the region or within <paramref name="reach"/> + Margin of it.</summary>
+        public bool Near(Vector2 p, float reach)
+        {
+            float d = reach + Margin;
+            if (Outline == null)
+                return Vector2.DistanceSquared(p, Center) <= (Radius + d) * (Radius + d);
+
+            bool inside = false;
+            float nearestSq = float.MaxValue;
+            for (int i = 0, j = Outline.Length - 1; i < Outline.Length; j = i++)
+            {
+                Vector2 a = Outline[j], b = Outline[i];
+                if ((a.Y > p.Y) != (b.Y > p.Y) && p.X < (b.X - a.X) * (p.Y - a.Y) / (b.Y - a.Y) + a.X)
+                    inside = !inside;
+                var ab = b - a;
+                float t = Math.Clamp(Vector2.Dot(p - a, ab) / MathF.Max(ab.LengthSquared(), 1e-9f), 0f, 1f);
+                nearestSq = MathF.Min(nearestSq, Vector2.DistanceSquared(p, a + ab * t));
+            }
+            return inside || nearestSq <= d * d;
+        }
+    }
+
     internal sealed class NavMeshBakeInput
     {
         public readonly List<TerrainSource> Terrains = [];
         public readonly List<MeshGeometry> Geometries = [];
         public MeshInstance[] Instances = [];
         public readonly List<AreaVolume> Areas = [];
+
+        /// <summary>The NavMeshRegions' areas on the ground plane. Empty: the whole grid is baked.</summary>
+        public readonly List<BakeRegion> Regions = [];
 
         public static NavMeshBakeInput Collect()
         {
@@ -423,6 +475,14 @@ namespace Freefall.Navigation
             });
 
             input.Instances = instances.ToArray();
+
+            // Where to bake at all (NavMeshRegion): none = everywhere
+            foreach (var region in ComponentCache<NavMeshRegion>.All)
+            {
+                if (region.Entity == null || !region.Enabled) continue;
+                var outline = region.Outline(out var center);
+                input.Regions.Add(new BakeRegion(outline, center, MathF.Max(region.Radius, 0f), MathF.Max(region.Margin, 0f)));
+            }
 
             // The NavMeshAreas' boxes: their outlines on the ground and their height ranges in world space
             foreach (var area in ComponentCache<NavMeshArea>.All)

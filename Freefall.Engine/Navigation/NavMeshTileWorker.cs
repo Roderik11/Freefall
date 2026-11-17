@@ -77,6 +77,15 @@ namespace Freefall.Navigation
                 float maxX = tiles.Origin.X + tx * c.TileWorld + c.TileWorld + c.Pad;
                 float maxZ = tiles.Origin.Z + tz * c.TileWorld + c.TileWorld + c.Pad;
 
+                // Outside every NavMeshRegion: no tile. Hash 0 is no input's hash, so a region that reaches the cell later
+                // builds it; losing a tile the last bake had is a change like any other.
+                if (c.Wanted != null && !c.Wanted[cell])
+                {
+                    tiles.Hashes[cell] = 0;
+                    tiles.Tiles[cell] = null;
+                    return c.Previous?.Tiles[cell] != null ? CellResult.Rebuilt : CellResult.Empty;
+                }
+
                 _vertCount = 0;
                 _patchCount = 0;
                 _quadHoleCount = 0;
