@@ -6,6 +6,7 @@ using Freefall.Graphics;
 using Vortice.Mathematics;
 using DefaultValue = System.ComponentModel.DefaultValueAttribute;
 using Category = System.ComponentModel.CategoryAttribute;
+using Description = System.ComponentModel.DescriptionAttribute;
 
 namespace Freefall.Components
 {
@@ -102,6 +103,37 @@ namespace Freefall.Components
         [ValueRange(0.05f, 2f)]
         public float CurbWidth = 0.2f;
 
+        /// <summary>
+        /// Closed spline: wherever the ground under the edge lies below the surface's base, a wall runs from the edge
+        /// down into the ground (in the curb material, slot 1), so paving on falling ground stands on masonry instead
+        /// of floating over it: an island beside a ramp, a terrace edge. Rebuilt when the terrain's heights change.
+        /// </summary>
+        [Category("Foundation")]
+        [DefaultValue(false)]
+        [Description("Closed spline: wherever the ground under the edge lies below the base, a wall in the curb material runs from the edge down into it, so paving on falling ground stands on masonry instead of floating. Rebuilt when the terrain's heights change.")]
+        public bool Foundation = false;
+
+        /// <summary>With Foundation and curbs: where the ground falls more than this below the base, the curb rises to a parapet (0 = never).</summary>
+        [DefaultValue(1.0f)]
+        [ValueRange(0f, 20f)]
+        [Description("With Foundation and curbs: where the ground falls more than this below the base (m), the curb rises to a parapet. 0 = never.")]
+        public float ParapetDrop = 1.0f;
+
+        /// <summary>The parapet's top above the base, counted as CurbHeight is.</summary>
+        [DefaultValue(1.15f)]
+        [ValueRange(0f, 3f)]
+        [Description("The parapet's top above the base (m), counted as Curb Height is.")]
+        public float ParapetHeight = 1.15f;
+
+        /// <summary>The parapet's thickness out from the edge.</summary>
+        [DefaultValue(0.35f)]
+        [ValueRange(0.05f, 2f)]
+        [Description("The parapet's thickness out from the edge (m).")]
+        public float ParapetWidth = 0.35f;
+
+        /// <summary>How far a foundation reaches below the ground, so no slit shows at its foot.</summary>
+        private const float FoundationDepth = 0.3f;
+
 
         // ═══════════════════════════
         // ── Internals ──
@@ -159,7 +191,8 @@ namespace Freefall.Components
         // matches the scene's stamps) until the GPU bake is read back, so rebuild whenever it is replaced.
         private void OnTerrainHeightsChanged(Message msg)
         {
-            if (HeightMode != RuntimeMeshHeightMode.Surface) return;
+            // Surface mode reads the heights; a closed mesh's Foundation reaches down to them
+            if (HeightMode != RuntimeMeshHeightMode.Surface && !(Foundation && Spline is { Closed: true })) return;
 
             // Heights changed somewhere else on the terrain: the mesh still fits
             if (msg.Data is TerrainHeightsChange { All: false } change && Spline != null
@@ -704,6 +737,33 @@ namespace Freefall.Components
                 });
             }
 
+            // Outward normals per vertex of every ring (average of the adjacent edge normals): out of the surface,
+            // into the hole on a hole's ring
+            var outwardAt = new Vector3[n];
+            foreach (var (start, count) in rings)
+                for (int k = 0; k < count; k++)
+                {
+                    int i = start + k;
+                    var e0 = polygon2D[i] - polygon2D[start + (k - 1 + count) % count];
+                    var e1 = polygon2D[start + (k + 1) % count] - polygon2D[i];
+                    // Outward normal in XZ: for CCW polygon, outward = (dz, -dx)
+                    var avg = new Vector2(e0.Y, -e0.X) + new Vector2(e1.Y, -e1.X);
+                    avg = avg.LengthSquared() > 1e-12f ? Vector2.Normalize(avg) : Vector2.UnitX;
+                    outwardAt[i] = new Vector3(avg.X, 0, avg.Y);
+                }
+
+            // Foundation: the ground under the edge (at the curb's outer face); where it falls further than ParapetDrop
+            // below the base, the curb there is a parapet
+            float[] ground = Foundation ? GroundUnderEdge(polygon2D, outwardAt, EnableCurbs ? CurbWidth : 0f) : null;
+            var curbHeight = new float[n];
+            var curbWidth = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                bool parapet = ground != null && ParapetHeight > 0f && ParapetDrop > 0f && yValues[i] - ground[i] > ParapetDrop;
+                curbHeight[i] = parapet ? ParapetHeight : CurbHeight;
+                curbWidth[i] = parapet ? ParapetWidth : CurbWidth;
+            }
+
             // ── Perimeter curbs: round the outline and round every hole (into it) ──
             int curbStartIndex = indices.Count;
             if (EnableCurbs)
@@ -711,24 +771,8 @@ namespace Freefall.Components
                 foreach (var (start, count) in rings)
                 {
                     int curbBase = verts.Count;
-
-                    // Compute outward normals per vertex (average of adjacent edge normals)
                     var outwards = new Vector3[count];
-                    for (int k = 0; k < count; k++)
-                    {
-                        int prev = start + (k - 1 + count) % count;
-                        int next = start + (k + 1) % count;
-                        int i = start + k;
-
-                        var e0 = polygon2D[i] - polygon2D[prev];
-                        var e1 = polygon2D[next] - polygon2D[i];
-
-                        // Outward normal in XZ: for CCW polygon, outward = (dz, -dx)
-                        var n0 = new Vector2(e0.Y, -e0.X);
-                        var n1 = new Vector2(e1.Y, -e1.X);
-                        var avg = Vector2.Normalize(n0 + n1);
-                        outwards[k] = new Vector3(avg.X, 0, avg.Y);
-                    }
+                    for (int k = 0; k < count; k++) outwards[k] = outwardAt[start + k];
 
                     // Perimeter arc lengths
                     var perimArc = new float[count + 1]; // +1 for wrap
@@ -747,22 +791,23 @@ namespace Freefall.Components
                         var pos = new Vector3(polygon2D[i].X, yValues[i], polygon2D[i].Y);
                         var outward = outwards[k];
 
+                        float height = curbHeight[i], width = curbWidth[i];
                         var innerBot = pos;
-                        var innerTop = innerBot + Vector3.UnitY * CurbHeight;
-                        var outerTop = innerTop + outward * CurbWidth;
-                        var outerBot = innerBot + outward * CurbWidth;
+                        var innerTop = innerBot + Vector3.UnitY * height;
+                        var outerTop = innerTop + outward * width;
+                        var outerBot = innerBot + outward * width;
 
                         float u = perimArc[k] * UVScale;
 
                         // 6 verts per sample — duplicated at hard edges for flat shading
                         // Inner wall (0, 1)
                         verts.Add(innerBot); norms.Add(-outward); uvs.Add(new Vector2(u, 0));
-                        verts.Add(innerTop); norms.Add(-outward); uvs.Add(new Vector2(u, CurbHeight));
+                        verts.Add(innerTop); norms.Add(-outward); uvs.Add(new Vector2(u, height));
                         // Top ledge (2, 3)
                         verts.Add(innerTop); norms.Add(Vector3.UnitY); uvs.Add(new Vector2(u, 0));
-                        verts.Add(outerTop); norms.Add(Vector3.UnitY); uvs.Add(new Vector2(u, CurbWidth));
+                        verts.Add(outerTop); norms.Add(Vector3.UnitY); uvs.Add(new Vector2(u, width));
                         // Outer wall (4, 5)
-                        verts.Add(outerTop); norms.Add(outward); uvs.Add(new Vector2(u, CurbHeight));
+                        verts.Add(outerTop); norms.Add(outward); uvs.Add(new Vector2(u, height));
                         verts.Add(outerBot); norms.Add(outward); uvs.Add(new Vector2(u, 0));
                     }
 
@@ -795,7 +840,76 @@ namespace Freefall.Components
                 });
             }
 
+            // ── Foundation: the curb's outer face (the slab's edge without curbs) carried down into the ground ──
+            int foundationStart = indices.Count;
+            if (ground != null)
+            {
+                foreach (var (start, count) in rings)
+                {
+                    float arc = 0;
+                    for (int k = 0; k < count; k++)
+                    {
+                        int i = start + k, j = start + (k + 1) % count;
+                        float len = Vector2.Distance(polygon2D[i], polygon2D[j]);
+                        float footI = MathF.Min(yValues[i], ground[i] - FoundationDepth);
+                        float footJ = MathF.Min(yValues[j], ground[j] - FoundationDepth);
+                        if (yValues[i] - footI < 0.01f && yValues[j] - footJ < 0.01f) { arc += len; continue; }
+
+                        float wi = EnableCurbs ? curbWidth[i] : 0f, wj = EnableCurbs ? curbWidth[j] : 0f;
+                        var topI = new Vector3(polygon2D[i].X, yValues[i], polygon2D[i].Y) + outwardAt[i] * wi;
+                        var topJ = new Vector3(polygon2D[j].X, yValues[j], polygon2D[j].Y) + outwardAt[j] * wj;
+                        var edge = polygon2D[j] - polygon2D[i];
+                        var normal = Vector3.Normalize(new Vector3(edge.Y, 0, -edge.X));
+
+                        uint v0 = (uint)verts.Count;
+                        verts.Add(new Vector3(topI.X, footI, topI.Z));
+                        verts.Add(new Vector3(topJ.X, footJ, topJ.Z));
+                        verts.Add(topI);
+                        verts.Add(topJ);
+                        norms.Add(normal); norms.Add(normal); norms.Add(normal); norms.Add(normal);
+                        uvs.Add(new Vector2(arc * UVScale, footI * UVScale));
+                        uvs.Add(new Vector2((arc + len) * UVScale, footJ * UVScale));
+                        uvs.Add(new Vector2(arc * UVScale, yValues[i] * UVScale));
+                        uvs.Add(new Vector2((arc + len) * UVScale, yValues[j] * UVScale));
+                        indices.Add(v0 + 0); indices.Add(v0 + 2); indices.Add(v0 + 1);
+                        indices.Add(v0 + 1); indices.Add(v0 + 2); indices.Add(v0 + 3);
+                        arc += len;
+                    }
+                }
+            }
+
+            if (indices.Count > foundationStart)
+            {
+                parts.Add(new MeshPart
+                {
+                    Name = "Foundation",
+                    BaseIndex = foundationStart,
+                    NumIndices = indices.Count - foundationStart,
+                    MaterialSlot = 1
+                });
+            }
+
             return BuildMesh(verts, norms, uvs, indices, parts);
+        }
+
+        /// <summary>
+        /// The ground's height, in this entity's space, under each outline vertex moved out by <paramref name="offset"/>;
+        /// null until the terrain's heights are in (the mesh is rebuilt when they arrive).
+        /// </summary>
+        private float[] GroundUnderEdge(List<Vector2> polygon, Vector3[] outward, float offset)
+        {
+            var terrain = EntityManager.FindComponent<TerrainRenderer>();
+            if (terrain?.Terrain?.Pages is not { HasHeights: true } || Transform == null) return null;
+            var toWorld = Transform.Matrix;
+            if (!Matrix4x4.Invert(toWorld, out var toLocal)) return null;
+            var result = new float[polygon.Count];
+            for (int i = 0; i < polygon.Count; i++)
+            {
+                var world = Vector3.Transform(new Vector3(polygon[i].X, 0f, polygon[i].Y) + outward[i] * offset, toWorld);
+                float height = terrain.GetHeight(world);
+                result[i] = Vector3.Transform(new Vector3(world.X, height, world.Z), toLocal).Y;
+            }
+            return result;
         }
 
         // ═══════════════════════════
