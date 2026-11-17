@@ -384,7 +384,8 @@ namespace Freefall.Graphics
                 BoneBufferIdx = call.BoneBufferIdx
             };
             WriteCore(DrawBucket.DescriptorsHash, 20, index, descriptor);
-            WriteCore(DrawBucket.SubbatchIdsHash, 4, index, (uint)meshPartId | (call.LodManaged ? DrawBucket.LodManagedBit : 0u));
+            WriteCore(DrawBucket.SubbatchIdsHash, 4, index, (uint)meshPartId | (call.LodManaged ? DrawBucket.LodManagedBit : 0u)
+                                                           | (call.NoPointShadow ? DrawBucket.NoPointShadowBit : 0u));
 
             if (call.MaterialBlock != null)
             {

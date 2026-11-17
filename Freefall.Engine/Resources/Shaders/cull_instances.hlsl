@@ -222,6 +222,10 @@ struct MeshPartLod
 // High bit of a subbatch ID: the instance was submitted as a LOD chain head and the culler
 // resolves the part to draw (DrawBucket.LodManagedBit). Without it the ID is drawn as-is.
 #define LOD_MANAGED_BIT 0x80000000u
+// MeshRenderer.CastPointLightShadows off (DrawBucket.NoPointShadowBit): the instance is in no point light's shadow
+// views (CSVisibilityLocalShadows). A lamp's own post, arm and cage, a brazier's basket.
+#define NO_POINT_SHADOW_BIT 0x40000000u
+#define SUBBATCH_PART_MASK (~(LOD_MANAGED_BIT | NO_POINT_SHADOW_BIT))
 #define INVALID_PART    0xFFFFFFFFu
 
 //-----------------------------------------------------------------------------
@@ -265,7 +269,7 @@ float LodK(MeshPartLod head, row_major float4x4 world, float maxScaleSq)
 
 uint ResolveLodPart(uint subbatchId, row_major float4x4 world, float maxScaleSq)
 {
-    uint partId = subbatchId & ~LOD_MANAGED_BIT;
+    uint partId = subbatchId & SUBBATCH_PART_MASK;
     if ((subbatchId & LOD_MANAGED_BIT) == 0)
         return partId;
 
@@ -290,7 +294,7 @@ uint ResolveLodPart(uint subbatchId, row_major float4x4 world, float maxScaleSq)
 // at the same frame. A LOD-managed id and a valid camera (LodFactor > 0) only.
 uint ResolveLodPartHeld(uint subbatchId, row_major float4x4 world, float maxScaleSq, uint held)
 {
-    uint partId = subbatchId & ~LOD_MANAGED_BIT;
+    uint partId = subbatchId & SUBBATCH_PART_MASK;
     StructuredBuffer<MeshPartLod> lodRegistry = ResourceDescriptorHeap[MeshLodRegistryIdx];
     MeshPartLod lod = lodRegistry[partId];
     float k = LodK(lod, world, maxScaleSq);
@@ -1906,6 +1910,15 @@ void CSVisibilityLocalShadows(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     RWStructuredBuffer<uint> combinedVis = ResourceDescriptorHeap[CombinedShadowVisIdx];
     RWStructuredBuffer<uint4> masks = ResourceDescriptorHeap[LocalShadowMaskIdx];
+
+    // A fitting that throws no shadow in a point light (its own lamp's above all)
+    StructuredBuffer<uint> casterIds = ResourceDescriptorHeap[SubbatchIdsIdx];
+    if ((casterIds[instanceIdx] & NO_POINT_SHADOW_BIT) != 0)
+    {
+        combinedVis[instanceIdx] = 0;
+        masks[instanceIdx] = 0;
+        return;
+    }
 
     // The sphere and LOD part (the camera's InstanceBounds when slot 38 is set)
     float3 worldCenter;

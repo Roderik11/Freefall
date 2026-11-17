@@ -117,6 +117,23 @@ namespace Freefall.Components
         private MaterialBlock? _params;
         private static readonly MaterialBlock NoParams = new();   // never changed
 
+        [System.ComponentModel.Description("Whether it throws a shadow in point lights (lamps, fires). Off for a lamp's own " +
+                                           "fitting: a lantern's post, arm and cage, a brazier's basket, which otherwise " +
+                                           "throw bars and stars over the ground round their own light. People and " +
+                                           "everything else still throw shadows in that light. The sun's shadows are " +
+                                           "not affected.")]
+        public bool CastPointLightShadows
+        {
+            get => _castPointLightShadows;
+            set
+            {
+                if (_castPointLightShadows == value) return;
+                _castPointLightShadows = value;
+                Invalidate();
+            }
+        }
+        private bool _castPointLightShadows = true;
+
         protected override Mesh? RenderMesh => _mesh;
 
         public override void Destroy()
@@ -156,7 +173,8 @@ namespace Freefall.Components
                 if (partIdx >= meshParts.Count) continue;
                 var mat = GetMaterial(meshParts[partIdx].MaterialSlot);
                 if (mat != null)
-                    CommandBuffer.AddPersistent(group, mesh, partIdx, mat, _params ?? NoParams, transformSlot, lodManaged: true, instanceSlot: InstanceSlotFor(mat));
+                    CommandBuffer.AddPersistent(group, mesh, partIdx, mat, _params ?? NoParams, transformSlot, lodManaged: true, instanceSlot: InstanceSlotFor(mat),
+                                               noPointShadow: !_castPointLightShadows);
             }
         }
     }
