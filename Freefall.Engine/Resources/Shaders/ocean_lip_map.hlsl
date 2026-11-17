@@ -37,7 +37,9 @@ void CSLipMapBuild(uint3 id : SV_DispatchThreadID)
     float4 result = 0.0;
     float4 surface = 0.0;
     OceanShore shore = ShoreAt(ocean, xz);
-    if (ocean.WarpOmega.x + ocean.WarpOmega.y > 0.0 && ocean.TerrainPages != 0 && shore.shoreDepth < 1e3)
+    // Only on the sea (the sea mask): the shore warp's depth is the ground's under sea level, enclosed or not, so a lake,
+    // a river or a moat whose bed lies below sea level got lips and barrels too
+    if (ocean.WarpOmega.x + ocean.WarpOmega.y > 0.0 && ocean.TerrainPages != 0 && shore.shoreDepth < 1e3 && !OutsideSea(ocean, xz))
     {
         // The smooth swell over the whole coast, where the lip's crest, face and trough end can lie
         OceanShore smoothShore;

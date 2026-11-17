@@ -73,6 +73,25 @@ struct OceanData
 
 SamplerState OceanSampler : register(s0);
 
+// The sea plane is endless, but the sea is only where it can flow in from the open sea across ground below sea level
+// (C# SeaMask: flooded from the terrain's border, reaching a little up the beaches). Enclosed low ground, a lake bed
+// deeper than the sea or a hall under a hill, gets no sea. Past the terrain it is all sea. Every pass that draws the
+// sea asks it: the ocean's surface, the lip map and the lip pass (until 2026-11-17 only the surface did, so breaking
+// lips and their barrels stood in lakes, rivers and a moat whose beds lie below sea level)
+bool OutsideSea(OceanData ocean, float2 xz)
+{
+    if (ocean.SeaMaskSRV == 0) return false;
+    float2 uv = (xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ)) / float2(ocean.TerrainSizeX, ocean.TerrainSizeZ);
+    if (any(uv < 0.0) || any(uv > 1.0)) return false;
+
+    Texture2D<float> mask = ResourceDescriptorHeap[ocean.SeaMaskSRV];
+    uint w, h;
+    mask.GetDimensions(w, h);
+    // Laid out as the heights are, its first and last cells on the terrain's edges (SeaMask.Build takes every step-th
+    // height sample): read on that grid, which also keeps the far border's texels from blending with the clamp
+    return mask.SampleLevel(OceanSampler, TerrainHeightUV(uv, float2(w, h)), 0) < 0.5;
+}
+
 // The swash's cycle (SwashLevel): the share of a wave's period its bore runs up the beach, the rest it drains back
 // (0.5 would be symmetric; 0.25 felt too abrupt up and too sluggish back)
 static const float SurgeRise = 0.38;

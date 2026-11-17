@@ -424,6 +424,10 @@ LipPSOutput PS_Lip(LipOutput input)
     LipPSOutput output;
     StructuredBuffer<OceanData> oceanData = ResourceDescriptorHeap[OceanDataIdx];
     OceanData ocean = oceanData[input.InstanceIdx];
+    // Only on the sea, as the ocean's surface is cut (the lip map is too; this keeps a sheet thrown past the mask's edge
+    // off enclosed water)
+    if (OutsideSea(ocean, input.UndisplacedXZ.xy))
+        discard;
 
     float3 camPos = ViewInverse[3].xyz;
     float3 worldPos = input.WorldPos;
