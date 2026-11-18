@@ -391,14 +391,16 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
     float sunCos = dot(dir, A.SunDirection), moonCos = dot(dir, A.MoonDirection);
     float sunMie = AtmMiePhase(A.MieG, sunCos), sunRayleigh = AtmRayleighPhase(sunCos);
     float moonMie = AtmMiePhase(A.MieG, moonCos), moonRayleigh = AtmRayleighPhase(moonCos);
-    bool moonLit = any(A.MoonIlluminance > 0);
+    // Each body only while it adds to the air's light (atmosphere_common.hlsli AtmSunLightsAir): at noon the moon was a
+    // second lighting of all 96 steps of a column for three millionths of the sun's light
+    bool sunLit = AtmSunLightsAir(A), moonLit = AtmMoonLightsAir(A);
     float skyDimming = CloudSkyDimming(CloudDeck());
 
     float3 L = 0;               // × the illuminances
     float3 throughput = 1.0;
     float t = 0.0;
     // The ray's margin above the terrain's shadow toward the sun and the moon where the step starts
-    float sunMargin = AtmTerrainLightMargin(A, APWorldPos(A, pos), false);
+    float sunMargin = sunLit ? AtmTerrainLightMargin(A, APWorldPos(A, pos), false) : 1e4;
     float moonMargin = moonLit ? AtmTerrainLightMargin(A, APWorldPos(A, pos), true) : 1e4;
     for (uint s = 0; s < slices; s++)
     {
@@ -416,21 +418,25 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
                 float3 up = P / pHeight;
                 AtmMedium medium = SampleAtmMedium(P, A);
 
-                float midMargin = AtmTerrainLightMargin(A, worldMid, false);
-                float endMargin = AtmTerrainLightMargin(A, worldEnd, false);
-                float sunLit = 0.5 * (APLitShare(sunMargin, midMargin) + APLitShare(midMargin, endMargin));
-                sunMargin = endMargin;
                 // The cloud layer at the step's middle (the near fog volume's own CloudAirLight, so the two meet at
                 // its range without a seam)
                 float3 relMid = worldMid - CamPos;
-                float3 sunTint;
-                float3 sunCloud = CloudAirLight(CloudWrapSampler, relMid, A.SunDirection, skyDimming, sunTint);
-                float3 S = A.SunIlluminance * APSampleLight(A, medium, P, up, pHeight, sunLit, sunCloud, sunTint,
-                                                            A.SunDirection, sunMie, sunRayleigh);
+                float3 S = 0;
+                if (sunLit)
+                {
+                    float midMargin = AtmTerrainLightMargin(A, worldMid, false);
+                    float endMargin = AtmTerrainLightMargin(A, worldEnd, false);
+                    float sunShare = 0.5 * (APLitShare(sunMargin, midMargin) + APLitShare(midMargin, endMargin));
+                    sunMargin = endMargin;
+                    float3 sunTint;
+                    float3 sunCloud = CloudAirLight(CloudWrapSampler, relMid, A.SunDirection, skyDimming, sunTint);
+                    S = A.SunIlluminance * APSampleLight(A, medium, P, up, pHeight, sunShare, sunCloud, sunTint,
+                                                         A.SunDirection, sunMie, sunRayleigh);
+                }
                 if (moonLit)
                 {
-                    midMargin = AtmTerrainLightMargin(A, worldMid, true);
-                    endMargin = AtmTerrainLightMargin(A, worldEnd, true);
+                    float midMargin = AtmTerrainLightMargin(A, worldMid, true);
+                    float endMargin = AtmTerrainLightMargin(A, worldEnd, true);
                     float moonShare = 0.5 * (APLitShare(moonMargin, midMargin) + APLitShare(midMargin, endMargin));
                     moonMargin = endMargin;
                     float3 moonTint;

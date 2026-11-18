@@ -464,11 +464,18 @@ void CSFogScatter(uint3 id : SV_DispatchThreadID, uint groupIndex : SV_GroupInde
     float sky = open > 0.0 ? open * max(fogMeshes, A.SkyCaptureBounce) : 0.0;
 
     float skyDimming = CloudSkyDimming(CloudDeck());      // Ψ_ms under the clouds round the camera
-    float3 sunOpen, moonOpen = 0;
-    float3 L = A.SunIlluminance * FroxelBodyLight(A, medium, smoke, false, posKm, worldPos, relPos, V, viewDepth,
-                                                  A.SunDirection, open, sky, skyDimming, sunOpen);
-    float3 openL = A.SunIlluminance * sunOpen;
-    if (any(A.MoonIlluminance > 0))
+    // Each body only while it adds to the air's light (AtmSunLightsAir: at noon the moon was a second lighting of every
+    // froxel for three millionths of the sun's light). Two calls, each behind its own test: one copy looped over the
+    // bodies was slower with a single body (0.40-0.44 ms against 0.38) than these two with both.
+    float3 sunOpen = 0, moonOpen = 0;
+    float3 L = 0, openL = 0;
+    if (AtmSunLightsAir(A))
+    {
+        L = A.SunIlluminance * FroxelBodyLight(A, medium, smoke, false, posKm, worldPos, relPos, V, viewDepth,
+                                               A.SunDirection, open, sky, skyDimming, sunOpen);
+        openL = A.SunIlluminance * sunOpen;
+    }
+    if (AtmMoonLightsAir(A))
     {
         L += A.MoonIlluminance * FroxelBodyLight(A, medium, smoke, true, posKm, worldPos, relPos, V, viewDepth,
                                                  A.MoonDirection, open, sky, skyDimming, moonOpen);

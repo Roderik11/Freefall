@@ -249,6 +249,7 @@ namespace Freefall.Graphics
             public float TerrainShadowSize;
             public uint TerrainSunWindow, TerrainMoonWindow; public Vector2 TerrainWindowOrigin;
             public float TerrainWindowSize;
+            public uint AirWithout;
 
             /// <summary>The part the transmittance and multiple scattering LUTs depend on</summary>
             // Within half a percent of the medium the tables were made for: a change of weather turns these for many
@@ -263,8 +264,50 @@ namespace Freefall.Graphics
             private static bool Near(float a, float b) => MathF.Abs(a - b) <= 0.005f * MathF.Max(MathF.Abs(a), MathF.Abs(b));
         }
 
+        // ── Which bodies light the air ──
+
+        private const uint AirWithoutSun = 1, AirWithoutMoon = 2;       // atmosphere_common.hlsli AirWithout
+        /// <summary>A body this far under the horizon (the sine of −20°: past astronomical twilight) lights no air the
+        /// camera can see: the planet's shadow stands over 400 km high there, the atmosphere ends at 100.</summary>
+        private const float AirBodyGone = -0.342f;
+        /// <summary>The sun's light at the camera over a moon's above the atmosphere from which the moon is left out of
+        /// the air. Toward the moon itself its aerosol phase is ~160 times what the sun's light gives there (the sun
+        /// behind the viewer), so at this mark the moon would add 1.6 % to the haze at the middle of its own aureole and
+        /// less everywhere else; at noon it is 0.05 %.</summary>
+        private const float AirSunOverMoon = 1e4f;
+
+        /// <summary>For engine_stats: the bodies that light the air this frame (<see cref="AirWithout"/>).</summary>
+        public static string AirLitBy => (_frame.AirWithout & (AirWithoutSun | AirWithoutMoon)) switch
+        {
+            0 => "sun and moon",
+            AirWithoutSun => "moon",
+            AirWithoutMoon => "sun",
+            _ => "neither",
+        };
+
+        /// <summary>
+        /// The bodies that add nothing to the air's light this frame (AtmosphereParams.AirWithout): the near fog volume
+        /// and the aerial perspective light every froxel and every step once per body (its shadows, the clouds toward it,
+        /// its phases), and one of the two is nearly always nothing. The moon while a moon exists is never at zero lux,
+        /// so at noon both passes lit the air with it for three millionths of the sun's light, and its terrain shadow
+        /// maps were made again as it moved. The sky, the meter and the clouds are not touched: they take each body on
+        /// their own.
+        /// </summary>
+        private static uint AirWithout(in AtmosphereSettings s, Vector3 sunTransmittance)
+        {
+            uint without = 0;
+            float sunY = Vector3.Normalize(s.SunDirection).Y, moonY = Vector3.Normalize(s.MoonDirection).Y;
+            if (sunY < AirBodyGone || s.SunIlluminance == Vector3.Zero) without |= AirWithoutSun;
+            if (moonY < AirBodyGone || s.MoonIlluminance == Vector3.Zero) without |= AirWithoutMoon;
+            if (without == 0 && Luminance(s.SunIlluminance * sunTransmittance) > AirSunOverMoon * Luminance(s.MoonIlluminance))
+                without |= AirWithoutMoon;
+            return without;
+        }
+
+        private static float Luminance(Vector3 c) => 0.2126f * c.X + 0.7152f * c.Y + 0.0722f * c.Z;
+
         private const int FrameCount = 3;
-        private const int AmbientElements = 5;      // atmosphere_cs.hlsl CSAmbient: sky, ground, sky (older units), sun
+        private const int AmbientElements = 5;     // atmosphere_cs.hlsl CSAmbient: sky, ground, sky (older units), sun
                                                     // transmittance; CSCloudDeck: the cloud layer
         private const int TransmittanceW = 256, TransmittanceH = 64, MultiScatRes = 32;
         private const int SkyViewW = 192, SkyViewH = 108;
@@ -346,6 +389,7 @@ namespace Freefall.Graphics
             _cpuSunTransmittance[slot] = TransmittanceToLight(cameraHeight, Settings.SunDirection);
 
             var s = Settings;
+            uint airWithout = AirWithout(s, _cpuSunTransmittance[slot]);
             float fogKm = s.FogDensity * 1000f;
             // The aerosols, and the haze of the rain and snow falling at the camera (Weather.HazeKm: scattering, white)
             float mieScattering = MieScatteringEarth * s.MieScale + Weather.HazeKm;
@@ -379,6 +423,7 @@ namespace Freefall.Graphics
                 SkyViewPastMoonLut = _skyViewPastMoon!.BindlessIndex,
                 AerialPerspective = 0,      // each view has its own (SceneConstants.AerialPerspectiveIdx)
                 Ambient = _ambient!.SrvIndex,
+                AirWithout = airWithout,
             };
             // The scene's terrain: its pages' parameters for this frame (terrain_pages.hlsli)
             TerrainIdx = 0;
@@ -413,7 +458,8 @@ namespace Freefall.Graphics
             (_frame.TerrainSunShadow, _frame.TerrainMoonShadow, _frame.TerrainShadowOrigin, _frame.TerrainShadowSize,
              _frame.TerrainSunWindow, _frame.TerrainMoonWindow, _frame.TerrainWindowOrigin, _frame.TerrainWindowSize) =
                 TerrainLightShadow.Prepare(TerrainCover, Components.DirectionalLight.ShadowTowards(_frame.SunDirection),
-                    Components.DirectionalLight.ShadowTowards(_frame.MoonDirection), s.MoonIlluminance != Vector3.Zero);
+                    Components.DirectionalLight.ShadowTowards(_frame.MoonDirection),
+                    s.MoonIlluminance != Vector3.Zero && (airWithout & AirWithoutMoon) == 0);
             unsafe { *_params[slot]!.WritePtr<GpuParams>() = _frame; }
             return _params[slot]!.SrvIndex;
         }

@@ -50,7 +50,22 @@ struct AtmosphereParams
     float TerrainShadowSize;                               // metres the maps span each way
     uint TerrainSunWindow;      uint TerrainMoonWindow;    float2 TerrainWindowOrigin;   // the same round the camera, finer (TerrainLightShadow's window; 0 = none); its corner
     float TerrainWindowSize;                               // metres the window spans each way
+    uint AirWithout;                                       // bodies that add nothing to the air's light this frame: 1 the sun, 2 the moon (Atmosphere.cs AirWithout)
 };
+
+// Whether a body lights the air this frame (the near fog volume's froxels, the aerial perspective's march): not the sun
+// deep under the horizon, and not a moon deep under it or up by day, when its light is under a ten-thousandth of the
+// sun's (Atmosphere.cs AirWithout). Each body is a second lighting of every froxel and every step of the haze: its
+// shadows, the clouds toward it, its phases.
+bool AtmSunLightsAir(AtmosphereParams A)
+{
+    return (A.AirWithout & 1) == 0;
+}
+
+bool AtmMoonLightsAir(AtmosphereParams A)
+{
+    return (A.AirWithout & 2) == 0 && any(A.MoonIlluminance > 0);
+}
 
 // The global root signature's linear clamp sampler (s2)
 SamplerState AtmosphereLinearClamp : register(s2);

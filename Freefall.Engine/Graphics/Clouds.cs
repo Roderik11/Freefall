@@ -139,8 +139,8 @@ namespace Freefall.Graphics
         public const int ShadowMapTexels = 1024;                // cloud_common.hlsli CLOUD_SHADOW_TEXELS
         private const float ShadowMapTexel = 31.25f;            // m: 32 km across
         private const float EarthRadius = 6360000f;             // cloud_common.hlsli CLOUD_EARTH_RADIUS
-        // All of it every 16 frames: ~0.075 ms at 64 rows (0.15 ms at 128); the map is in cloud space, so only the clouds'
-        // own slow change and a moving light age it
+        // All of it every 16 steps (UpkeepHz): ~0.075 ms at 64 rows (0.15 ms at 128); the map is in cloud space, so only
+        // the clouds' own slow change and a moving light age it
         private const int ShadowRowsPerFrame = ShadowMapTexels / 16;
         private static RenderTexture2D? _shadowMap;
         private static ResourceStates _shadowMapState = ResourceStates.Common;
@@ -166,6 +166,27 @@ namespace Freefall.Graphics
         private const int LightPasses = 8;              // doubling passes: 256 steps along the light cross a level
         private static readonly List<int> _lightLevels = new();     // levels whose light and sky volumes are made this frame
         private static int _lightTurn;
+
+        // Upkeep by the clock. Four passes keep the volumes up with the clouds' own slow change and the light's turn: a
+        // rolling brick column a level (the bake), a level's light and sky volumes, a share of the ground shadow map's
+        // rows, a face of the probe. Each took a step every frame, so at 140 fps they ran over twice as often as at 60
+        // for the same picture: 0.39 ms of GPU (2026-11-18). Each now takes UpkeepHz steps a real second and never more
+        // than one a frame: at 60 fps and under it is what it was, above it the steps thin out. The four start a quarter
+        // of a step apart, so their steps fall on different frames. What must be whole at once (a rebake, a change of
+        // light, a teleport) and the brick columns that enter as the camera moves do not wait for a clock.
+        private const float UpkeepHz = 60f;
+        private static float _bakeClock, _lightClock = 0.25f, _shadowClock = 0.5f, _probeClock = 0.75f;
+        private static bool _shadowDue, _probeDue;
+
+        // Whether a pass takes its step this frame; steps = the real time since the last frame × UpkeepHz. Only the
+        // fraction is kept, so a slow frame is not made up for and the four stay a quarter apart.
+        private static bool UpkeepDue(ref float clock, float steps)
+        {
+            clock += steps;
+            if (clock < 1f) return false;
+            clock -= MathF.Floor(clock);
+            return true;
+        }
         private static Vector3 _lightDir = Vector3.UnitY;
         private static bool _lightIsMoon;
         private static readonly Level[] _levels = new Level[LevelCount];
@@ -362,14 +383,21 @@ namespace Freefall.Graphics
             if (relight) _probeAll = true;
             _lightIsMoon = moon;
             _lightDir = lightDir;
-            // A level's light and sky volumes a frame, coarse to fine (each adds the coarser level's light where its path
+            // The upkeep's steps this frame (UpkeepHz)
+            float upkeepSteps = MathF.Max(Base.Time.RealDelta, 0f) * UpkeepHz;
+            bool bakeDue = UpkeepDue(ref _bakeClock, upkeepSteps);
+            bool lightDue = UpkeepDue(ref _lightClock, upkeepSteps);
+            _shadowDue = UpkeepDue(ref _shadowClock, upkeepSteps);
+            _probeDue = UpkeepDue(ref _probeClock, upkeepSteps);
+
+            // A level's light and sky volumes a step, coarse to fine (each adds the coarser level's light where its path
             // leaves it); all of them when everything is baked again or the light changed source
             _lightLevels.Clear();
             if (relight)
             {
                 for (int i = LevelCount - 1; i >= 0; i--) _lightLevels.Add(i);
             }
-            else
+            else if (lightDue)
             {
                 _lightLevels.Add(LevelCount - 1 - _lightTurn);
                 _lightTurn = (_lightTurn + 1) % LevelCount;
@@ -400,9 +428,12 @@ namespace Freefall.Graphics
                     if (dx < 0) _bakes.Add(new Bake(i, originX, originZ, (int)-dx, BricksPerSide));
                     if (dz > 0) _bakes.Add(new Bake(i, originX, originZ + BricksPerSide - dz, BricksPerSide, (int)dz));
                     if (dz < 0) _bakes.Add(new Bake(i, originX, originZ, BricksPerSide, (int)-dz));
-                    // ... and one column again for the clouds' own change
-                    _bakes.Add(new Bake(i, originX + level.Rolling, originZ, 1, BricksPerSide));
-                    level.Rolling = (level.Rolling + 1) % BricksPerSide;
+                    // ... and one column again a step for the clouds' own change
+                    if (bakeDue)
+                    {
+                        _bakes.Add(new Bake(i, originX + level.Rolling, originZ, 1, BricksPerSide));
+                        level.Rolling = (level.Rolling + 1) % BricksPerSide;
+                    }
                 }
                 level.CenterX = centerX;
                 level.CenterZ = centerZ;
@@ -853,46 +884,53 @@ namespace Freefall.Graphics
             // The ground shadow map: a share of its rows (all of them after a rebake, a change of light or a jump), after
             // the light volumes (it takes the rest of a storm's depth from them)
             PixMarker.Begin(list, "Cloud shadow map");
-            if (_shadowMapState != ResourceStates.UnorderedAccess)
+            int firstRow = _shadowAll ? 0 : _shadowRow;
+            int rows = _shadowAll ? ShadowMapTexels : _shadowDue ? ShadowRowsPerFrame : 0;      // a share a step (UpkeepHz)
+            if (rows > 0)
             {
-                list.ResourceBarrierTransition(_shadowMap!.Native, _shadowMapState, ResourceStates.UnorderedAccess);
-                _shadowMapState = ResourceStates.UnorderedAccess;
+                if (_shadowMapState != ResourceStates.UnorderedAccess)
+                {
+                    list.ResourceBarrierTransition(_shadowMap!.Native, _shadowMapState, ResourceStates.UnorderedAccess);
+                    _shadowMapState = ResourceStates.UnorderedAccess;
+                }
+                cs.SetPushConstant(_kShadowMap, "TargetUAV", _shadowMap!.UavIndex);
+                cs.SetPushConstant(_kShadowMap, "TargetWidth", (uint)ShadowMapTexels);
+                cs.SetPushConstant(_kShadowMap, "TargetHeight", (uint)rows);
+                cs.SetPushConstant(_kShadowMap, "RegionZ0Bits", (uint)firstRow);
+                cs.Dispatch(_kShadowMap, list, ShadowMapTexels / 8, (uint)(rows + 7) / 8, 1);
+                if (!_shadowAll) _shadowRow = (_shadowRow + rows) % ShadowMapTexels;
+                _shadowAll = false;
+                list.ResourceBarrierTransition(_shadowMap.Native, ResourceStates.UnorderedAccess, shaderRead);
+                _shadowMapState = shaderRead;
             }
-            int firstRow = _shadowAll ? 0 : _shadowRow, rows = _shadowAll ? ShadowMapTexels : ShadowRowsPerFrame;
-            cs.SetPushConstant(_kShadowMap, "TargetUAV", _shadowMap!.UavIndex);
-            cs.SetPushConstant(_kShadowMap, "TargetWidth", (uint)ShadowMapTexels);
-            cs.SetPushConstant(_kShadowMap, "TargetHeight", (uint)rows);
-            cs.SetPushConstant(_kShadowMap, "RegionZ0Bits", (uint)firstRow);
-            cs.Dispatch(_kShadowMap, list, ShadowMapTexels / 8, (uint)(rows + 7) / 8, 1);
             _shadowRowsLast = rows;
-            if (!_shadowAll) _shadowRow = (_shadowRow + rows) % ShadowMapTexels;
-            _shadowAll = false;
-            list.ResourceBarrierTransition(_shadowMap.Native, ResourceStates.UnorderedAccess, shaderRead);
-            _shadowMapState = shaderRead;
             PixMarker.End(list);
 
-            // The sky probe's clouds: a face a frame (all five after a rebake or a change of light); the probe composes
+            // The sky probe's clouds: a face a step (all six after a rebake or a change of light); the probe composes
             // them over its sky every frame (sky_probe_cs.hlsl), so it follows the time and the exposure as before
             PixMarker.Begin(list, "Cloud probe");
-            if (_probeCloudsState != ResourceStates.UnorderedAccess)
+            int faces = _probeAll ? 6 : _probeDue ? 1 : 0;      // all six once (−Y too: it must hold "no cloud", not garbage)
+            if (faces > 0)
             {
-                list.ResourceBarrierTransition(_probeClouds!, _probeCloudsState, ResourceStates.UnorderedAccess);
-                _probeCloudsState = ResourceStates.UnorderedAccess;
+                if (_probeCloudsState != ResourceStates.UnorderedAccess)
+                {
+                    list.ResourceBarrierTransition(_probeClouds!, _probeCloudsState, ResourceStates.UnorderedAccess);
+                    _probeCloudsState = ResourceStates.UnorderedAccess;
+                }
+                for (int f = 0; f < faces; f++)
+                {
+                    var round = _cameraOverBase ? ProbeFacesAbove : ProbeFaces;
+                    int face = _probeAll ? f : round[_probeTurn % round.Length];
+                    cs.SetPushConstant(_kProbeFace, "TargetUAV", _probeCloudsUav);
+                    cs.SetPushConstant(_kProbeFace, "TargetWidth", (uint)ProbeSize);
+                    cs.SetPushConstant(_kProbeFace, "ProbeFace", (uint)face);
+                    cs.Dispatch(_kProbeFace, list, ProbeSize / 8, ProbeSize / 8, 1);
+                }
+                if (!_probeAll) _probeTurn = (_probeTurn + 1) % (_cameraOverBase ? ProbeFacesAbove.Length : ProbeFaces.Length);
+                _probeAll = false;
+                list.ResourceBarrierTransition(_probeClouds!, ResourceStates.UnorderedAccess, shaderRead);
+                _probeCloudsState = shaderRead;
             }
-            int faces = _probeAll ? 6 : 1;          // all six once (−Y too: it must hold "no cloud", not garbage)
-            for (int f = 0; f < faces; f++)
-            {
-                var round = _cameraOverBase ? ProbeFacesAbove : ProbeFaces;
-                int face = _probeAll ? f : round[_probeTurn % round.Length];
-                cs.SetPushConstant(_kProbeFace, "TargetUAV", _probeCloudsUav);
-                cs.SetPushConstant(_kProbeFace, "TargetWidth", (uint)ProbeSize);
-                cs.SetPushConstant(_kProbeFace, "ProbeFace", (uint)face);
-                cs.Dispatch(_kProbeFace, list, ProbeSize / 8, ProbeSize / 8, 1);
-            }
-            if (!_probeAll) _probeTurn = (_probeTurn + 1) % (_cameraOverBase ? ProbeFacesAbove.Length : ProbeFaces.Length);
-            _probeAll = false;
-            list.ResourceBarrierTransition(_probeClouds!, ResourceStates.UnorderedAccess, shaderRead);
-            _probeCloudsState = shaderRead;
             PixMarker.End(list);
         }
 

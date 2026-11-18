@@ -133,6 +133,8 @@ namespace Freefall.Editor.Commands
                 exposure = Freefall.Graphics.AutoExposure.Describe(),
                 // The cloud layer as the air takes it: its mean density toward the sun and the moon, how much it hides them
                 cloudDeck = Freefall.Graphics.Atmosphere.DescribeCloudDeck(),
+                // The bodies lighting the near fog volume and the aerial perspective this frame: one that adds nothing is left out
+                airLitBy = Freefall.Graphics.Atmosphere.AirLitBy,
                 // The volumetric clouds: on, the slab's heights, this frame's bake, the wind's offset and heading, towers
                 clouds = Freefall.Graphics.Clouds.Describe(),
                 weather = Freefall.Graphics.Weather.Describe(),
