@@ -37,6 +37,7 @@ namespace Freefall.World
         private const float LookEvery = 0.25f;
         private const float RingMargin = 128f;   // the camera may move this far between two looks before a cell it fades in lacks instances
         private const float Leave = 1.15f;       // what is made goes again this much further out
+        private const float CopiesPerMsAwake = 200f;   // copies whose colliders a cell's body makes in a millisecond when it wakes (play)
 
         private float _sinceLook = LookEvery;
         private bool _farTierOn;
@@ -47,6 +48,13 @@ namespace Freefall.World
         private readonly List<Group> _toDrop = new();
         private readonly List<Vector3> _viewers = new();
         private readonly List<Slice> _candidates = new();
+
+        // Where its frame goes, in the profiler
+        private static readonly ProfilerMarker s_lookMarker = ProfilerMarker.Get("Cells look");
+        private static readonly ProfilerMarker s_despawnMarker = ProfilerMarker.Get("Cells despawn");
+        private static readonly ProfilerMarker s_dropMarker = ProfilerMarker.Get("Cells instances drop");
+        private static readonly ProfilerMarker s_instanceMarker = ProfilerMarker.Get("Cells instances add");
+        private static readonly ProfilerMarker s_spawnMarker = ProfilerMarker.Get("Cells spawn");
 
         public override void Update()
         {
@@ -86,65 +94,74 @@ namespace Freefall.World
             if (_sinceLook >= LookEvery)
             {
                 _sinceLook = 0;
-                Look();
+                using (s_lookMarker.Auto()) Look();
             }
 
-            // Within the budget: what left first, then instances for the nearest, then entities for the nearest
+            // Within the budget: what left first, then instances for the nearest, then entities for the nearest. At least
+            // one thing a frame; a slice holds at most WorldCells.MaxSliceRecords, so one is never far past the budget.
             double budget = Engine.Settings.WorldCellsBudgetMs;
             int done = 0;
             long work = Stopwatch.GetTimestamp();
-            bool Within() => done == 0 || Stopwatch.GetElapsedTime(work).TotalMilliseconds < budget;
 
-            while (_toDespawn.Count > 0 && Within())
-            {
-                var slice = _toDespawn[^1];
-                _toDespawn.RemoveAt(_toDespawn.Count - 1);
-                if (slice.Gone || slice.Near || slice.Spawned == null) continue;
-                int draws = Despawn(slice);
-                if (draws > 0) { Stats.InstanceGroupsMade++; Stats.InstanceDrawsMade += draws; }
-                Stats.Despawned++;
-                done++;
-            }
-            while (_toDrop.Count > 0)
-            {
-                var g = _toDrop[^1];
-                _toDrop.RemoveAt(_toDrop.Count - 1);
-                if (g.Slice.Gone || g.InRing || g.Draws == null) continue;
-                RemoveInstances(g);
-                Stats.InstanceGroupsDropped++;
-            }
+            using (s_despawnMarker.Auto())
+                while (_toDespawn.Count > 0 && (done == 0 || Stopwatch.GetElapsedTime(work).TotalMilliseconds < budget))
+                {
+                    var slice = _toDespawn[^1];
+                    _toDespawn.RemoveAt(_toDespawn.Count - 1);
+                    if (slice.Gone || slice.Near || slice.Spawned == null) continue;
+                    int draws = Despawn(slice);
+                    if (draws > 0) { Stats.InstanceGroupsMade++; Stats.InstanceDrawsMade += draws; }
+                    Stats.Despawned++;
+                    done++;
+                }
+            using (s_dropMarker.Auto())
+                while (_toDrop.Count > 0)
+                {
+                    var g = _toDrop[^1];
+                    _toDrop.RemoveAt(_toDrop.Count - 1);
+                    if (g.Slice.Gone || g.InRing || g.Draws == null) continue;
+                    RemoveInstances(g);
+                    Stats.InstanceGroupsDropped++;
+                }
             int next = 0;
-            while (next < _toInstance.Count && Within())
-            {
-                var g = _toInstance[next++].Group;
-                if (g.Slice.Gone || !g.InRing || g.Draws != null || g.Slice.Spawned != null) continue;
-                long t0 = Stopwatch.GetTimestamp();
-                int draws = AddInstances(g);
-                Stats.InstanceMs += Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
-                Stats.InstanceGroupsMade++;
-                Stats.InstanceDrawsMade += draws;
-                done++;
-            }
+            using (s_instanceMarker.Auto())
+                while (next < _toInstance.Count && (done == 0 || Stopwatch.GetElapsedTime(work).TotalMilliseconds < budget))
+                {
+                    var g = _toInstance[next++].Group;
+                    if (g.Slice.Gone || !g.InRing || g.Draws != null || g.Slice.Spawned != null) continue;
+                    long t0 = Stopwatch.GetTimestamp();
+                    int draws = AddInstances(g);
+                    Stats.InstanceMs += Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+                    Stats.InstanceGroupsMade++;
+                    Stats.InstanceDrawsMade += draws;
+                    done++;
+                }
             _toInstance.RemoveRange(0, next);
             next = 0;
-            while (next < _toSpawn.Count && Within())
-            {
-                var slice = _toSpawn[next++].Slice;
-                if (slice.Gone || !slice.Near || slice.Spawned != null) continue;
-                long t0 = Stopwatch.GetTimestamp();
-                Spawn(slice);
-                Stats.SpawnMs += Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
-                if (slice.Spawned == null) continue;
-                Stats.SpawnedEntities += slice.Records.Count;
-                Stats.Spawned++;
-                done++;
-                foreach (var g in slice.Groups)
-                    if (g.Draws != null)
-                    {
-                        g.DropInstancesIn = 2;
-                        Dropping.Add(g);
-                    }
-            }
+            // In play a copy's collider is made when its cell's body wakes, the frame after (RigidBody.CreateActor, ~5 µs
+            // a copy): copies taken from the parked ones cost next to nothing here, so dozens of cells fitted the budget
+            // and their bodies woke together (62 ms, TestWorld's capital). So the copies are counted too.
+            int copiesLeft = Engine.IsEditor ? int.MaxValue : (int)(budget * CopiesPerMsAwake);
+            using (s_spawnMarker.Auto())
+                while (next < _toSpawn.Count && (done == 0 || (copiesLeft > 0 && Stopwatch.GetElapsedTime(work).TotalMilliseconds < budget)))
+                {
+                    var slice = _toSpawn[next++].Slice;
+                    if (slice.Gone || !slice.Near || slice.Spawned != null) continue;
+                    copiesLeft -= slice.Records.Count;
+                    long t0 = Stopwatch.GetTimestamp();
+                    Spawn(slice);
+                    Stats.SpawnMs += Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+                    if (slice.Spawned == null) continue;
+                    Stats.SpawnedEntities += slice.Records.Count;
+                    Stats.Spawned++;
+                    done++;
+                    foreach (var g in slice.Groups)
+                        if (g.Draws != null)
+                        {
+                            g.DropInstancesIn = 2;
+                            Dropping.Add(g);
+                        }
+                }
             _toSpawn.RemoveRange(0, next);
 
             Stats.MaxFrameMs = Math.Max(Stats.MaxFrameMs, Stopwatch.GetElapsedTime(start).TotalMilliseconds);

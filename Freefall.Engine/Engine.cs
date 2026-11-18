@@ -854,6 +854,14 @@ namespace Freefall
          public float WorldCellsBudgetMs { get; set; } = 2f;
 
          /// <summary>
+         /// Near cells' copies kept for reuse when their cell goes (WorldCells, "Parked copies"): a cell coming near takes
+         /// them instead of making new ones, so moving about makes no garbage. ~1 KB each while parked.
+         /// </summary>
+         [ValueRange(0f, 1000000f)]
+         [System.ComponentModel.Description("How many of the world cells' copies are kept, hidden and not drawn, for the next cells that come near, instead of being made again (about 1 KB each). Past it they are destroyed when their cell goes. 0 = none kept.")]
+         public int WorldCellsParkedMax { get; set; } = 100000;
+
+         /// <summary>
          /// Characters are posed less often the smaller they are on screen and when out of view, and not at all
          /// once too small to be drawn (AnimatorSystem). Off = every character every frame.
          /// </summary>

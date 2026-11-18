@@ -87,9 +87,13 @@ namespace Freefall.Components
         protected abstract void AddDraws(DrawGroup group, Mesh mesh, int transformSlot);
 
         /// <summary>The persistent draws currently registered (null = none).</summary>
-        protected DrawGroup? Draws => _drawGroup;
+        protected DrawGroup? Draws => _registered ? _drawGroup : null;
 
+        // Kept from one registration to the next (a refresh, a park and back): its removal and the next adds are queued in
+        // that order and applied in it (CommandBuffer.FlushPersistent), so reusing it allocates nothing
         private DrawGroup? _drawGroup;
+        private bool _registered;
+        private bool _parked;
         private bool _live;                   // between Awake and Destroy: only then may draws be registered
         private int _refreshQueued;           // 1 while a RefreshDraws is pending (Interlocked)
         private Transform? _trackedTransform; // the transform UpdateBounds is subscribed to
@@ -362,6 +366,21 @@ namespace Freefall.Components
         }
 
         /// <summary>
+        /// Kept aside for reuse, not drawn (a world cells copy parked while its cell is away, WorldCells): no draws, its
+        /// own <see cref="Component.Enabled"/> untouched. Runtime only, never saved.
+        /// </summary>
+        internal bool Parked
+        {
+            get => _parked;
+            set
+            {
+                if (_parked == value) return;
+                _parked = value;
+                Invalidate();
+            }
+        }
+
+        /// <summary>
         /// Queue a RefreshDraws before the next frame is rendered. Thread-safe and cheap to call
         /// repeatedly: only the first call until the refresh runs queues anything.
         /// </summary>
@@ -395,7 +414,7 @@ namespace Freefall.Components
             Unregister();
 
             var mesh = RenderMesh;
-            if (!_live || !Enabled || _drawnElsewhere || mesh == null || Transform == null) return;
+            if (!_live || !Enabled || _drawnElsewhere || _parked || mesh == null || Transform == null) return;
 
             int slot = Transform.TransformSlot;
             if (slot < 0)
@@ -407,10 +426,10 @@ namespace Freefall.Components
 
             UpdateBounds();
 
-            var group = new DrawGroup(mesh.DrawPartIndices.Length);
+            var group = _drawGroup ??= new DrawGroup(mesh.DrawPartIndices.Length);
             _instanceSlotsUsed?.Clear();
             AddDraws(group, mesh, slot);
-            _drawGroup = group;
+            _registered = true;
 
             // Slots of effects the draws no longer use go back; the ones in use are rewritten (an effect's layout
             // may have changed: a recompile invalidates every renderer through Material.EffectChanged)
@@ -430,9 +449,9 @@ namespace Freefall.Components
 
         private void Unregister()
         {
-            if (_drawGroup == null) return;
+            if (!_registered || _drawGroup == null) return;
             CommandBuffer.RemovePersistent(_drawGroup);
-            _drawGroup = null;
+            _registered = false;
         }
     }
 

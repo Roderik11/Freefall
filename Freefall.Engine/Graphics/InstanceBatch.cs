@@ -332,6 +332,19 @@ namespace Freefall.Graphics
         private int _persistentCount;
         private InstanceHandle?[] _handles = Array.Empty<InstanceHandle?>();
 
+        // Handles of removed records, for the next adds: a forest's instances coming and going made one per draw and pass
+        // (~9,000 in a frame, 280 KB). Main thread only, as AddPersistent and RemovePersistent are.
+        private static readonly Stack<InstanceHandle> s_freeHandles = new();
+
+        /// <summary>A handle whose record was removed (<see cref="RemovePersistent"/>) and that nothing holds any more, for
+        /// reuse. Main thread (CommandBuffer.FlushPersistent).</summary>
+        internal static void Recycle(InstanceHandle handle)
+        {
+            if (handle.Index >= 0) return;   // still a record's
+            handle.Batch = null!;
+            s_freeHandles.Push(handle);
+        }
+
         /// <summary>Number of persistent instance records (registered once, not re-enqueued per frame).</summary>
         public int PersistentCount => _persistentCount;
 
@@ -417,7 +430,14 @@ namespace Freefall.Graphics
                 }
             }
 
-            var handle = new InstanceHandle(this, index);
+            InstanceHandle handle;
+            if (s_freeHandles.TryPop(out var free))
+            {
+                handle = free;
+                handle.Batch = this;
+                handle.Index = index;
+            }
+            else handle = new InstanceHandle(this, index);
             _handles[index] = handle;
             _persistentCount++;
             MarkRecordChanged(index);

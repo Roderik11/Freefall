@@ -135,7 +135,10 @@ namespace Freefall.World
         public static void Start(WorldCells.Owner o, PrefabShapes.Part[][] shapes)
         {
             var records = o.Records.ToArray();
-            var cells = o.Slices.Select(s => new CellIn { Key = s.Cell.Key, Centre = s.Cell.Centre, Records = s.Records.ToArray() }).ToArray();
+            // One per cell: a cell's records may be in several slices (WorldCells.MaxSliceRecords), in record order
+            var cells = o.Slices.GroupBy(s => s.Cell.Key)
+                .Select(g => new CellIn { Key = g.Key, Centre = g.First().Cell.Centre, Records = g.SelectMany(s => s.Records).ToArray() })
+                .ToArray();
             var kinds = o.Kinds.Select(k => new KindIn(k.Far is FarForm.Auto or FarForm.Merged, k.Far == FarForm.Merged, k.Profile, k.Swap)).ToArray();
             var toWorld = o.ToWorld;
             Matrix4x4.Invert(toWorld, out var toLocal);

@@ -144,6 +144,7 @@ namespace Freefall.World
             public bool Gone;                           // its owner ran again or was cleared
             public bool Near;                           // a viewer within A: its entities
             public Entity? Spawned;
+            public List<Entity?>? Copies;               // its copies by record (null where none was made), while it is spawned
             public List<(Entity Copy, int Record)>? Stateful;   // its copies that keep state, while it is spawned
             public float MaxRing;                       // the farthest any of its groups is wanted from (its kinds' rings)
             public int Stamp;                           // the look that last visited it
@@ -171,7 +172,14 @@ namespace Freefall.World
 
         internal static (int X, int Z) KeyMin = (int.MaxValue, int.MaxValue), KeyMax = (int.MinValue, int.MinValue);
         internal static IReadOnlyDictionary<(int, int), Cell> Cells => s_cells;
-        internal static IEnumerable<Owner> Owners => s_owners.Values;
+        internal static Dictionary<ulong, Owner>.ValueCollection Owners => s_owners.Values;   // a struct enumerator: a look allocates nothing
+
+        /// <summary>
+        /// The most records a slice holds: a cell's records of one owner beyond it go into further slices of the same cell,
+        /// so that the entities made in a frame stay within the system's budget. A town block's slice was up to 3,486 pieces,
+        /// made in one frame whatever the budget said (45 ms, 4.4 MB, TestWorld's capital).
+        /// </summary>
+        public const int MaxSliceRecords = 256;
 
         /// <summary>Owners with records.</summary>
         public static int OwnerCount => s_owners.Count;
@@ -286,18 +294,17 @@ namespace Freefall.World
         }
 
         // Every renderer of a copy draws with a slot its record's owner keeps (PersistentRenderer.ShareInstanceSlot)
-        private static void ShareInstanceSlot(Entity copy, int slot)
+        private static void ShareInstanceSlot(Entity copy, int slot) => ShareInstanceSlot(copy.Transform, slot);
+
+        private static void ShareInstanceSlot(Transform t, int slot)
         {
-            var stack = new Stack<Transform>();
-            stack.Push(copy.Transform);
-            while (stack.Count > 0)
+            if (t.Entity != null)
             {
-                var t = stack.Pop();
-                if (t.Entity != null)
-                    foreach (var c in t.Entity.Components)
-                        if (c is PersistentRenderer r) r.ShareInstanceSlot(slot);
-                for (int i = 0; i < t.Count; i++) stack.Push(t.GetChild(i));
+                var components = t.Entity.Components;
+                for (int c = 0; c < components.Count; c++)
+                    if (components[c] is PersistentRenderer r) r.ShareInstanceSlot(slot);
             }
+            for (int i = 0; i < t.Count; i++) ShareInstanceSlot(t.GetChild(i), slot);
         }
 
         // The instance slot a record's owner gave it (0: none)
@@ -467,7 +474,7 @@ namespace Freefall.World
                 var r = o.Records[i];
                 var w = Vector3.Transform(r.Position, o.ToWorld);
                 var key = KeyOf(w.X, w.Z);
-                if (!byKey.TryGetValue(key, out var slice))
+                if (!byKey.TryGetValue(key, out var slice) || slice.Records.Count >= MaxSliceRecords)
                 {
                     if (!s_cells.TryGetValue(key, out var cell))
                     {
@@ -475,7 +482,7 @@ namespace Freefall.World
                         KeyMin = (Math.Min(KeyMin.X, key.Item1), Math.Min(KeyMin.Z, key.Item2));
                         KeyMax = (Math.Max(KeyMax.X, key.Item1), Math.Max(KeyMax.Z, key.Item2));
                     }
-                    byKey[key] = slice = new Slice { Owner = o, Cell = cell };
+                    byKey[key] = slice = new Slice { Owner = o, Cell = cell };   // a full slice: the next one of the same cell
                     cell.Slices.Add(slice);
                     o.Slices.Add(slice);
                 }
@@ -695,6 +702,7 @@ namespace Freefall.World
                 {
                     KeepState(slice);   // a re-run that places them again finds it under the same ids
                     s_spawned.Remove(slice.Spawned);
+                    ParkCopies(slice);  // for the next cell that wants them (none when the output is being destroyed)
                     if (!slice.Spawned.IsBeingDestroyed) slice.Spawned.Destroy();
                 }
                 slice.Spawned = null;
@@ -747,6 +755,12 @@ namespace Freefall.World
         private static readonly MaterialBlock NoParams = new();
         private static readonly Dictionary<Effect, int> s_instanceSlots = new();
 
+        // A group's instances' draw group and transform slots, kept for the next group when its instances go: a forest's
+        // groups coming and going in flight made new ones each time. A draw group may be reused at once: its removal is
+        // queued before the next adds and applied in that order (CommandBuffer.FlushPersistent).
+        private static readonly Stack<DrawGroup> s_drawGroups = new();
+        private static readonly Stack<List<int>> s_slotLists = new();
+
         // An effect's shared per-object data slot, its defaults
         private static int InstanceSlotFor(Material material)
         {
@@ -768,8 +782,9 @@ namespace Freefall.World
             var o = g.Slice.Owner;
             var kind = o.Kinds[g.Kind];
             var renderers = PrefabShapes.RenderersOf(kind.Prefab);
-            g.Draws = new DrawGroup();
-            g.Slots = new List<int>(g.Records.Count * renderers.Length);
+            g.Draws = s_drawGroups.Count > 0 ? s_drawGroups.Pop() : new DrawGroup();
+            g.Slots = s_slotLists.Count > 0 ? s_slotLists.Pop() : new List<int>();
+            g.Slots.EnsureCapacity(g.Records.Count * renderers.Length);
             int draws = 0;
             foreach (int i in g.Records)
             {
@@ -800,7 +815,10 @@ namespace Freefall.World
         {
             if (g.Draws == null) return;
             CommandBuffer.RemovePersistent(g.Draws);
+            s_drawGroups.Push(g.Draws);
             foreach (int slot in g.Slots!) TransformBuffer.Instance.ReleaseSlot(slot);
+            g.Slots.Clear();
+            s_slotLists.Push(g.Slots);
             g.Slice.Owner.InstanceDraws -= g.DrawCount;
             g.DrawCount = 0;
             g.Draws = null;
@@ -808,7 +826,11 @@ namespace Freefall.World
             g.DropInstancesIn = -1;
         }
 
-        /// <summary>The slice's entities, under one container with a static body for their colliders.</summary>
+        /// <summary>
+        /// The slice's entities, under one container with a static body for their colliders (the body gathers their shapes
+        /// when it wakes, also those of copies taken from the parked ones). A copy is a parked one of its kind where there
+        /// is one (<see cref="ParkCopies"/>), moved into place: nothing made, nothing to collect later.
+        /// </summary>
         internal static void Spawn(Slice slice)
         {
             var o = slice.Owner;
@@ -816,18 +838,27 @@ namespace Freefall.World
             var root = new Entity($"Cell {slice.Cell.Key.X},{slice.Cell.Key.Z}");
             root.Transform.Parent = o.Container!.Transform;
             root.AddComponent<RigidBody>();
+            var copies = slice.Copies = s_copyLists.Count > 0 ? s_copyLists.Pop() : new List<Entity?>(slice.Records.Count);
             foreach (int i in slice.Records)
             {
                 var r = o.Records[i];
                 var kind = o.Kinds[r.Kind];
-                var e = kind.Prefab.Instantiate();
+                var e = kind.Stateful ? null : Unpark(kind);
+                bool parked = e != null;
+                if (!parked)
+                {
+                    using (s_instantiateMarker.Auto()) e = kind.Prefab.Instantiate();
+                    if (e != null) kind.Swap?.ApplyTo(e);
+                }
+                copies.Add(e);
                 if (e == null) continue;
                 e.Transform.Parent = root.Transform;
                 e.Transform.Position = r.Position;
                 e.Transform.Rotation = r.Rotation;
                 e.Transform.Scale = r.Scale;
-                kind.Swap?.ApplyTo(e);
-                if (SlotOf(o, i) is > 0 and var recordSlot) ShareInstanceSlot(e, recordSlot);
+                int recordSlot = SlotOf(o, i);
+                if (recordSlot > 0 || parked) ShareInstanceSlot(e, recordSlot);   // a parked copy may hold another record's
+                if (parked) SetParked(e.Transform, false);
                 if (kind.Stateful)
                 {
                     (slice.Stateful ??= new()).Add((e, i));
@@ -838,21 +869,123 @@ namespace Freefall.World
             s_spawned.Add(root);
         }
 
-        /// <summary>Its groups' instances back first (those the camera's ring wants), then its entities go. Returns the draws made.</summary>
+        /// <summary>Its groups' instances back first (those the camera's ring wants), then its entities go: parked for reuse
+        /// where they can be (<see cref="ParkCopies"/>), the rest with the container. Returns the draws made.</summary>
         internal static int Despawn(Slice slice)
         {
             if (slice.Spawned == null) return 0;
             int draws = 0;
-            foreach (var g in slice.Groups)
-            {
-                g.DropInstancesIn = -1;
-                if (g.InRing && g.Draws == null) draws += AddInstances(g);
-            }
+            using (s_despawnInstancesMarker.Auto())
+                foreach (var g in slice.Groups)
+                {
+                    g.DropInstancesIn = -1;
+                    if (g.InRing && g.Draws == null) draws += AddInstances(g);
+                }
             KeepState(slice);
             s_spawned.Remove(slice.Spawned);
-            if (!slice.Spawned.IsBeingDestroyed) slice.Spawned.Destroy();
+            ParkCopies(slice);
+            using (s_containerMarker.Auto())
+                if (!slice.Spawned.IsBeingDestroyed) slice.Spawned.Destroy();
             slice.Spawned = null;
             return draws;
+        }
+
+        // ── Parked copies ──
+        // A near cell's copies are kept when the cell goes, by kind (prefab and material swap), not drawn and without
+        // collision, under a hidden container per kind; the next cell that wants a copy of that kind takes the last one put
+        // there and moves it into place. Making and dropping a town block's copies was ~1.1 KB and ~11 µs a copy, all of it
+        // garbage once the cell went (4.4 MB in one frame flying over TestWorld's capital). The last child of a container
+        // per kind comes out at once (Transform.Parent removes from the end); out of one container of tens of thousands,
+        // List.Remove's scan from the front took 400 ms a frame. A copy with state of its own is not parked (its component
+        // would carry the last record's state). Up to EngineSettings.WorldCellsParkedMax copies; past it they go.
+
+        private static readonly Dictionary<(Prefab, MaterialSwap?), Entity> s_parked = new();   // a kind's container
+        private static readonly Stack<List<Entity?>> s_copyLists = new();
+        private static int s_parkedCount;
+        private static bool s_parkListening;
+        private static readonly ProfilerMarker s_instantiateMarker = ProfilerMarker.Get("Cells new copies");
+        private static readonly ProfilerMarker s_parkMarker = ProfilerMarker.Get("Cells park");
+        private static readonly ProfilerMarker s_despawnInstancesMarker = ProfilerMarker.Get("Cells instances back");
+        private static readonly ProfilerMarker s_containerMarker = ProfilerMarker.Get("Cells container gone");
+
+        /// <summary>Copies parked for reuse now.</summary>
+        public static int ParkedCount => s_parkedCount;
+
+        // A kind's hidden container of parked copies; a near cell's container to the readers of the scene (IsCellCopy), so
+        // the navmesh bake and PCG take them for nothing
+        private static Entity ParkedOf(Kind kind)
+        {
+            var key = (kind.Prefab, kind.Swap);
+            if (s_parked.TryGetValue(key, out var root) && !root.IsBeingDestroyed && root.Transform != null) return root;
+            if (!s_parkListening)
+            {
+                s_parkListening = true;
+                SceneManager.LoadStarted += _ => ForgetParked();   // the scene's clear takes the copies
+            }
+            root = new Entity($"Parked {kind.Prefab.Name}") { Flags = EntityFlags.HideAndDontSave };
+            s_parked[key] = root;
+            s_spawned.Add(root);
+            return root;
+        }
+
+        private static void ForgetParked()
+        {
+            foreach (var root in s_parked.Values) s_spawned.Remove(root);
+            s_parked.Clear();
+            s_parkedCount = 0;
+            s_drawGroups.Clear();
+            s_slotLists.Clear();
+        }
+
+        // A parked copy of the kind (the last one parked), or null
+        private static Entity? Unpark(Kind kind)
+        {
+            if (!s_parked.TryGetValue((kind.Prefab, kind.Swap), out var root) || root.IsBeingDestroyed || root.Transform == null) return null;
+            var t = root.Transform;
+            while (t.Count > 0)
+            {
+                var e = t.GetChild(t.Count - 1).Entity;
+                s_parkedCount--;
+                if (e != null && !e.IsBeingDestroyed) return e;   // the caller moves it out of the container
+                t.GetChild(t.Count - 1).Parent = null;            // something left without an entity: out of the way
+            }
+            return null;
+        }
+
+        // The slice's copies parked (those that may be, while there is room) before its container goes with the rest
+        private static void ParkCopies(Slice slice)
+        {
+            var copies = slice.Copies;
+            if (copies == null) return;
+            using var _ = s_parkMarker.Auto();
+            slice.Copies = null;
+            var o = slice.Owner;
+            bool canPark = slice.Spawned != null && !slice.Spawned.IsBeingDestroyed;   // a scene clear or an output destroyed: all go
+            int max = Engine.Settings.WorldCellsParkedMax;
+            for (int n = copies.Count - 1; n >= 0; n--)   // from the end: each comes out of its cell's container at once
+            {
+                var e = copies[n];
+                if (!canPark || e == null || e.IsBeingDestroyed || e.Transform == null) continue;
+                var kind = o.Kinds[o.Records[slice.Records[n]].Kind];
+                if (kind.Stateful || s_parkedCount >= max) continue;   // goes with the container
+                SetParked(e.Transform, true);
+                e.Transform.Parent = ParkedOf(kind).Transform;
+                s_parkedCount++;
+            }
+            copies.Clear();
+            s_copyLists.Push(copies);
+        }
+
+        // Every renderer of a copy drawn again or not (PersistentRenderer.Parked)
+        private static void SetParked(Transform t, bool parked)
+        {
+            if (t.Entity != null)
+            {
+                var components = t.Entity.Components;   // by index: an IReadOnlyList's foreach boxes its enumerator
+                for (int c = 0; c < components.Count; c++)
+                    if (components[c] is PersistentRenderer r) r.Parked = parked;
+            }
+            for (int i = 0; i < t.Count; i++) SetParked(t.GetChild(i), parked);
         }
 
         // The near cells' containers: what is under them is a copy of records, which readers of the scene take from the records
@@ -905,6 +1038,36 @@ namespace Freefall.World
                 {
                     if (rd.Enabled) visit(o.Component, rd.Mesh, world);
                 });
+        }
+
+        /// <summary>
+        /// For tools that check placements on the ground (scene_ground_check): every enabled renderer of the records standing
+        /// in the cells that reach into a ground box, with its owner and the world matrix its entity would have.
+        /// </summary>
+        public static void VisitRecordsIn(Vector2 min, Vector2 max, Action<Component, Mesh, Matrix4x4> visit)
+        {
+            if (s_cells.Count == 0) return;
+            var (x0, z0) = KeyOf(min.X, min.Y);
+            var (x1, z1) = KeyOf(max.X, max.Y);
+            x0 = Math.Max(x0 - 1, KeyMin.X); z0 = Math.Max(z0 - 1, KeyMin.Z);
+            x1 = Math.Min(x1 + 1, KeyMax.X); z1 = Math.Min(z1 + 1, KeyMax.Z);
+            for (int kz = z0; kz <= z1; kz++)
+                for (int kx = x0; kx <= x1; kx++)
+                {
+                    if (!s_cells.TryGetValue((kx, kz), out var cell)) continue;
+                    foreach (var slice in cell.Slices)
+                    {
+                        var o = slice.Owner;
+                        if (o.Open || o.Component == null) continue;
+                        foreach (int i in slice.Records)
+                        {
+                            var r = o.Records[i];
+                            var root = LocalOf(r) * o.ToWorld;
+                            foreach (var rd in PrefabShapes.RenderersOf(o.Kinds[r.Kind].Prefab))
+                                if (rd.Enabled) visit(o.Component, rd.Mesh, rd.WorldOf(root));
+                        }
+                    }
+                }
         }
 
         /// <summary>Every renderer of the records of the owners <paramref name="takes"/> agrees to, with its world matrix.</summary>
@@ -1062,6 +1225,7 @@ namespace Freefall.World
                     slicesSpawned = c.Spawned,
                     slicesDespawned = c.Despawned,
                     usPerEntity = Math.Round(1000 * c.SpawnMs / Math.Max(1, c.SpawnedEntities), 2),
+                    parkedCopies = s_parkedCount,
                     instanceGroupsMade = c.InstanceGroupsMade,
                     instanceGroupsDropped = c.InstanceGroupsDropped,
                     usPerInstanceDraw = Math.Round(1000 * c.InstanceMs / Math.Max(1, c.InstanceDrawsMade), 3),

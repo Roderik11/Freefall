@@ -924,8 +924,13 @@ namespace Freefall.Graphics
                     }
                     else
                     {
+                        // Each handle goes back for reuse once its record is out (InstanceBatch.Recycle): the group's
+                        // list was its only holder
                         foreach (var handle in op.Group.Handles)
+                        {
                             handle.Batch.RemovePersistent(handle);
+                            InstanceBatch.Recycle(handle);
+                        }
                         op.Group.Handles.Clear();
                     }
                 }

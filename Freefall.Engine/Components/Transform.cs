@@ -137,7 +137,14 @@ namespace Freefall.Components
             set
             {
                 if (_parent == value) return;
-                _parent?._children?.Remove(this);
+                // From the end: the child taken out is most often the last one put in (a parked world cells copy taken back
+                // from a container of thousands, WorldCells: List.Remove's scan from the front took 400 ms a frame)
+                var siblings = _parent?._children;
+                if (siblings != null)
+                {
+                    int at = siblings.LastIndexOf(this);
+                    if (at >= 0) siblings.RemoveAt(at);
+                }
                 _parent = value;
                 if (_parent != null) (_parent._children ??= new List<Transform>()).Add(this);
                 HierarchyVersion++;
