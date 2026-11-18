@@ -166,7 +166,8 @@ namespace Freefall.Components
                     radius = MathF.Round(light._cascadeRadius[c], 1),
                     texelCm = MathF.Round(light._cascadeRadius[c] * 200f / light._shadowResolution, 1),
                 };
-            return new { adaptive = Engine.Settings.UseAdaptiveSplits, cascades = result };
+            // rangeSpikes: analyses whose farthest depth was kept out of the range so far (WithoutSpikes)
+            return new { adaptive = Engine.Settings.UseAdaptiveSplits, rangeSpikes = light._rangeSpikes, cascades = result };
         }
 
         private static DirectionalLight? _instance;
@@ -848,19 +849,98 @@ namespace Freefall.Components
         /// capped at this: on a forest floor the last 10 % of the pixels reached from 125 m to 1.2 km and put every tree
         /// past 125 m in one cascade with 1.5 m texels, where their shadows vanished. False when there is no depth.
         /// </summary>
-        private static bool AdaptiveSplits(GPUCuller.DepthDistribution d, float near, int count, float[] result)
+        private bool AdaptiveSplits(GPUCuller.DepthDistribution d, float near, int count, float[] result)
         {
             if (d.Farthest <= 0f || d.Farthest - d.Nearest <= 0.0001f)
                 return false;
 
             float floor = near + 0.1f;
-            float logFrom = MathF.Max(d.Percentiles[0], floor);
-            float logRatio = MathF.Max(d.Farthest, logFrom) / logFrom;
+            float far = HoldFar(WithoutSpikes(MathF.Max(d.Farthest, floor)));
+            float logFrom = MathF.Min(HoldFrom(MathF.Max(d.Percentiles[0], floor)), far);
+            float logRatio = far / logFrom;
             for (int k = 1; k < count; k++)
                 result[k - 1] = logFrom * MathF.Pow(logRatio, (float)k / count);
-            result[count - 1] = MathF.Max(d.Farthest, floor);
+            result[count - 1] = far;
             MakeIncreasing(result, count);
             return true;
+        }
+
+        // ── The range held ──────────────────────────────────────────────────────────
+
+        // Steps of the held range, per octave: 2^(1/4), 19 % apart
+        private const float RangeStepsPerOctave = 4f;
+        // The range follows a smaller need only when it is this many steps smaller...
+        private const float RangeLooseSteps = 2f;
+        // ...and has been for this long (real seconds)
+        private const float RangeHoldSeconds = 2f;
+        private float _heldFar, _heldFrom, _farLooseSince, _fromLooseSince;
+        // The farthest depth of the last analyses (WithoutSpikes) and how many spikes it kept out, for the stats
+        private float _farBefore1, _farBefore2;
+        private int _rangeSpikes;
+
+        /// <summary>
+        /// The farthest depth to make the range from: the smallest of the last three analyses, so a depth that shows
+        /// for a frame or two does not count. The farthest depth is that of one pixel, and while the camera moves the
+        /// camera's occlusion culling (last frame's depth) draws what comes out from behind an edge a frame late: for
+        /// that frame a sliver of the background shows through. In the capital's market, flying forward, about one
+        /// analysis in five came back with 644-1628 m instead of 167 m, the four splits went from 12 / 28 / 69 / 167 m
+        /// to 17 / 61 / 223 / 815 m for a frame, and every near shadow was drawn that much coarser: small ones went
+        /// off and on (2026-11-18). A range that really grows follows two frames later.
+        /// </summary>
+        private float WithoutSpikes(float farthest)
+        {
+            float steady = MathF.Min(farthest, MathF.Min(_farBefore1, _farBefore2));
+            if (_farBefore2 <= 0f) steady = farthest;      // the first analyses
+            if (farthest > _heldFar && steady <= _heldFar) _rangeSpikes++;
+            _farBefore2 = _farBefore1;
+            _farBefore1 = farthest;
+            return steady;
+        }
+
+        /// <summary>
+        /// Where the last cascade ends for an analysis whose farthest depth is <paramref name="needed"/>: a step of a
+        /// 2^(k/4) ladder at or past it, grown at once, and brought in only after the need has stayed two steps under it
+        /// for RangeHoldSeconds. The analysis is last frame's and its range follows the casters and pixels in view, so
+        /// while the camera turned the end jumped from frame to frame (the capital's market, turning 1 degree: 1062 m,
+        /// 200 m, 1062 m): past the end nothing is shadowed, and every split and square moved with it, so far shadows
+        /// went off and on in motion (2026-11-18). The ladder's step is also the margin for the frame of lag.
+        /// </summary>
+        private float HoldFar(float needed)
+        {
+            float now = Time.RealTime;
+            if (now < _farLooseSince) _farLooseSince = now;
+            float loose = _heldFar * MathF.Pow(2f, -RangeLooseSteps / RangeStepsPerOctave);
+            if (needed > _heldFar || (needed <= loose && now - _farLooseSince > RangeHoldSeconds))
+            {
+                float step = MathF.Ceiling(MathF.Log2(needed) * RangeStepsPerOctave);
+                _heldFar = MathF.Pow(2f, step / RangeStepsPerOctave);
+                // Never past the analysis's ceiling, unless the need itself is
+                _heldFar = MathF.Min(_heldFar, MathF.Max(needed, Engine.Settings.MaxShadowDistance));
+                _farLooseSince = now;
+            }
+            else if (needed > loose)
+                _farLooseSince = now;
+            return _heldFar;
+        }
+
+        /// <summary>
+        /// The depth the logarithmic splits start from, held as the far end is (HoldFar) the other way round: brought
+        /// nearer at once, pushed out only after the need has stayed two steps past it for RangeHoldSeconds.
+        /// </summary>
+        private float HoldFrom(float needed)
+        {
+            float now = Time.RealTime;
+            if (now < _fromLooseSince) _fromLooseSince = now;
+            float loose = _heldFrom * MathF.Pow(2f, RangeLooseSteps / RangeStepsPerOctave);
+            if (needed < _heldFrom || _heldFrom <= 0f || (needed >= loose && now - _fromLooseSince > RangeHoldSeconds))
+            {
+                float step = MathF.Floor(MathF.Log2(needed) * RangeStepsPerOctave);
+                _heldFrom = MathF.Pow(2f, step / RangeStepsPerOctave);
+                _fromLooseSince = now;
+            }
+            else if (needed < loose)
+                _fromLooseSince = now;
+            return _heldFrom;
         }
 
         /// <summary>

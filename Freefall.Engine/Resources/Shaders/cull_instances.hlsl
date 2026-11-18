@@ -586,7 +586,7 @@ bool IsVisibleShadow(float3 center, float radius, uint cascadeIndex)
 bool IsOccludedShadow(float3 worldCenter, float worldRadius, uint cascadeIdx)
 {
     if (ShadowHiZSrvIdx == 0) return false;
-    
+
     // Read previous frame's VP from cascade buffer
     StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
     row_major float4x4 vp = cascades[cascadeIdx].PrevVP;
@@ -601,22 +601,28 @@ bool IsOccludedShadow(float3 worldCenter, float worldRadius, uint cascadeIdx)
     
     // Shadow depth in standard Z [0,1]
     float shadowDepth = ndc.z;
-    
-    // Sphere's farthest point from light (deeper into shadow map)
-    float4 offsetPoint = mul(float4(worldCenter, 1.0) + float4(0, 0, worldRadius, 0), vp);
-    float depthExtent = abs(offsetPoint.z / offsetPoint.w - shadowDepth);
-    float sphereFarDepth = shadowDepth + depthExtent;
-    
+
+    // The sphere's reach in depth and across the map (orthographic): its radius times the length of the VP's column
+    // for that axis, whichever way the light looks. Until 2026-11-18 the depth was measured along world Z and the
+    // footprint from _m00 / _m11 alone, both too small unless the light's axes lay along the world's: a caster was
+    // tested as a thinner, smaller thing than it is and counted as hidden behind its neighbours' or its own surfaces
+    // of last frame. It then sat out a frame, and with it the shadow on everything it really did hide: stalls and
+    // houses in the capital's market lost their shadows on and off while the camera moved.
+    float depthExtent = worldRadius * length(float3(vp._13, vp._23, vp._33));
+    float2 radiusUV = 0.5 * worldRadius * float2(length(float3(vp._11, vp._21, vp._31)),
+                                                 length(float3(vp._12, vp._22, vp._32)));
+
+    // Reaching off the map: not all of it can be tested, assume visible
+    if (any(uv - radiusUV < 0.0) || any(uv + radiusUV > 1.0)) return false;
+
     Texture2DArray<float> shadowHiZ = ResourceDescriptorHeap[ShadowHiZSrvIdx];
     
     float w, h, elements, levels;
     shadowHiZ.GetDimensions(0, w, h, elements, levels);
     float2 mip0Size = float2(w, h);
     
-    // Orthographic projection: screen-space radius from VP scale
-    float projRadiusX = worldRadius * abs(vp._m00);
-    float projRadiusY = worldRadius * abs(vp._m11);
-    float screenRadius = max(projRadiusX * mip0Size.x, projRadiusY * mip0Size.y) * 0.5;
+    // The footprint's radius in texels of the pyramid's level 0
+    float screenRadius = max(radiusUV.x * mip0Size.x, radiusUV.y * mip0Size.y);
     
     float mipLevel = ceil(log2(max(screenRadius * 2.0, 1.0)));
     mipLevel = min(mipLevel, levels - 1.0);
