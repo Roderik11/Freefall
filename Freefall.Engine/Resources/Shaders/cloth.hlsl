@@ -1,7 +1,8 @@
 // Cloth on the GPU (Graphics/ClothSystem.cs, Components/Cloth.cs): clothing on a skinned character, or a banner or a
 // flag on a static mesh.
 //
-// One thread group per cloth, every cloth of a frame in one dispatch: the group's row (SV_GroupID) names its buffers,
+// One thread group of 1024 per cloth (256 until 2026-11-19: a tabard's 2,630 particles took ten turns a thread and pass;
+// with a full cloth in view the pass went 0.89 -> 0.52 ms), every cloth of a frame in one dispatch: the group's row (SV_GroupID) names its buffers,
 // its ranges of the shared pools and its settings for this frame. A particle is a vertex of the mesh's LOD 0 (vertices
 // at the same place, a seam in the UVs, are one particle). Each frame:
 //   1. every particle's held place (skinned like gbuffer_skinned.fx, or as it is for a static mesh, then into the world);
@@ -15,10 +16,18 @@
 //      moved by as much as its particle was, with that particle's normal.
 // The skinned vertex shader draws these instead of skinning. A particle with MaxAway 0 is held. Positions are in the
 // world: gravity and wind are. Every buffer index comes from the group's row, the same for all its threads.
+//
+// A cloth nobody sees does nothing. The engine's own culling says which: each cloth's row names the camera's visibility
+// flags and the sun's cascade masks of the batch its renderer is drawn from, as last frame's culling left them, and its
+// instance there (ClothSystem, InstanceBatch.RecentVerdicts). Neither seen nor in any cascade (the cascade masks hold
+// only casters that shade something the camera sees: the receiver test): the group writes nothing but a mark, and a
+// skinned cloth starts over where its bones hold it when it is next run (a flag carries on from where it stood). In a
+// cascade but not seen, only its shadow shows: one substep and a quarter of its passes. In a town most of what the
+// view's frustum holds stands behind a house: TestWorld's market simulated 42 cloths with none in sight.
 
 #pragma kernel CSCloth
 
-#define THREADS 256
+#define THREADS 1024
 #define MOST_PARTS 16
 
 cbuffer PushConstants : register(b3)
@@ -46,7 +55,8 @@ struct ClothRow
     float Streams;                  // share of Drag the wind pulls with whichever way the cloth faces
     uint Substeps;
     uint Iterations;
-    uint Reset;                     // 1 = start where everything is held
+    uint Reset;                     // 1 = start where everything is held; 2 = its particles are another LOD's since
+                                    // last frame: start where their vertices were drawn (the output holds every LOD's)
     uint PartFirst;                 // its body parts in the parts buffer (two float4 a part)
     uint PartCount;
     uint ParticleCount;
@@ -64,6 +74,10 @@ struct ClothRow
     uint MeshNormalsIdx;
     uint MeshWeightsIdx;
     uint _pad;
+    uint SeenIdx;                   // StructuredBuffer<uint>: the camera's visibility flags of its batch last frame (0 = not seen); 0 = not known
+    uint CastsIdx;                  // StructuredBuffer<uint>: the sun's cascade masks of its batch last frame (low bits, a cascade each); 0 = not known
+    uint Instance;                  // its instance in both
+    uint _pad2;
 };
 
 struct ClothParticle
@@ -103,6 +117,9 @@ static const float3 Gravity = float3(0, -9.81, 0);
 
 // Vertices.w
 #define FOLLOWS 2u
+
+// The cascades' bits of a cascade mask (cull_instances.hlsl: the LOD steps start at CASCADE_LOD_SHIFT, 8)
+#define CASCADE_BITS 0xFFu
 
 // The group's body parts, read once
 groupshared float4 PartFrom[MOST_PARTS];
@@ -190,6 +207,40 @@ void CSCloth(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
     uint s0 = row.StateBase;
     uint o0 = row.OutputBase;
 
+    // What last frame's culling made of it (the same for every thread of the group). Not known: as if seen.
+    bool seen = true, casts = true;
+    if (row.SeenIdx != 0u)
+    {
+        StructuredBuffer<uint> flags = ResourceDescriptorHeap[row.SeenIdx];
+        seen = flags[row.Instance] != 0u;
+    }
+    if (row.CastsIdx != 0u)
+    {
+        StructuredBuffer<uint> masks = ResourceDescriptorHeap[row.CastsIdx];
+        casts = (masks[row.Instance] & CASCADE_BITS) != 0u;
+    }
+    // The mark of a frame sat out: the w of its first STATE_BACK, which step 2a writes 0 again
+    uint mark = s0 + STATE_BACK * count;
+    bool satOut = state[mark].w != 0.0;
+    if (!seen && !casts && row.Reset == 0u)
+    {
+        if (tid == 0u && !satOut)
+            state[mark] = float4(state[mark].xyz, 1.0);
+        return;
+    }
+    // Back after frames sat out: a skinned cloth where its bones hold it now (they went on without it)
+    bool reset = row.Reset == 1u || (satOut && row.BonesIdx != 0u);
+
+    // Only its shadow shows: one substep of the whole frame and a quarter of its passes
+    uint substeps = row.Substeps, iterations = row.Iterations;
+    float dt = row.Dt;
+    if (!seen)
+    {
+        dt *= substeps;
+        substeps = 1u;
+        iterations = max(2u, iterations / 4u);
+    }
+
     if (tid < partCount)
     {
         StructuredBuffer<float4> parts = ResourceDescriptorHeap[PartsIdx];
@@ -204,20 +255,27 @@ void CSCloth(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
         ClothParticle particle = particles[p];
         float3 next = HeldWorld(particle.Rest, particle.BoneIds, particle.Weights, row);
         state[s0 + STATE_NEXT * count + p] = float4(next, 0);
-        if (row.Reset != 0u)
+        if (reset)
         {
             state[s0 + STATE_A * count + p] = float4(next, 0);
             state[s0 + STATE_PREV * count + p] = float4(next, 0);
             state[s0 + STATE_TARGET * count + p] = float4(next, 0);
         }
+        else if (row.Reset == 2u)
+        {
+            // Where its vertex was drawn last frame (the renderer's object space), at rest; held from here on
+            float3 was = mul(float4(output[o0 + particle.Vertex * 2u].xyz, 1.0), row.World).xyz;
+            state[s0 + STATE_A * count + p] = float4(was, 0);
+            state[s0 + STATE_PREV * count + p] = float4(was, 0);
+            state[s0 + STATE_TARGET * count + p] = float4(next, 0);
+        }
     }
     AllMemoryBarrierWithGroupSync();        // the parts in groupshared too
 
-    float dt = row.Dt;
     float3x3 toWorld = (float3x3)row.World;
-    for (uint s = 0; s < row.Substeps; s++)
+    for (uint s = 0; s < substeps; s++)
     {
-        float share = (s + 1.0) / row.Substeps;
+        float share = (s + 1.0) / substeps;
 
         // 2a. A step on
         for (uint i2 = tid; i2 < count; i2 += THREADS)
@@ -272,7 +330,7 @@ void CSCloth(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
         DeviceMemoryBarrierWithGroupSync();
 
         // 2b. Passes over the links, from A into B and back (an even number: it ends in A)
-        uint passes = (row.Iterations + 1u) & ~1u;
+        uint passes = (iterations + 1u) & ~1u;
         for (uint it = 0; it < passes; it++)
         {
             uint from = s0 + ((it & 1u) == 0u ? STATE_A : STATE_B) * count;
@@ -379,7 +437,7 @@ void CSCloth(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
         normal = mul(normal, (float3x3)row.ToObject);
 
         float facing = output[o0 + v * 2 + 1].w;
-        if (row.Reset != 0u || facing == 0.0)
+        if (reset || row.Reset == 2u || facing == 0.0)
         {
             // At rest the triangles' normal and the mesh's own agree or not: how this vertex's triangles are wound
             facing = 1.0;
@@ -425,13 +483,23 @@ void CSCloth(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
             weights = bw.Weights;
         }
         float3 held = HeldWorld(meshPositions[row.VertexFirst + f], boneIds, weights, row);
-        float3 moved = state[s0 + STATE_A * count + vertex.x].xyz - state[s0 + STATE_TARGET * count + vertex.x].xyz;
+        // By as much as its three particles moved, each by its weight (ClothMesh.Blend): one surface across the
+        // cells of a coarser level, where following one particle made every cell a stiff patch
+        float wa = ((vertex.w >> 4) & 0x3FFFu) / 16383.0, wb = (vertex.w >> 18) / 16383.0;
+        float wc = max(1.0 - wa - wb, 0.0);
+        float3 moved = (state[s0 + STATE_A * count + vertex.x].xyz - state[s0 + STATE_TARGET * count + vertex.x].xyz) * wa
+                     + (state[s0 + STATE_A * count + vertex.y].xyz - state[s0 + STATE_TARGET * count + vertex.y].xyz) * wb
+                     + (state[s0 + STATE_A * count + vertex.z].xyz - state[s0 + STATE_TARGET * count + vertex.z].xyz) * wc;
         float3 x = held + moved;
 
         uint lead = particles[vertex.x].Vertex;
-        float3 normal = output[o0 + lead * 2 + 1].xyz;
+        // (its particles' normals as they are drawn; two that face apart leave the first's)
+        float3 na = output[o0 + lead * 2 + 1].xyz;
+        float3 blended = na * wa + output[o0 + particles[vertex.y].Vertex * 2 + 1].xyz * wb
+                       + output[o0 + particles[vertex.z].Vertex * 2 + 1].xyz * wc;
+        float3 normal = dot(blended, blended) > 0.01 ? normalize(blended) : na;
         float facing = output[o0 + f * 2 + 1].w;
-        if (row.Reset != 0u || facing == 0.0)
+        if (reset || row.Reset == 2u || facing == 0.0)
         {
             // Its own normal and its lead's, both at rest: the other side of a two-sided piece faces the other way
             facing = 1.0;

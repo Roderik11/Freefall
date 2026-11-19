@@ -134,6 +134,10 @@ namespace Freefall.Components
     {
         public Mesh Mesh;
         public int Slot;
+        /// <summary>How coarse its particles are (ClothSystem picks it by size on screen): 0 = every vertex of LOD 0 a
+        /// particle; 1 and 2 = one particle per cell of a grid 2 and 4 of the mesh's mean edges wide, about a quarter
+        /// and a sixteenth as many, the cell's other vertices following it as the other LODs' do.</summary>
+        public int Level;
         public int Version;                 // the mesh's GeometryVersion it was made from
         public int ParticleCount, VertexFirst, VertexCount;
         public GraphicsBuffer Particles, Links, Vertices, VertexTris;
@@ -147,14 +151,20 @@ namespace Freefall.Components
 
         private static readonly ConditionalWeakTable<Mesh, Dictionary<int, ClothMesh>> s_meshes = new();
 
-        public static ClothMesh Of(Mesh mesh, int slot)
+        /// <summary>How many levels a cloth can be simulated at (<see cref="Level"/>).</summary>
+        public const int Levels = 3;
+
+        /// <param name="level">How coarse its particles are, from 0 (the finest).</param>
+        public static ClothMesh Of(Mesh mesh, int slot, int level = 0)
         {
+            level = Math.Clamp(level, 0, Levels - 1);
+            int key = (slot + 1) * 8 + level;
             var bySlot = s_meshes.GetOrCreateValue(mesh);
             lock (bySlot)
             {
-                if (bySlot.TryGetValue(slot, out var cloth) && cloth.Version == mesh.GeometryVersion) return cloth;
+                if (bySlot.TryGetValue(key, out var cloth) && cloth.Version == mesh.GeometryVersion) return cloth;
                 cloth?.Release();
-                bySlot[slot] = cloth = Build(mesh, slot);
+                bySlot[key] = cloth = Build(mesh, slot, level);
                 return cloth;
             }
         }
@@ -215,12 +225,13 @@ namespace Freefall.Components
             public uint X, Y, Z, W;
         }
 
-        // Vertices.W: a vertex of another LOD, which follows its particle
+        // Vertices.W: a vertex that follows particles (another LOD's, or a coarser level's that is no particle): X, Y, Z
+        // the particles, bits 4-17 and 18-31 the first two's weights of 16383 (cloth.hlsl)
         private const uint Follows = 2u;
 
-        private static ClothMesh Build(Mesh mesh, int slot)
+        private static ClothMesh Build(Mesh mesh, int slot, int level)
         {
-            var cloth = new ClothMesh { Mesh = mesh, Slot = slot, Version = mesh.GeometryVersion };
+            var cloth = new ClothMesh { Mesh = mesh, Slot = slot, Level = level, Version = mesh.GeometryVersion };
             var positions = mesh.Positions;
             var indices = mesh.CpuIndices;
             var weights = mesh.BoneWeights;
@@ -265,10 +276,28 @@ namespace Freefall.Components
             }
             if (triangles.Count == 0) return cloth;
 
+            // A coarser level: one particle per cell of a grid, 2 or 4 of the mesh's mean edges wide (the first vertex
+            // met in the cell; the others follow it). Far off, where such a level is picked, a tabard's 2,630
+            // particles cost what they cost close up, and the pass costs what its largest cloth does.
+            float cell = 0f;
+            if (level > 0)
+            {
+                double edges3 = 0;
+                foreach (var (a, b, c) in triangles)
+                    edges3 += Vector3.Distance(positions[a], positions[b]) + Vector3.Distance(positions[b], positions[c])
+                            + Vector3.Distance(positions[c], positions[a]);
+                cell = (float)(edges3 / (triangles.Count * 3)) * (level == 1 ? 2f : 4f);
+                if (cell < 1e-4f) cell = 0f;
+            }
+
             // Vertices at one place (to half a millimetre) are one particle
             int vertexCount = last - first + 1;
             var particleOf = new int[vertexCount];
             Array.Fill(particleOf, -1);
+            // ... and a vertex in a coarser level's cell that is not its particle follows that particle
+            var follows = new int[vertexCount];
+            Array.Fill(follows, -1);
+            var byCell = new Dictionary<(int, int, int), int>();
             var byPlace = new Dictionary<(int, int, int), int>();
             var rest = new List<Vector3>();
             var bones = new List<BoneWeight>();
@@ -277,10 +306,21 @@ namespace Freefall.Components
             {
                 int local = vertex - first;
                 if (particleOf[local] >= 0) return particleOf[local];
+                if (follows[local] >= 0) return follows[local];
                 var p = positions[vertex];
                 var key = ((int)MathF.Round(p.X * 2000f), (int)MathF.Round(p.Y * 2000f), (int)MathF.Round(p.Z * 2000f));
                 if (!byPlace.TryGetValue(key, out int particle))
                 {
+                    if (cell > 0f)
+                    {
+                        var inCell = ((int)MathF.Floor(p.X / cell), (int)MathF.Floor(p.Y / cell), (int)MathF.Floor(p.Z / cell));
+                        if (byCell.TryGetValue(inCell, out int theirs))
+                        {
+                            follows[local] = theirs;
+                            return theirs;
+                        }
+                        byCell[inCell] = rest.Count;
+                    }
                     particle = rest.Count;
                     byPlace[key] = particle;
                     rest.Add(p);
@@ -296,9 +336,54 @@ namespace Freefall.Components
             {
                 int pa = Weld(a), pb = Weld(b), pc = Weld(c);
                 if (pa == pb || pb == pc || pa == pc) continue;
-                welded.Add((pa, pb, pc, a, b, c));
+                // (a corner that only follows its particle hands the triangle to the particle's own vertex: the normal
+                // is worked out there)
+                welded.Add((pa, pb, pc,
+                    particleOf[a - first] >= 0 ? a : first + vertexOf[pa],
+                    particleOf[b - first] >= 0 ? b : first + vertexOf[pb],
+                    particleOf[c - first] >= 0 ? c : first + vertexOf[pc]));
             }
             int count = rest.Count;
+
+            // A coarser level's particle that kept no triangle (every triangle round it fell into one or two cells) has
+            // no links, no normal, and its own vertex no place to be written: its vertices were drawn wherever the output
+            // happened to hold, spikes out of every flag (user, 2026-11-19). Its vertices follow a particle beside it that
+            // has one; the particle itself stays in the list, unused.
+            if (cell > 0f)
+            {
+                var kept = new bool[count];
+                foreach (var t in welded) kept[t.A] = kept[t.B] = kept[t.C] = true;
+                var into = new int[count];
+                Array.Fill(into, -1);
+                int Of(int vertex) => particleOf[vertex - first] >= 0 ? particleOf[vertex - first] : follows[vertex - first];
+                void Beside(int lost, int other)
+                {
+                    if (!kept[lost] && into[lost] < 0 && kept[other]) into[lost] = other;
+                }
+                foreach (var (a, b, c) in triangles)
+                {
+                    int pa = Of(a), pb = Of(b), pc = Of(c);
+                    Beside(pa, pb); Beside(pa, pc); Beside(pb, pa); Beside(pb, pc); Beside(pc, pa); Beside(pc, pb);
+                }
+                for (int i = 0; i < count; i++)
+                {
+                    if (kept[i] || into[i] >= 0) continue;
+                    float nearest = float.MaxValue;
+                    for (int k = 0; k < count; k++)
+                    {
+                        if (!kept[k]) continue;
+                        float d = Vector3.DistanceSquared(rest[i], rest[k]);
+                        if (d < nearest) { nearest = d; into[i] = k; }
+                    }
+                }
+                for (int local = 0; local < vertexCount; local++)
+                {
+                    int particle = particleOf[local] >= 0 ? particleOf[local] : follows[local];
+                    if (particle < 0 || kept[particle] || into[particle] < 0) continue;
+                    particleOf[local] = -1;
+                    follows[local] = into[particle];
+                }
+            }
 
             // The edges, and across each edge two triangles share, their far corners
             var edges = new Dictionary<(int, int), List<int>>();
@@ -341,8 +426,6 @@ namespace Freefall.Components
             }
 
             // The other LODs' vertices: the particle nearest each, by a grid of 5 cm cells over the particles
-            var follows = new int[vertexCount];
-            Array.Fill(follows, -1);
             if (others.Count > 0)
             {
                 const float Cell = 0.05f;
@@ -382,6 +465,31 @@ namespace Freefall.Components
                         }
                     follows[local] = best;
                 }
+            }
+
+            // A following vertex moves with its particle and the two of that particle's neighbours (along edges)
+            // nearest it at rest, each by the inverse square of its distance: a vertex between two particles takes
+            // about half of each from whichever side it is counted, so the cloth stays one surface across a coarser
+            // level's cells. Following its one particle alone, each cell moved as a stiff patch and the cells stepped
+            // against each other: a flag's edge a saw (user, 2026-11-19). The weights in 14 bits each over the flag.
+            UInt4 Blend(int particle, Vector3 at)
+            {
+                int b = particle, c = particle;
+                float db = float.MaxValue, dc = float.MaxValue;
+                foreach (var link in linksOf[particle])
+                {
+                    if (link.Bend != 0u) continue;
+                    float d = Vector3.DistanceSquared(at, rest[(int)link.Other]);
+                    if (d < db) { c = b; dc = db; b = (int)link.Other; db = d; }
+                    else if (d < dc) { c = (int)link.Other; dc = d; }
+                }
+                float da = Vector3.DistanceSquared(at, rest[particle]);
+                const float Least = 1e-8f;
+                float wa = 1f / (da + Least), wb = b != particle ? 1f / (db + Least) : 0f, wc = c != particle ? 1f / (dc + Least) : 0f;
+                float sum = wa + wb + wc;
+                uint qa = (uint)MathF.Round(wa / sum * 16383f), qb = (uint)MathF.Round(wb / sum * 16383f);
+                if (qa + qb > 16383u) qb = 16383u - qa;
+                return new UInt4 { X = (uint)particle, Y = (uint)b, Z = (uint)c, W = Follows | (qa << 4) | (qb << 18) };
             }
 
             // Up onto the GPU
@@ -425,7 +533,9 @@ namespace Freefall.Components
                             triData[nextTri++] = new UInt4 { X = (uint)tri.A, Y = (uint)tri.B, Z = (uint)tri.C };
                         }
                     }
-                    else if (follows[v] >= 0) vertexData[v] = new UInt4 { X = (uint)follows[v], W = Follows };
+                    else if (follows[v] >= 0) vertexData[v] = Blend(follows[v], positions[first + v]);
+                    // (a particle's twin at the same place whose own triangles all fell away: with its particle)
+                    else if (particleOf[v] >= 0) vertexData[v] = Blend(particleOf[v], positions[first + v]);
                     else vertexData[v] = new UInt4 { X = uint.MaxValue };
                 }
             }

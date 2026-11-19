@@ -21,7 +21,10 @@ namespace Freefall.Graphics
     ///
     /// Per frame: this system (UpdateGroup) picks the cloths to simulate: in view (its bounds, widened by how far it may
     /// leave them, against the main camera's frustum) and big enough on screen to be seen moving, with fewer substeps and
-    /// passes the smaller it shows, the biggest first within a budget. Out of view a cloth stands as it was last, and
+    /// passes the smaller it shows, the biggest first within a budget. What the engine's culling found neither on screen
+    /// nor in a shadow cascade last frame does nothing: its row names its batch's verdicts and its instance there, and its
+    /// own thread group reads them (cloth.hlsl; in a town most of what the frustum holds is behind a house). Seen only as
+    /// a shadow it takes the least of both. Out of view a cloth stands as it was last, and
     /// carries on from there when it comes back (a character's starts again where its bones hold it). Too small for a
     /// while, it gives its ranges back and is drawn as the mesh is. Then, once a tick before anything draws
     /// (DeferredRenderer), <see cref="SimulateAll"/> writes a row per picked cloth (its transform, bones, body parts,
@@ -34,6 +37,11 @@ namespace Freefall.Graphics
         // Radius of its bounds on screen, in pixels: below the first it is not simulated, from the second on it gets all
         // its settings' substeps and passes, from the third half of them, below that one substep and a quarter
         private const float SimulatedFrom = 1.5f, FullFrom = 48f, HalfFrom = 12f;
+
+        // ... and how coarse its particles are (ClothMesh.Level): every vertex from the first, about a quarter of them
+        // from the second, a sixteenth below. At 48 px seven cloths of the market's forty still took every particle
+        // (tabards and wall flags 30-50 m off), and they are what the pass costs.
+        private const float AllParticlesFrom = 96f, QuarterParticlesFrom = 24f;
 
         // Seconds unsimulated while too small to see before its ranges go back to the pools
         private const float ReleaseAfter = 5f;
@@ -51,7 +59,7 @@ namespace Freefall.Graphics
         private const int PoolStart = 1 << 16;      // float4s
         private const int RangeGrain = 64;          // float4s
 
-        /// <summary>One cloth's row of the frame's table. Must match struct ClothRow in cloth.hlsl (256 bytes).</summary>
+        /// <summary>One cloth's row of the frame's table. Must match struct ClothRow in cloth.hlsl (272 bytes).</summary>
         [StructLayout(LayoutKind.Sequential)]
         private struct ClothRow
         {
@@ -65,6 +73,7 @@ namespace Freefall.Graphics
             public uint StateBase;      public uint OutputBase;     public uint Particles;      public uint Links;
             public uint Vertices;       public uint VertexTris;     public uint Limits;         public uint Bones;
             public uint MeshPositions;  public uint MeshNormals;    public uint MeshWeights;    public uint Pad;
+            public uint Seen;           public uint Casts;          public uint Instance;       public uint Pad2;
         }
 
         /// <summary>Everything the system keeps per cloth.</summary>
@@ -78,6 +87,8 @@ namespace Freefall.Graphics
             public int State = -1, StateSize;       // its ranges of the pools (float4s); -1 = none
             public int Output = -1, OutputSize;
             public bool Fresh = true;               // its state holds nothing of its own yet: start where it is held
+            public int Level;                       // the LOD it is simulated at (ClothMesh.Level)
+            public bool FromOutput;                 // its particles are another LOD's now: they start where its vertices were drawn
 
             public long SimulatedTick = long.MinValue;
             public float SimulatedAt;               // Time.TotalTime
@@ -118,13 +129,24 @@ namespace Freefall.Graphics
         /// <summary>Cloths simulated in the last frame, and their particles.</summary>
         public int SimulatedCount { get; private set; }
         public int SimulatedParticles { get; private set; }
+        private readonly int[] _simulatedByLevel = new int[3];
+
+        /// <summary>For engine_stats: the cloths picked last frame, their particles, and how many at each LOD (finest
+        /// first). Those the GPU then found unseen (cloth.hlsl) are among them: it does not report back.</summary>
+        public static object? Describe() => s_current == null ? null : new
+        {
+            picked = s_current.SimulatedCount,
+            particles = s_current.SimulatedParticles,
+            byLevel = (int[])s_current._simulatedByLevel.Clone(),
+            all = s_current._entries.Count,
+        };
 
         // ────────────── Registration ──────────────
 
         protected internal override void Initialize()
         {
-            if (Unsafe.SizeOf<ClothRow>() != 256)
-                throw new InvalidOperationException("ClothRow must match struct ClothRow in cloth.hlsl (256 bytes)");
+            if (Unsafe.SizeOf<ClothRow>() != 272)
+                throw new InvalidOperationException("ClothRow must match struct ClothRow in cloth.hlsl (272 bytes)");
 
             s_current = this;
             ComponentCache<Cloth>.Added += OnAdded;
@@ -260,6 +282,14 @@ namespace Freefall.Graphics
                     substeps = Math.Max(1, substeps / 2);
                     iterations = Math.Max(2, iterations / 2);
                 }
+                // Fewer particles the smaller it shows (ClothMesh.Level, LevelFor)
+                int levelMode = Engine.Settings.ClothParticleLevel;
+                SetLevel(entry, levelMode >= 3 ? LevelFor(entry.Level, onScreen / distanceSq) : Math.Clamp(levelMode, 0, 2), settings);
+
+                // Half the passes a level: links twice as long carry a pull twice as far a pass, so a coarser cloth is
+                // as stiff with half of them, and a pass costs about the same however few its particles (its group sync)
+                iterations = Math.Max(2, iterations >> entry.Mesh!.Level);
+
                 entry.Substeps = substeps;
                 entry.Iterations = iterations;
                 entry.Size = onScreen / distanceSq;
@@ -279,6 +309,46 @@ namespace Freefall.Graphics
             }
         }
 
+        // How coarse a cloth's particles are by the square of its radius on screen (pixels): all of them from
+        // AllParticlesFrom, about a quarter from QuarterParticlesFrom, a sixteenth below. It goes finer only a quarter
+        // past a mark, so one standing at a mark does not change back and forth.
+        private static int LevelFor(int now, float radiusSq)
+        {
+            // (only with EngineSettings.ClothParticleLevel 3: by default every cloth takes all its particles, since up
+            // close the coarser levels still crumple a flag)
+            int level = radiusSq >= AllParticlesFrom * AllParticlesFrom ? 0 : radiusSq >= QuarterParticlesFrom * QuarterParticlesFrom ? 1 : 2;
+            if (level < now)
+            {
+                const float Past = 1.25f * 1.25f;
+                level = radiusSq >= AllParticlesFrom * AllParticlesFrom * Past ? 0 : radiusSq >= QuarterParticlesFrom * QuarterParticlesFrom * Past ? 1 : 2;
+                if (level > now) level = now;
+            }
+            return level;
+        }
+
+        // Its particles become another level's: another range of the state pool (the output's is per vertex of
+        // the mesh and stays), and they start where those vertices were drawn last frame, so nothing is seen of it
+        private void SetLevel(Entry entry, int level, ClothSettings settings)
+        {
+            var made = entry.Mesh!;
+            level = Math.Min(level, ClothMesh.Levels - 1);
+            if (level == made.Level) { entry.Level = level; return; }
+            var other = ClothMesh.Of(made.Mesh, made.Slot, level);
+            if (other.ParticleCount == 0 || other.ParticleCount > MostParticles
+                || other.VertexFirst != made.VertexFirst || other.VertexCount != made.VertexCount)
+                return;     // that LOD has nothing of the cloth's: it stays as it is
+
+            Free(_stateFree, entry.State, entry.StateSize);
+            entry.State = -1;
+            entry.StateSize = 0;
+            entry.FromOutput = entry.Output >= 0 && !entry.Fresh;
+            entry.Mesh = other;
+            entry.Level = level;
+            entry.Cloth.ClothMesh = other;
+            entry.LimitsKey = ClothMesh.LimitsKey.Of(settings);
+            entry.Limits = other.LimitsFor(entry.LimitsKey, settings);
+        }
+
         // Enabled, its renderer there (a static mesh's twin made now), on a character posed every frame, its mesh made
         // into cloth (again when the mesh was reimported), and its limits for its settings
         private bool Usable(Entry entry)
@@ -293,7 +363,7 @@ namespace Freefall.Graphics
             var made = entry.Mesh;
             if (made == null || made.Mesh != mesh || made.Slot != cloth.MaterialSlot || made.Version != mesh.GeometryVersion)
             {
-                var again = ClothMesh.Of(mesh, cloth.MaterialSlot);
+                var again = ClothMesh.Of(mesh, cloth.MaterialSlot, entry.Level);
                 if (again != made)
                 {
                     // Other particles and vertices: other ranges, and drawn as the mesh is until simulated
@@ -332,6 +402,7 @@ namespace Freefall.Graphics
             using var _ = _simulateMarker.Auto(_picked.Count);
             SimulatedCount = 0;
             SimulatedParticles = 0;
+            Array.Clear(_simulatedByLevel);
 
             // Ranges for the newly picked; the pools grow first if they must (keeping what they hold)
             int stateWanted = 0, outputWanted = 0;
@@ -339,25 +410,33 @@ namespace Freefall.Graphics
             {
                 var entry = _picked[i];
                 if (entry.Cloth.IsDestroyed || entry.Mesh == null || entry.Cloth.Renderer == null) { _picked.RemoveAt(i); continue; }
-                if (entry.State < 0)
-                {
-                    stateWanted += Round(entry.Mesh.ParticleCount * 6);
-                    outputWanted += Round(entry.Mesh.VertexCount * 2);
-                }
+                if (entry.State < 0) stateWanted += Round(entry.Mesh.ParticleCount * 6);
+                if (entry.Output < 0) outputWanted += Round(entry.Mesh.VertexCount * 2);
             }
             EnsurePools(cmd, stateWanted, outputWanted);
 
-            int count = _picked.Count;
+            // The game clock stood still (Time.Scale 0): the cloth stands too, and carries on from there. Its step was
+            // never under 1/240 s, so it went on blowing at full pace in a stopped world (user, 2026-11-19).
+            bool still = Time.Scale <= 0f;
+            if (still)
+                foreach (var entry in _picked)
+                    if (entry.SimulatedTick != long.MinValue) entry.SimulatedTick = Engine.TickCount;
+
+            int count = still ? 0 : _picked.Count;
             if (count > 0)
             {
                 foreach (var entry in _picked)
                 {
                     if (entry.State >= 0) continue;
                     entry.StateSize = Round(entry.Mesh!.ParticleCount * 6);
-                    entry.OutputSize = Round(entry.Mesh.VertexCount * 2);
                     entry.State = Take(_stateFree, entry.StateSize);
-                    entry.Output = Take(_outputFree, entry.OutputSize);
-                    entry.Fresh = true;
+                    if (entry.Output < 0)
+                    {
+                        entry.OutputSize = Round(entry.Mesh.VertexCount * 2);
+                        entry.Output = Take(_outputFree, entry.OutputSize);
+                        entry.Fresh = true;
+                    }
+                    if (entry.Fresh) entry.FromOutput = false;
                 }
 
                 int frame = Engine.FrameIndex % FrameCount;
@@ -367,7 +446,9 @@ namespace Freefall.Graphics
                 var partData = parts.WritePtr<Vector4>();
                 int partNext = 0;
 
-                float frameSeconds = Math.Clamp(Time.SmoothDelta, 1f / 240f, 1f / 30f);
+                // A frame's seconds on the real clock kept within 1/240 and 1/30, then at the game clock's pace: slow
+                // motion slows the cloth as it slows everything else
+                float frameSeconds = Math.Clamp(Time.SmoothDelta / Time.Scale, 1f / 240f, 1f / 30f) * Time.Scale;
                 var wind = Wind.Local;
                 for (int i = 0; i < count; i++)
                 {
@@ -378,12 +459,17 @@ namespace Freefall.Graphics
                     var settings = cloth.Settings ?? ClothSettings.Default;
                     var world = renderer.Transform.Matrix;
                     Matrix4x4.Invert(world, out var toObject);
+                    // What last frame's culling made of its renderer (not known: the shader takes it for seen)
+                    renderer.RecentVerdicts(out uint seenSrv, out uint castsSrv, out uint instance);
 
                     // Started over where it is held: the first time, or after a pause in which a character's bones or a
                     // static piece moved (a flag that stood still carries on from where it was)
                     bool paused = entry.SimulatedTick < Engine.TickCount - 2;
                     bool reset = entry.Fresh || (paused && (cloth.Animator != null || world != entry.LastWorld));
+                    // ... or, its particles another LOD's since last frame, where its vertices were drawn
+                    uint start = reset ? 1u : entry.FromOutput ? 2u : 0u;
                     entry.Fresh = false;
+                    entry.FromOutput = false;
                     entry.SimulatedTick = Engine.TickCount;
                     entry.SimulatedAt = Time.TotalTime;
                     entry.LastWorld = world;
@@ -420,7 +506,7 @@ namespace Freefall.Graphics
                         Streams = settings.Streams,
                         Substeps = (uint)entry.Substeps,
                         Iterations = (uint)entry.Iterations,
-                        Reset = reset ? 1u : 0u,
+                        Reset = start,
                         PartFirst = partFirst,
                         PartCount = partCount,
                         ParticleCount = (uint)mesh.ParticleCount,
@@ -437,9 +523,13 @@ namespace Freefall.Graphics
                         MeshPositions = mesh.Mesh.PosBufferIndex,
                         MeshNormals = mesh.Mesh.NormBufferIndex,
                         MeshWeights = mesh.Mesh.BoneWeightBufferIndex,
+                        Seen = seenSrv,
+                        Casts = castsSrv,
+                        Instance = instance,
                     };
                     cloth.SimulatedTick = Engine.TickCount;
                     SimulatedParticles += mesh.ParticleCount;
+                    _simulatedByLevel[Math.Min(mesh.Level, 2)]++;
                 }
                 SimulatedCount = count;
 

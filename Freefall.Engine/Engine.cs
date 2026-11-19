@@ -1044,6 +1044,12 @@ namespace Freefall
          // March every texel of the clouds every frame (captures, A/B) instead of one of each 2×2 block and the history
          public bool VolumetricCloudsFullRate { get; set; } = false;
 
+         // How coarse the cloths' particles are (ClothSystem, ClothMesh.Level): 0 = every cloth all its particles;
+         // 1 and 2 = every cloth forced to about a quarter and a sixteenth of them, to judge that level up close;
+         // 3 = by its size on screen. 0 until levels 1 and 2 hold up close (they mangled the flags, 2026-11-19).
+         [Category("Cloth")]
+         public int ClothParticleLevel { get; set; } = 0;
+
          // Camera exposure as EV100: light in physical units (lux, cd/m²) times 1 / (1.2 · 2^EV) is what the
          // tonemapper sees; higher = darker image. Auto: metered from the scene each frame (Graphics.AutoExposure).
          // Off: ExposureEV, which the captures lock (13.36 = Atmosphere.ReferenceEV shows light sources in the

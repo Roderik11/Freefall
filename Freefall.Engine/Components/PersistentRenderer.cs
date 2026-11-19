@@ -89,6 +89,29 @@ namespace Freefall.Components
         /// <summary>The persistent draws currently registered (null = none).</summary>
         protected DrawGroup? Draws => _registered ? _drawGroup : null;
 
+        /// <summary>
+        /// Where the GPU keeps what last frame's culling made of this renderer, for a compute pass that works for it
+        /// (ClothSystem): the camera's visibility flags and the sun's cascade masks of the batch its first opaque draw
+        /// sits in (InstanceBatch.RecentVerdicts), and its instance there. All 0 when not known: not registered yet, its
+        /// batch not culled last tick, or its record newer than that culling.
+        /// </summary>
+        internal void RecentVerdicts(out uint seenSrv, out uint castsSrv, out uint instance)
+        {
+            seenSrv = castsSrv = instance = 0;
+            var handles = Draws?.Handles;
+            if (handles == null) return;
+            for (int i = 0; i < handles.Count; i++)
+            {
+                var handle = handles[i];
+                if (handle.Index < 0 || handle.Batch == null) continue;
+                if (!handle.Batch.RecentVerdicts(out uint seen, out uint casts, out int count) || handle.Index >= count) continue;
+                seenSrv = seen;
+                castsSrv = casts;
+                instance = (uint)handle.Index;
+                return;
+            }
+        }
+
         // Kept from one registration to the next (a refresh, a park and back): its removal and the next adds are queued in
         // that order and applied in it (CommandBuffer.FlushPersistent), so reusing it allocates nothing
         private DrawGroup? _drawGroup;

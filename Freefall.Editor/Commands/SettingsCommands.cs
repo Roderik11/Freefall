@@ -135,6 +135,8 @@ namespace Freefall.Editor.Commands
                 cloudDeck = Freefall.Graphics.Atmosphere.DescribeCloudDeck(),
                 // The bodies lighting the near fog volume and the aerial perspective this frame: one that adds nothing is left out
                 airLitBy = Freefall.Graphics.Atmosphere.AirLitBy,
+                // The cloths picked for simulation last frame, their particles, and how many at each LOD of their mesh
+                cloth = Freefall.Graphics.ClothSystem.Describe(),
                 // The volumetric clouds: on, the slab's heights, this frame's bake, the wind's offset and heading, towers
                 clouds = Freefall.Graphics.Clouds.Describe(),
                 weather = Freefall.Graphics.Weather.Describe(),

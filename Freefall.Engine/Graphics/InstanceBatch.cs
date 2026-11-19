@@ -1327,6 +1327,28 @@ namespace Freefall.Graphics
 
         // The tick, frame slot and instance count of this batch's last camera culling (PrepareCull)
         private int _lastCullTick = -1, _lastCullSlot, _lastCullCount;
+        // ... and of its last culling for the sun's cascades
+        private int _lastCascadeCullTick = -1, _lastCascadeCullSlot;
+
+        /// <summary>
+        /// What the last tick's culling made of each instance, for a pass that runs before this tick's (ClothSystem: a cloth
+        /// nobody saw does nothing): the camera's visibility flags (SRV, 0 = not seen) and the sun's cascade masks (SRV,
+        /// the low 8 bits a cascade each, after the receiver test; 0 when the cascades were not culled then: not known),
+        /// and how many instances the flags cover. False when the camera did not cull the batch in the last tick.
+        /// </summary>
+        internal bool RecentVerdicts(out uint flagsSrv, out uint cascadeMaskSrv, out int count)
+        {
+            flagsSrv = cascadeMaskSrv = 0;
+            count = 0;
+            if (_lastCullTick < Engine.TickCount - 1 || _lastCullCount == 0 || visibilityFlagsBuffers[_lastCullSlot] == null)
+                return false;
+            flagsSrv = visibilityFlagsSRVIndices[_lastCullSlot];
+            count = _lastCullCount;
+            if (_lastCascadeCullTick >= Engine.TickCount - 1 && _lastCascadeCullTick >= _lastCullTick
+                && shadowCascadeMaskBuffers[_lastCascadeCullSlot] != null)
+                cascadeMaskSrv = shadowCascadeMaskSRVIndices[_lastCascadeCullSlot];
+            return true;
+        }
 
         /// <summary>
         /// What this batch's camera culling left in the last tick or this one, for the sun shadow receivers
@@ -1577,6 +1599,8 @@ namespace Freefall.Graphics
             c[26] = shadowHistogramUAVIndices[f];
             c[27] = (uint)MeshRegistry.Count;
             c[28] = shadowCascadeMaskUAVIndices[f];           // CascadeMaskUAVIdx
+            _lastCascadeCullTick = Engine.TickCount;
+            _lastCascadeCullSlot = f;
             c[29] = shadowExpansionUAVIndices[f];             // ExpansionUAVIdx
             c[30] = BitConverter.SingleToUInt32Bits(minCasterClip);
             c[31] = cascadeBufferSrv;                         // CascadeBufferSRVIdx
