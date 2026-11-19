@@ -65,6 +65,18 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </None>
+    <!-- AMD FidelityFX SDK v2.4.0 (FSR upscaler, Graphics/Upscaling/Fsr.cs): AMD's signed DLLs, fetched by
+         ThirdParty/FidelityFX/fetch.ps1 and not committed. Without them the engine builds and runs, FSR unavailable. -->
+    <None Include="..\ThirdParty\FidelityFX\win-x64\amd_fidelityfx_loader_dx12.dll" Condition="Exists('..\ThirdParty\FidelityFX\win-x64\amd_fidelityfx_loader_dx12.dll')">
+      <Link>amd_fidelityfx_loader_dx12.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+    <None Include="..\ThirdParty\FidelityFX\win-x64\amd_fidelityfx_upscaler_dx12.dll" Condition="Exists('..\ThirdParty\FidelityFX\win-x64\amd_fidelityfx_upscaler_dx12.dll')">
+      <Link>amd_fidelityfx_upscaler_dx12.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
   </ItemGroup>
 
 </Project>

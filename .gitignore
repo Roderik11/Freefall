@@ -58,3 +58,7 @@ Tools/TerrainMigration/migrate-to-stamps.mjs
 /Tools/PbrMaps
 /Tools/ItemIcons
 /Tools/Megascans
+
+# AMD FidelityFX SDK (FSR): fetched by ThirdParty/FidelityFX/fetch.ps1, not committed (57.7 MB of signed DLLs)
+ThirdParty/FidelityFX/*
+!ThirdParty/FidelityFX/fetch.ps1

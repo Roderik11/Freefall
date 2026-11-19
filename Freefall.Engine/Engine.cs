@@ -698,6 +698,23 @@ namespace Freefall
         Motion = 10                 // motion_cs CSMotionView: where each pixel came from (hue = direction, brightness = up to 16 px)
     }
 
+    /// <summary>EngineSettings.Upscaler: the temporal upscaler (UPSCALING_PLAN.md)</summary>
+    public enum UpscalerKind
+    {
+        Off = 0,        // RenderScale and the plain spatial upscale
+        FSR = 1,        // AMD FSR through the FidelityFX API (Graphics/Upscaling/Fsr.cs)
+    }
+
+    /// <summary>EngineSettings.UpscaleMode: the temporal upscaler's render size, as FSR and DLSS name them</summary>
+    public enum UpscaleQuality
+    {
+        NativeAA = 0,           // 1:1, anti-aliasing only
+        Quality = 1,            // 1 / 1.5 each way
+        Balanced = 2,           // 1 / 1.7
+        Performance = 3,        // 1 / 2
+        UltraPerformance = 4,   // 1 / 3
+    }
+
     /// <summary>EngineSettings.ShadowReceiverCulling</summary>
     public enum ShadowReceiverCulling
     {
@@ -760,12 +777,51 @@ namespace Freefall
          private float _renderScale = 1f;
 
          /// <summary>
-         /// The camera moved by a sub-pixel amount each frame (DeferredRenderer.JitterPixels), as a temporal upscaler
-         /// needs. Until one exists (UPSCALING_PLAN.md stage 3) it is only for checking that the motion vectors leave it
-         /// out (DebugVizMode.Motion stays grey with a still camera): on its own the picture shakes.
+         /// The camera moved by a sub-pixel amount each frame (DeferredRenderer.JitterPixels) without a temporal upscaler,
+         /// for checking that the motion vectors leave it out (DebugVizMode.Motion stays grey with a still camera): on its
+         /// own the picture shakes. The temporal upscaler (<see cref="Upscaler"/>) jitters whatever this says.
          /// </summary>
-         [System.ComponentModel.Description("Moves the camera by under a pixel each frame, as a temporal upscaler needs; on its own (no upscaler yet) the picture shakes. For testing.")]
+         [System.ComponentModel.Description("Moves the camera by under a pixel each frame without an upscaler, for testing the motion vectors (the picture shakes). The temporal upscaler (Upscaler) jitters by itself.")]
          public bool CameraJitter { get; set; } = false;
+
+         /// <summary>
+         /// The temporal upscaler (UPSCALING_PLAN.md): Off = RenderScale and the plain upscale, SMAA as set; FSR = AMD's
+         /// FSR (FSR 4 on Radeon RX 9000, FSR 3.1.5 on any other GPU) drawing at <see cref="UpscaleMode"/>'s size with
+         /// the camera jittered, its own anti-aliasing in SMAA's place. Without the FidelityFX DLLs FSR falls back to Off.
+         /// </summary>
+         [System.ComponentModel.Description("Temporal upscaler: Off uses Render Scale and a plain upscale; FSR (AMD, any GPU) draws at the Upscale Mode's size and rebuilds the picture over frames, anti-aliasing included.")]
+         public UpscalerKind Upscaler
+         {
+             get => _upscaler;
+             set
+             {
+                 if (value == _upscaler) return;
+                 _upscaler = value;
+                 Graphics.RenderView.ResizePipelines();
+             }
+         }
+         private UpscalerKind _upscaler = UpscalerKind.Off;
+
+         /// <summary>
+         /// The temporal upscaler's render size: Native AA draws at the view's size (anti-aliasing only), Quality at
+         /// 1/1.5 of it each way, Balanced 1/1.7, Performance 1/2, Ultra Performance 1/3.
+         /// </summary>
+         [System.ComponentModel.Description("Size the temporal upscaler draws at: Native AA = the view's size (anti-aliasing only), Quality 67 %, Balanced 59 %, Performance 50 %, Ultra Performance 33 % each way.")]
+         public UpscaleQuality UpscaleMode
+         {
+             get => _upscaleMode;
+             set
+             {
+                 if (value == _upscaleMode) return;
+                 _upscaleMode = value;
+                 Graphics.RenderView.ResizePipelines();
+             }
+         }
+         private UpscaleQuality _upscaleMode = UpscaleQuality.Quality;
+
+         [ValueRange(0f, 1f)]
+         [System.ComponentModel.Description("Sharpening the temporal upscaler adds to its picture: 0 = none, 1 = the most.")]
+         public float UpscaleSharpness { get; set; } = 0f;
 
          public bool ShowGrid { get; set; } = true;                      // Show editor grid in scene view
          public bool ShowSystemGizmos { get; set; } = true;              // Markers systems draw in the scene view whatever is selected (Systems.Gizmos)
