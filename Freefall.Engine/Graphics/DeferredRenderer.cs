@@ -572,17 +572,9 @@ namespace Freefall.Graphics
             RenderHeight = scale >= 1f ? DisplayHeight : Math.Clamp((int)MathF.Round(DisplayHeight * scale), 1, DisplayHeight);
         }
 
-        /// <summary>
-        /// The temporal upscaler that runs for EngineSettings.Upscaler: DLSS (and Auto) where NGX says it is available,
-        /// else FSR where its DLLs are there, else Off.
-        /// </summary>
+        /// <summary>The temporal upscaler that runs for EngineSettings.Upscaler (<see cref="Upscaling.Upscalers.Resolve"/>).</summary>
         private static UpscalerKind ChooseUpscaler(EngineSettings? settings)
-        {
-            var wanted = settings?.Upscaler ?? UpscalerKind.Off;
-            if (wanted == UpscalerKind.Off) return UpscalerKind.Off;
-            if ((wanted == UpscalerKind.DLSS || wanted == UpscalerKind.Auto) && Upscaling.Dlss.Available) return UpscalerKind.DLSS;
-            return Upscaling.Fsr.Available ? UpscalerKind.FSR : UpscalerKind.Off;
-        }
+            => Upscaling.Upscalers.Resolve(settings?.Upscaler ?? UpscalerKind.Off);
 
         // The temporal upscaler chosen and available (SetSizes: Off, FSR or DLSS); _upscaler is it while one could be made
         private bool _temporalWanted;

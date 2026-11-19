@@ -79,6 +79,14 @@ namespace Freefall.Graphics.Upscaling
             {
                 if (_state >= 0) return _state == 1;
                 _state = 0;
+                // NGX is NVIDIA's alone: on another GPU (or Proton's translation of one) it is never started, so the
+                // game's options can ask what runs without loading NVIDIA's code there
+                uint vendor = Engine.Device.VendorId;
+                if (vendor != 0x10DE)
+                {
+                    Debug.LogAlways($"[DLSS] not an NVIDIA GPU (vendor 0x{vendor:X4}): no DLSS here");
+                    return false;
+                }
                 if (!NativeLibrary.TryLoad(Library + ".dll", typeof(Dlss).Assembly,
                         DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.ApplicationDirectory, out IntPtr loaded))
                 {

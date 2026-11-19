@@ -896,17 +896,35 @@ namespace Freefall.Graphics
         {
             try
             {
-                long luid = _device.AdapterLuid;
-                // LUID is { uint LowPart; int HighPart }: the same 8 bytes as the long D3D12 hands back
-                _memoryAdapter ??= _factory.EnumAdapterByLuid<IDXGIAdapter3>(
-                    System.Runtime.CompilerServices.Unsafe.As<long, Vortice.Luid>(ref luid));
-                var info = _memoryAdapter.QueryVideoMemoryInfo(0, MemorySegmentGroup.Local);
+                var info = Adapter().QueryVideoMemoryInfo(0, MemorySegmentGroup.Local);
                 return ((long)info.CurrentUsage, (long)info.Budget);
             }
             catch
             {
                 return null;
             }
+        }
+
+        /// <summary>
+        /// The PCI vendor id of the device's adapter: 0x10DE NVIDIA, 0x1002 AMD, 0x8086 Intel; 0 when it cannot be asked.
+        /// DLSS is asked for only on NVIDIA's (Upscaling.Dlss.Available).
+        /// </summary>
+        public uint VendorId
+        {
+            get
+            {
+                try { return (uint)Adapter().Description1.VendorId; }
+                catch { return 0; }
+            }
+        }
+
+        // The DXGI adapter the device was made on (by its LUID)
+        private IDXGIAdapter3 Adapter()
+        {
+            long luid = _device.AdapterLuid;
+            // LUID is { uint LowPart; int HighPart }: the same 8 bytes as the long D3D12 hands back
+            return _memoryAdapter ??= _factory.EnumAdapterByLuid<IDXGIAdapter3>(
+                System.Runtime.CompilerServices.Unsafe.As<long, Vortice.Luid>(ref luid));
         }
 
         /// <summary>The descriptor heaps the device keeps (the bindless one, RTV, DSV), in bytes.</summary>

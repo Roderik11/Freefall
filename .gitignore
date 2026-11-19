@@ -67,3 +67,6 @@ ThirdParty/FidelityFX/*
 ThirdParty/DLSS/sdk/
 ThirdParty/DLSS/win-x64/
 !ThirdParty/DLSS/fetch.ps1
+
+# The licences a published game's ThirdPartyNotices.txt quotes (Publishing/ThirdPartyNotices.cs)
+!ThirdParty/Licenses/*.txt

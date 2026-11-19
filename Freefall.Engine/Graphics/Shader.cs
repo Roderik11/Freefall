@@ -105,15 +105,16 @@ namespace Freefall.Graphics
             else if (profile.Contains("_6_4")) dxcProfile = profile.Replace("_6_4", "_6_6");
             else if (profile.Contains("_6_5")) dxcProfile = profile.Replace("_6_5", "_6_6");
 
-            return new[]
-            {
-                "-E", entryPoint,
-                "-T", dxcProfile,
-                "-O3",
-                "-Zi",
-                "-Qembed_debug"
-            };
+            return EmbedDebugInfo
+                ? new[] { "-E", entryPoint, "-T", dxcProfile, "-O3", "-Zi", "-Qembed_debug" }
+                : new[] { "-E", entryPoint, "-T", dxcProfile, "-O3" };
         }
+
+        // Shaders carry their debug info (for PIX) except under the D3D12 debug layer (FREEFALL_D3DDEBUG=1 or 2, as
+        // GraphicsDevice reads it): the layer's own copy of a shader with embedded debug info failed LLVM's verifier and
+        // ended the process (grass_blades in Eldermoor, 2026-10-28; rendering_engine/stability/amd_close_failure.md).
+        // The arguments are part of the cache key, so validation runs compile and keep their own copies.
+        private static readonly bool EmbedDebugInfo = Environment.GetEnvironmentVariable("FREEFALL_D3DDEBUG") is not ("1" or "2");
 
         private static byte[] CompileWithDxc(string source, string[] args, string entryPoint, string profile)
         {

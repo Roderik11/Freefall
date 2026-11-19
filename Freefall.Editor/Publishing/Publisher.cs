@@ -32,6 +32,10 @@ namespace Freefall.Editor.Publishing
         public long PlayerBytes;
         /// <summary>The version of the Visual C++ runtime copied beside the exe (<see cref="VCRuntime"/>).</summary>
         public string Runtime = "";
+        /// <summary>The temporal upscalers the game carries (<see cref="UpscalerFiles"/>): "FSR (…), DLSS (…)" or "none".</summary>
+        public string Upscalers = "";
+        /// <summary>The third-party components named in ThirdPartyNotices.txt beside the exe (<see cref="ThirdPartyNotices"/>).</summary>
+        public List<string> Notices = new();
         /// <summary>The engine's own files in Data/engine.ffpack.</summary>
         public int EngineFiles;
         public long EngineBytes;
@@ -290,6 +294,9 @@ namespace Freefall.Editor.Publishing
                     result.PlayerBytes += VCRuntime.Copy(runtime.Folder, output);
                     result.PlayerFiles += VCRuntime.Files.Length;
                     result.Runtime = runtime.Version;
+                    result.Upscalers = UpscalerFiles.Check(output, result.Warnings);
+                    result.Notices = ThirdPartyNotices.Write(Path.GetDirectoryName(Path.GetDirectoryName(playerProject)!)!, output,
+                                                             result.Product, result.Warnings);
                 }));
 
                 await Step(Packs, () => Task.Run(() =>
@@ -417,6 +424,8 @@ namespace Freefall.Editor.Publishing
             sb.AppendLine($"  Exe: {Path.GetFileName(r.Exe)}");
             sb.AppendLine($"  Player: {r.PlayerFiles:N0} files, {BuildScan.Size(r.PlayerBytes)}");
             sb.AppendLine($"  Visual C++ runtime: {r.Runtime}, beside the exe ({string.Join(", ", VCRuntime.Files)})");
+            sb.AppendLine($"  Upscalers: {r.Upscalers}");
+            sb.AppendLine($"  Third-party notices: {(r.Notices.Count > 0 ? string.Join(", ", r.Notices) + $" in {ThirdPartyNotices.FileName}" : "none")}");
             sb.AppendLine($"  Scripts: {r.Scripts} files in {PackBuilder.ScriptsFile}");
             sb.AppendLine($"  Engine files: {r.EngineFiles} in {Freefall.Assets.EngineFiles.PackFile}, {BuildScan.Size(r.EngineBytes)}");
             sb.AppendLine($"  Packs: {r.Packs.Entries:N0} artifacts, {BuildScan.Size(r.Packs.Bytes)}" +

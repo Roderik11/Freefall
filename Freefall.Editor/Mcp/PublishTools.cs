@@ -181,6 +181,8 @@ namespace Freefall.Editor.Mcp
                     ["step"] = s.Step, ["seconds"] = Math.Round(s.Seconds, 1),
                 }).ToArray()),
                 ["player"] = new JsonObject { ["files"] = r.PlayerFiles, ["size"] = BuildScan.Size(r.PlayerBytes) },
+                ["upscalers"] = r.Upscalers,
+                ["notices"] = new JsonArray(r.Notices.Select(n => (JsonNode)n).ToArray()),
                 ["engineFiles"] = new JsonObject { ["files"] = r.EngineFiles, ["size"] = BuildScan.Size(r.EngineBytes) },
                 ["scripts"] = r.Scripts,
                 ["artifacts"] = r.Packs.Entries,

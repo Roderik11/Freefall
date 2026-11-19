@@ -822,8 +822,9 @@ namespace Freefall
          }
          private UpscaleQuality _upscaleMode = UpscaleQuality.Quality;
 
+         /// <summary>FSR's own sharpening of its picture, 0 none to 1 the most. DLSS has none (NVIDIA took it out in 2.5.1).</summary>
          [ValueRange(0f, 1f)]
-         [System.ComponentModel.Description("Sharpening the temporal upscaler adds to its picture: 0 = none, 1 = the most.")]
+         [System.ComponentModel.Description("Sharpening FSR adds to its picture: 0 = none, 1 = the most. DLSS has no sharpening.")]
          public float UpscaleSharpness { get; set; } = 0f;
 
          public bool ShowGrid { get; set; } = true;                      // Show editor grid in scene view
