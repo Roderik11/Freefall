@@ -62,3 +62,8 @@ Tools/TerrainMigration/migrate-to-stamps.mjs
 # AMD FidelityFX SDK (FSR): fetched by ThirdParty/FidelityFX/fetch.ps1, not committed (57.7 MB of signed DLLs)
 ThirdParty/FidelityFX/*
 !ThirdParty/FidelityFX/fetch.ps1
+
+# NVIDIA DLSS SDK: fetched by ThirdParty/DLSS/fetch.ps1, not committed; the shim (src, build.cmd) is, its built DLL is not
+ThirdParty/DLSS/sdk/
+ThirdParty/DLSS/win-x64/
+!ThirdParty/DLSS/fetch.ps1

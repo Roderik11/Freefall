@@ -77,6 +77,18 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </None>
+    <!-- NVIDIA DLSS (Graphics/Upscaling/Dlss.cs): the shim built by ThirdParty/DLSS/build.cmd and the DLSS model NGX loads
+         from beside it, fetched by ThirdParty/DLSS/fetch.ps1; neither committed. Without them DLSS reads unavailable. -->
+    <None Include="..\ThirdParty\DLSS\win-x64\freefall_dlss.dll" Condition="Exists('..\ThirdParty\DLSS\win-x64\freefall_dlss.dll')">
+      <Link>freefall_dlss.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+    <None Include="..\ThirdParty\DLSS\win-x64\nvngx_dlss.dll" Condition="Exists('..\ThirdParty\DLSS\win-x64\nvngx_dlss.dll')">
+      <Link>nvngx_dlss.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
   </ItemGroup>
 
 </Project>

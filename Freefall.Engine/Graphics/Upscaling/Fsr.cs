@@ -17,7 +17,7 @@ namespace Freefall.Graphics.Upscaling
     /// GPU is idle, and destroyed there too. The dispatch records its own barriers, descriptor heaps and root signature
     /// on the command list: the caller sets the engine's again after it.
     /// </summary>
-    internal sealed unsafe class Fsr : IDisposable
+    internal sealed unsafe class Fsr : ITemporalUpscaler
     {
         private const string Loader = "amd_fidelityfx_loader_dx12";
 
@@ -227,7 +227,7 @@ namespace Freefall.Graphics.Upscaling
 
             var version = new QueryProviderVersionDesc { Header = new ApiHeader { Type = QueryProviderVersion } };
             if (ffxQuery(&context, &version.Header) == ReturnOk && version.VersionName != null)
-                Version = Marshal.PtrToStringUTF8((IntPtr)version.VersionName) ?? "";
+                Version = "FSR " + (Marshal.PtrToStringUTF8((IntPtr)version.VersionName) ?? "");
 
             EffectMemoryUsage usage;
             var memory = new QueryGpuMemoryUsageDesc { Header = new ApiHeader { Type = QueryGpuMemoryUsage }, Usage = &usage };

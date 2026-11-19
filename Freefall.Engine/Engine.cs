@@ -702,7 +702,9 @@ namespace Freefall
     public enum UpscalerKind
     {
         Off = 0,        // RenderScale and the plain spatial upscale
-        FSR = 1,        // AMD FSR through the FidelityFX API (Graphics/Upscaling/Fsr.cs)
+        FSR = 1,        // AMD FSR through the FidelityFX API (Graphics/Upscaling/Fsr.cs), any DX12 GPU
+        DLSS = 2,       // NVIDIA DLSS through NGX and the engine's shim (Graphics/Upscaling/Dlss.cs), GeForce RTX
+        Auto = 3,       // DLSS where it runs, else FSR
     }
 
     /// <summary>EngineSettings.UpscaleMode: the temporal upscaler's render size, as FSR and DLSS name them</summary>
@@ -786,10 +788,11 @@ namespace Freefall
 
          /// <summary>
          /// The temporal upscaler (UPSCALING_PLAN.md): Off = RenderScale and the plain upscale, SMAA as set; FSR = AMD's
-         /// FSR (FSR 4 on Radeon RX 9000, FSR 3.1.5 on any other GPU) drawing at <see cref="UpscaleMode"/>'s size with
-         /// the camera jittered, its own anti-aliasing in SMAA's place. Without the FidelityFX DLLs FSR falls back to Off.
+         /// FSR (FSR 4 on Radeon RX 9000, FSR 3.1 on any other GPU); DLSS = NVIDIA's (GeForce RTX); Auto = DLSS where it
+         /// runs, else FSR. Each draws at <see cref="UpscaleMode"/>'s size with the camera jittered, its own
+         /// anti-aliasing in SMAA's place. One whose DLLs or GPU are missing falls back to the other (DLSS to FSR), or Off.
          /// </summary>
-         [System.ComponentModel.Description("Temporal upscaler: Off uses Render Scale and a plain upscale; FSR (AMD, any GPU) draws at the Upscale Mode's size and rebuilds the picture over frames, anti-aliasing included.")]
+         [System.ComponentModel.Description("Temporal upscaler: Off uses Render Scale and a plain upscale; FSR (AMD, any GPU) and DLSS (NVIDIA RTX) draw at the Upscale Mode's size and rebuild the picture over frames, anti-aliasing included; Auto takes DLSS where it runs, else FSR.")]
          public UpscalerKind Upscaler
          {
              get => _upscaler;

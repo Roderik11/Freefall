@@ -77,7 +77,7 @@ namespace Freefall.Graphics
             }
             float ratio = (float)DisplayWidth / RenderWidth;
             // The upscaler's own count (the same Halton sequence, so its offsets are these)
-            JitterPhases = TemporalUpscaling ? _fsr!.JitterPhaseCount(RenderWidth, DisplayWidth)
+            JitterPhases = TemporalUpscaling ? _upscaler!.JitterPhaseCount(RenderWidth, DisplayWidth)
                                              : Math.Max(8, (int)MathF.Ceiling(8f * ratio * ratio));
             int i = (_jitterIndex++ % JitterPhases) + 1;
             JitterPixels = new Vector2(Halton(i, 2) - 0.5f, Halton(i, 3) - 0.5f);
@@ -134,7 +134,7 @@ namespace Freefall.Graphics
         private const float CameraCutDistance = 25f;
 
         /// <summary>
-        /// FSR in the plain upscale's place: the composite, depth and motion (render size) into Upscaled (display size,
+        /// The temporal upscaler (FSR, DLSS) in the plain upscale's place: the composite, depth and motion (render size) into Upscaled (display size,
         /// left in NonPixelShaderResource for the bloom and the finalize pass). The SDK records its own heaps and root
         /// signature, so the engine's are set again after it. False if the dispatch failed (the plain upscale then).
         /// </summary>
@@ -146,15 +146,15 @@ namespace Freefall.Graphics
 
             // The exposure FSR tonemaps with: 1, the colour being pre-exposed. A 1x1 target cleared once (a texture
             // uploaded on the copy queue would sit in Common, not the state FSR is told)
-            if (_fsrExposure == null)
+            if (_upscaleExposure == null)
             {
-                _fsrExposure = new RenderTexture2D(Engine.Device, 1, 1, Format.R32_Float);
-                list.ResourceBarrierTransition(_fsrExposure.Native, ResourceStates.Common, ResourceStates.RenderTarget);
-                list.ClearRenderTargetView(_fsrExposure.RtvHandle, new Color4(1f, 0f, 0f, 0f));
-                list.ResourceBarrierTransition(_fsrExposure.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
+                _upscaleExposure = new RenderTexture2D(Engine.Device, 1, 1, Format.R32_Float);
+                list.ResourceBarrierTransition(_upscaleExposure.Native, ResourceStates.Common, ResourceStates.RenderTarget);
+                list.ClearRenderTargetView(_upscaleExposure.RtvHandle, new Color4(1f, 0f, 0f, 0f));
+                list.ResourceBarrierTransition(_upscaleExposure.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
             }
 
-            bool done = _fsr!.Dispatch(list, Composite.Native, Depth.Native, Motion.Native, _fsrExposure.Native, target.Native,
+            bool done = _upscaler!.Dispatch(list, Composite.Native, Depth.Native, Motion.Native, _upscaleExposure.Native, target.Native,
                 RenderWidth, RenderHeight, DisplayWidth, DisplayHeight, JitterPixels, _upscalerReset,
                 camera.NearPlane, camera.FarPlane, camera.FieldOfView * (MathF.PI / 180f),
                 MathF.Max(Time.RealDelta, 1e-4f) * 1000f, Engine.Settings.UpscaleSharpness);
@@ -535,18 +535,26 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// The display size is the view's. The render size is the temporal upscaler's mode's share of it while FSR is
-        /// chosen and its DLLs are there (EngineSettings.UpscaleMode: 1, 1/1.5, 1/1.7, 1/2, 1/3 each way, as FSR rounds
-        /// it), else EngineSettings.RenderScale of it; at least a pixel.
+        /// The display size is the view's. While a temporal upscaler runs (<see cref="ChooseUpscaler"/>) the render size is
+        /// its mode's share of it (EngineSettings.UpscaleMode): DLSS's own optimal size, or 1, 1/1.5, 1/1.7, 1/2, 1/3 each
+        /// way as FSR rounds it; else EngineSettings.RenderScale of it; at least a pixel.
         /// </summary>
         private void SetSizes(int width, int height)
         {
             DisplayWidth = Math.Max(1, width);
             DisplayHeight = Math.Max(1, height);
             var settings = Engine.Settings;
-            _temporalWanted = settings != null && settings.Upscaler == UpscalerKind.FSR && Upscaling.Fsr.Available;
+            _temporalKind = ChooseUpscaler(settings);
+            _temporalWanted = _temporalKind != UpscalerKind.Off;
             if (_temporalWanted)
             {
+                if (_temporalKind == UpscalerKind.DLSS
+                    && Upscaling.Dlss.RenderSize(DisplayWidth, DisplayHeight, settings!.UpscaleMode, out int w, out int h))
+                {
+                    RenderWidth = w;
+                    RenderHeight = h;
+                    return;
+                }
                 float ratio = settings!.UpscaleMode switch
                 {
                     UpscaleQuality.NativeAA => 1f,
@@ -564,20 +572,33 @@ namespace Freefall.Graphics
             RenderHeight = scale >= 1f ? DisplayHeight : Math.Clamp((int)MathF.Round(DisplayHeight * scale), 1, DisplayHeight);
         }
 
-        // FSR is chosen and its DLLs are there (SetSizes); _fsr is its context while one could be made
+        /// <summary>
+        /// The temporal upscaler that runs for EngineSettings.Upscaler: DLSS (and Auto) where NGX says it is available,
+        /// else FSR where its DLLs are there, else Off.
+        /// </summary>
+        private static UpscalerKind ChooseUpscaler(EngineSettings? settings)
+        {
+            var wanted = settings?.Upscaler ?? UpscalerKind.Off;
+            if (wanted == UpscalerKind.Off) return UpscalerKind.Off;
+            if ((wanted == UpscalerKind.DLSS || wanted == UpscalerKind.Auto) && Upscaling.Dlss.Available) return UpscalerKind.DLSS;
+            return Upscaling.Fsr.Available ? UpscalerKind.FSR : UpscalerKind.Off;
+        }
+
+        // The temporal upscaler chosen and available (SetSizes: Off, FSR or DLSS); _upscaler is it while one could be made
         private bool _temporalWanted;
-        private Upscaling.Fsr? _fsr;
+        private UpscalerKind _temporalKind;
+        private Upscaling.ITemporalUpscaler? _upscaler;
         private bool _upscalerReset = true;
-        private RenderTexture2D? _fsrExposure;   // 1x1 R32_Float holding 1 (TemporalUpscale), kept in NonPixelShaderResource
+        private RenderTexture2D? _upscaleExposure;   // 1x1 R32_Float holding 1 (TemporalUpscale), kept in NonPixelShaderResource
 
         // The smallest view a temporal upscaler is made for, pixels either way (CreateDisplayTextures)
         private const int MinTemporalSize = 256;
 
-        /// <summary>True while a temporal upscaler (FSR) rebuilds the picture: the camera is jittered and SMAA is skipped.</summary>
-        public bool TemporalUpscaling => _fsr?.Created == true;
+        /// <summary>True while a temporal upscaler (FSR, DLSS) rebuilds the picture: the camera is jittered and SMAA is skipped.</summary>
+        public bool TemporalUpscaling => _upscaler?.Created == true;
 
-        /// <summary>The temporal upscaler running for this view ("FSR 3.1.5", ...), or empty.</summary>
-        public string UpscalerVersion => _fsr?.Version ?? "";
+        /// <summary>The temporal upscaler running for this view ("FSR 3.1.6", "DLSS 310.9.16"), or empty.</summary>
+        public string UpscalerVersion => _upscaler?.Version ?? "";
 
         /// <summary>
         /// The targets at the display size: the tonemapped picture, and the upscaled composite while there is one. The
@@ -596,13 +617,23 @@ namespace Freefall.Graphics
             // project, 2026-11-19). Such a view takes the plain upscale until a resize makes it big enough.
             if (_temporalWanted && DisplayWidth >= MinTemporalSize && DisplayHeight >= MinTemporalSize)
             {
-                _fsr ??= new Upscaling.Fsr();
-                if (_fsr.Create(Engine.Device.NativeDevice, DisplayWidth, DisplayHeight, debugChecks: Engine.IsEditor))
-                    Debug.LogAlways($"[FSR] {_fsr.Version}: {RenderWidth}x{RenderHeight} to {DisplayWidth}x{DisplayHeight} ({Engine.Settings.UpscaleMode}), {_fsr.GpuBytes / (1024.0 * 1024.0):F0} MiB of its own");
+                if (_temporalKind == UpscalerKind.DLSS)
+                {
+                    // DLSS makes its feature on the next frame's command list, and logs it there
+                    if (_upscaler is not Upscaling.Dlss) { _upscaler?.Dispose(); _upscaler = new Upscaling.Dlss(); }
+                    ((Upscaling.Dlss)_upscaler).Create(RenderWidth, RenderHeight, DisplayWidth, DisplayHeight, Engine.Settings.UpscaleMode);
+                }
+                else
+                {
+                    if (_upscaler is not Upscaling.Fsr) { _upscaler?.Dispose(); _upscaler = new Upscaling.Fsr(); }
+                    var fsr = (Upscaling.Fsr)_upscaler;
+                    if (fsr.Create(Engine.Device.NativeDevice, DisplayWidth, DisplayHeight, debugChecks: Engine.IsEditor))
+                        Debug.LogAlways($"[Upscaler] {fsr.Version}: {RenderWidth}x{RenderHeight} to {DisplayWidth}x{DisplayHeight} ({Engine.Settings.UpscaleMode}), {fsr.GpuBytes / (1024.0 * 1024.0):F0} MiB of its own");
+                }
                 _upscalerReset = true;
             }
             else
-                _fsr?.Dispose();
+                _upscaler?.Dispose();
         }
 
         private void CreateRenderTextures(int width, int height)
@@ -854,7 +885,7 @@ namespace Freefall.Graphics
                 if (Upscaled != null)
                 {
                     // The temporal upscaler (FSR) when it runs, else the plain one
-                    PixMarker.Begin(list, TemporalUpscaling ? "FSR" : "Upscale");
+                    PixMarker.Begin(list, !TemporalUpscaling ? "Upscale" : _temporalKind == UpscalerKind.DLSS ? "DLSS" : "FSR");
                     if (!TemporalUpscaling || !TemporalUpscale(camera, list))
                         Upscale(list);
                     PixMarker.End(list);
@@ -2079,8 +2110,8 @@ namespace Freefall.Graphics
             CompositeSnapshot?.Dispose();
             Upscaled?.Dispose();
             _upscaleCS?.Dispose();
-            _fsr?.Dispose();
-            _fsrExposure?.Dispose();
+            _upscaler?.Dispose();
+            _upscaleExposure?.Dispose();
             Motion?.Dispose();
             _motionCS?.Dispose();
 
