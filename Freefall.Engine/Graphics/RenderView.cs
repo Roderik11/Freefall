@@ -97,6 +97,25 @@ namespace Freefall.Graphics
         private int _pendingWidth;
         private int _pendingHeight;
 
+        // The pipeline's targets to be made again at the same view size (EngineSettings.RenderScale changed)
+        private bool _pipelineResizePending;
+
+        /// <summary>
+        /// Every view's pipeline makes its targets again at the next resize point (Engine.Tick, after the GPU has
+        /// finished with the old ones), at the view's present size: a setting that changes their size has changed
+        /// (<see cref="EngineSettings.RenderScale"/>).
+        /// </summary>
+        public static void ResizePipelines()
+        {
+            foreach (var view in All)
+            {
+                view._pendingWidth = view._resizePending ? view._pendingWidth : view.Width;
+                view._pendingHeight = view._resizePending ? view._pendingHeight : view.Height;
+                view._resizePending = true;
+                view._pipelineResizePending = true;
+            }
+        }
+
         /// <summary>
         /// Create a RenderView from an external HWND (e.g. WinForms RenderForm).
         /// Call Resize() manually when the host window changes size.
@@ -291,8 +310,16 @@ namespace Freefall.Graphics
         {
             if (!_resizePending) return;
             _resizePending = false;
+            bool pipelineResize = _pipelineResizePending;
+            _pipelineResizePending = false;
 
-            if (_pendingWidth == Width && _pendingHeight == Height) return;
+            if (_pendingWidth == Width && _pendingHeight == Height)
+            {
+                // Same view size, but the pipeline's targets change size with a setting
+                if (pipelineResize && Width > 0 && Height > 0)
+                    Pipeline?.Resize(Width, Height);
+                return;
+            }
 
             Width = _pendingWidth;
             Height = _pendingHeight;

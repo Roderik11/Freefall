@@ -30,6 +30,8 @@ cbuffer PushConstants : register(b3)
     uint GradeBlurBits;     // radius as a share of the screen's height
     uint GradeOverlayIdx;   // 0 = none
     uint GradeOverlayAmountBits;
+    uint DepthWidth;        // the depth's size (the render size), which the picture's (ScreenWidth) is scaled from
+    uint DepthHeight;
 };
 
 SamplerState LinearClampSampler : register(s2);
@@ -88,7 +90,8 @@ void CSFinalize(uint3 dispatchThreadId : SV_DispatchThreadID)
             // gives up the share the prefilter put into the pyramid (of its capped light): the total stays the same.
             Texture2D<float> DepthTex = ResourceDescriptorHeap[DepthSrvIdx];
             float3 source = BloomSource(finalColor, asfloat(BloomCapBits));
-            float share = BloomIsSky(DepthTex.Load(int3(px, 0)))
+            uint2 depthAt = uint2((float2(px) + 0.5) * float2(DepthWidth, DepthHeight) / float2(ScreenWidth, ScreenHeight));
+            float share = BloomIsSky(DepthTex.Load(int3(depthAt, 0)))
                 ? 0
                 : BloomShare(dot(source, float3(0.2126, 0.7152, 0.0722)), asfloat(BloomThresholdBits), asfloat(BloomKneeBits));
             finalColor = max(finalColor + (bloom / BloomMipCount - source * share) * bloomIntensity, 0);

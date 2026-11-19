@@ -141,7 +141,12 @@ namespace Freefall.Components
             float exposure = Graphics.Atmosphere.Exposure;
             float emissiveExposure = Graphics.Atmosphere.EmissiveExposure;
             float sunLightScale = Graphics.Atmosphere.SunLightScale;
-            var viewportSize = new Vector2(Math.Max(Target?.Width ?? 1, 1), Math.Max(Target?.Height ?? 1, 1));
+            // The size of the targets drawn into (SV_Position lookups): the renderer's render size, which is smaller
+            // than the view while the scene is scaled up to it (EngineSettings.RenderScale)
+            var renderer = Graphics.DeferredRenderer.Current;
+            var viewportSize = renderer != null
+                ? new Vector2(renderer.RenderWidth, renderer.RenderHeight)
+                : new Vector2(Math.Max(Target?.Width ?? 1, 1), Math.Max(Target?.Height ?? 1, 1));
 
             foreach (var pair in Graphics.Effect.MasterEffects)
             {

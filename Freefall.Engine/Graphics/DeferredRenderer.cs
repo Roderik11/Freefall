@@ -38,9 +38,38 @@ namespace Freefall.Graphics
         private ResourceStates _skyVisState = ResourceStates.Common;
         private ComputeShader _skyVisCS = null!;
         private int _kSkyVis;
-        public RenderTexture2D Composite = null!;     // HDR intermediate (R16G16B16A16_Float)
-        public RenderTexture2D LdrOutput = null!;     // Final tonemapped output (R8G8B8A8_UNorm)
+        public RenderTexture2D Composite = null!;     // HDR intermediate (R16G16B16A16_Float), the render size
+        public RenderTexture2D LdrOutput = null!;     // Final tonemapped output (R8G8B8A8_UNorm), the display size
         public RenderTexture2D? CompositeSnapshot;
+
+        /// <summary>
+        /// The view's size: the picture from the upscale on (bloom, tonemapper, SMAA, blit). Picks are asked and
+        /// answered in it (<see cref="RequestPick"/>).
+        /// </summary>
+        public int DisplayWidth { get; private set; } = 1;
+        public int DisplayHeight { get; private set; } = 1;
+
+        /// <summary>
+        /// The size the scene is drawn at (<see cref="EngineSettings.RenderScale"/> of the display size): every target
+        /// up to <see cref="Composite"/>, and everything sized from them (fog, clouds, light clusters, GTAO, Hi-Z).
+        /// </summary>
+        public int RenderWidth { get; private set; } = 1;
+        public int RenderHeight { get; private set; } = 1;
+
+        /// <summary>True while the scene is drawn smaller than the view and scaled up to it.</summary>
+        public bool Upscales => RenderWidth != DisplayWidth || RenderHeight != DisplayHeight;
+
+        /// <summary>
+        /// The composite scaled up to the display size (R16G16B16A16_Float, pre-exposed HDR), which the bloom and the
+        /// finalize pass read in its place; null while the scene is drawn at the display size.
+        /// </summary>
+        public RenderTexture2D? Upscaled;
+        private ResourceStates _upscaledState = ResourceStates.Common;
+        private ComputeShader _upscaleCS = null!;
+        private int _kUpscale;
+
+        /// <summary>What the passes after the upscale read: the upscaled picture, or the composite when there is none.</summary>
+        private RenderTexture2D PostSource => Upscaled ?? Composite;
         public DepthTextureArray2D ShadowTextureArray = null!;
 
         /// <summary>
@@ -185,8 +214,10 @@ namespace Freefall.Graphics
         private GraphicsBuffer? _entityIdReadback;
         private GraphicsBuffer? _depthReadback;
         private GraphicsBuffer? _normalReadback;
-        private int _pickRequestX = -1;
+        private int _pickRequestX = -1;   // in the G-buffer (render size)
         private int _pickRequestY = -1;
+        private int _pickDisplayX = -1;   // as asked, in the view (display size)
+        private int _pickDisplayY = -1;
         private Animator? _pickSeeThrough;
         private bool _pickResultReady;
         private bool _pickCopyPending;
@@ -221,8 +252,10 @@ namespace Freefall.Graphics
             // First renderer sets Current; Render() handles save/restore per viewport
             Current ??= this;
 
-            // Create render textures first
-            CreateRenderTextures(width, height);
+            // Create render textures first: the scene's at the render size, the picture's at the view's
+            SetSizes(width, height);
+            CreateRenderTextures(RenderWidth, RenderHeight);
+            CreateDisplayTextures();
 
             // Create Materials
             matClear = new Material(new Effect("cleargbuffer"));
@@ -264,7 +297,7 @@ namespace Freefall.Graphics
 
             // Hi-Z pyramid (matched to depth buffer size)
             HiZPyramid = new HiZPyramid();
-            HiZPyramid.Create(Engine.Device, width, height);
+            HiZPyramid.Create(Engine.Device, RenderWidth, RenderHeight);
             
             // Shadow Hi-Z pyramid (matched to shadow map size)
             ShadowHiZPyramid = new ShadowHiZPyramid();
@@ -287,9 +320,9 @@ namespace Freefall.Graphics
             // SMAA anti-aliasing
             Smaa = new SMAA();
 
-            // Bloom pyramid
+            // Bloom pyramid, from the picture at the display size
             BloomPyramid = new BloomPyramid();
-            BloomPyramid.Create(Engine.Device, width, height);
+            BloomPyramid.Create(Engine.Device, DisplayWidth, DisplayHeight);
             _bloomCS = new ComputeShader("bloom_cs.hlsl");
             _kBloomThreshold = _bloomCS.FindKernel("CSBloomThreshold");
             _kBloomDownsample = _bloomCS.FindKernel("CSBloomDownsample");
@@ -298,6 +331,30 @@ namespace Freefall.Graphics
             // Finalize pass (HDR → LDR)
             _finalizeCS = new ComputeShader("finalize_cs.hlsl");
             _kFinalize = _finalizeCS.FindKernel("CSFinalize");
+
+            // The composite scaled up to the display size (EngineSettings.RenderScale below 1)
+            _upscaleCS = new ComputeShader("upscale_cs.hlsl");
+            _kUpscale = _upscaleCS.FindKernel("CSUpscale");
+        }
+
+        /// <summary>The display size is the view's; the render size that times EngineSettings.RenderScale, at least a pixel.</summary>
+        private void SetSizes(int width, int height)
+        {
+            DisplayWidth = Math.Max(1, width);
+            DisplayHeight = Math.Max(1, height);
+            float scale = Engine.Settings?.RenderScale ?? 1f;
+            RenderWidth = scale >= 1f ? DisplayWidth : Math.Clamp((int)MathF.Round(DisplayWidth * scale), 1, DisplayWidth);
+            RenderHeight = scale >= 1f ? DisplayHeight : Math.Clamp((int)MathF.Round(DisplayHeight * scale), 1, DisplayHeight);
+        }
+
+        /// <summary>The targets at the display size: the tonemapped picture, and the upscaled composite while there is one.</summary>
+        private void CreateDisplayTextures()
+        {
+            LdrOutput = new RenderTexture2D(Engine.Device, DisplayWidth, DisplayHeight, Format.R8G8B8A8_UNorm, randomWrite: true);
+            Upscaled = Upscales
+                ? new RenderTexture2D(Engine.Device, DisplayWidth, DisplayHeight, Format.R16G16B16A16_Float, randomWrite: true)
+                : null;
+            _upscaledState = ResourceStates.Common;
         }
 
         private void CreateRenderTextures(int width, int height)
@@ -328,7 +385,6 @@ namespace Freefall.Graphics
             SkyVisibilityTex = new RenderTexture2D(Engine.Device, width, height, Format.R8G8_UNorm, randomWrite: true);
             _skyVisState = ResourceStates.Common;
             Composite = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: true);
-            LdrOutput = new RenderTexture2D(Engine.Device, width, height, Format.R8G8B8A8_UNorm, randomWrite: true);
         }
 
         public override void Resize(int width, int height)
@@ -344,8 +400,11 @@ namespace Freefall.Graphics
             SkyVisibilityTex?.Dispose();
             Composite?.Dispose();
             LdrOutput?.Dispose();
+            Upscaled?.Dispose();
 
-            CreateRenderTextures(width, height);
+            SetSizes(width, height);
+            CreateRenderTextures(RenderWidth, RenderHeight);
+            CreateDisplayTextures();
             _isFirstFrame = true; // Resource states reset to Common/Texture
             _compositeSnapshotFirstFrame = true;
             CompositeSnapshot?.Dispose();
@@ -355,15 +414,15 @@ namespace Freefall.Graphics
             // Recreate Hi-Z pyramid to match new depth buffer dimensions
             HiZPyramid?.Dispose();
             HiZPyramid = new HiZPyramid();
-            HiZPyramid.Create(Engine.Device, width, height);
+            HiZPyramid.Create(Engine.Device, RenderWidth, RenderHeight);
 
             // Resize RC GI buffer
-            RadianceCascades?.Resize(width, height);
+            RadianceCascades?.Resize(RenderWidth, RenderHeight);
 
-            // Resize bloom pyramid
+            // Resize bloom pyramid (the display size: it reads the picture after the upscale)
             BloomPyramid?.Dispose();
             BloomPyramid = new BloomPyramid();
-            BloomPyramid.Create(Engine.Device, width, height);
+            BloomPyramid.Create(Engine.Device, DisplayWidth, DisplayHeight);
         }
 
         public override void Clear(Camera camera)
@@ -531,6 +590,15 @@ namespace Freefall.Graphics
 
             using (_postMarker.Auto())
             {
+                // 4c. The composite scaled up to the display size, when the scene was drawn smaller
+                //     (EngineSettings.RenderScale): from here on every pass is the view's size
+                if (Upscaled != null)
+                {
+                    PixMarker.Begin(list, "Upscale");
+                    Upscale(list);
+                    PixMarker.End(list);
+                }
+
                 // 5. Bloom (reads HDR Composite — now includes both deferred + forward)
                 bool bloom = BloomPyramid != null && Engine.Settings.EnableBloom;
                 if (bloom)
@@ -1091,7 +1159,9 @@ namespace Freefall.Graphics
                  Plane4 = new Vector4(Vector3.Normalize(camera.Forward), -camera.NearPlane),
                  CameraPosition = camera.Position,
                  Time = Time.TotalTime,
-                 PixelsPerMetre = 0.5f * Albedo.Native.Description.Height * camera.Projection.M22,
+                 // The view's pixels, not the render size's: which lights make the list does not change with
+                 // EngineSettings.RenderScale
+                 PixelsPerMetre = 0.5f * DisplayHeight * camera.Projection.M22,
                  FadeStep = Math.Clamp(Time.RealDelta, 0f, 0.1f) / PointShadowFadeSeconds,
                  SunLight = Daylight.SunIlluminance(),
                  Ambient = Daylight.SkyIlluminance(),
@@ -1272,12 +1342,15 @@ namespace Freefall.Graphics
             var bloomFrom = _isFirstFrame ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
             Transition(list, bloom.Texture!, bloomFrom, ResourceStates.UnorderedAccess);
 
-            // --- Pass 1: Threshold (full-res HDR Composite → half-res mip 0) ---
-            var compDesc = Composite.Native.Description;
-            _bloomCS.SetPushConstant(_kBloomThreshold, "InputSrv", Composite.BindlessIndex);
+            // --- Pass 1: Threshold (full-res HDR picture → half-res mip 0) ---
+            var source = PostSource;
+            _bloomCS.SetPushConstant(_kBloomThreshold, "InputSrv", source.BindlessIndex);
             _bloomCS.SetPushConstant(_kBloomThreshold, "OutputUAV", bloom.MipUAVs[0]);
-            _bloomCS.SetPushConstant(_kBloomThreshold, "OutputWidth", (uint)compDesc.Width);
-            _bloomCS.SetPushConstant(_kBloomThreshold, "OutputHeight", (uint)compDesc.Height);
+            _bloomCS.SetPushConstant(_kBloomThreshold, "OutputWidth", (uint)DisplayWidth);
+            _bloomCS.SetPushConstant(_kBloomThreshold, "OutputHeight", (uint)DisplayHeight);
+            // The sky mask reads the depth, which is the render size
+            _bloomCS.SetPushConstant(_kBloomThreshold, "DepthWidth", (uint)RenderWidth);
+            _bloomCS.SetPushConstant(_kBloomThreshold, "DepthHeight", (uint)RenderHeight);
             _bloomCS.SetPushConstant(_kBloomThreshold, "Param0Bits", BitConverter.SingleToUInt32Bits(settings.BloomThreshold));
             _bloomCS.SetPushConstant(_kBloomThreshold, "Param1Bits", BitConverter.SingleToUInt32Bits(settings.BloomSoftKnee));
             _bloomCS.SetPushConstant(_kBloomThreshold, "Param2Bits", BitConverter.SingleToUInt32Bits(MathF.Max(settings.BloomMaxBrightness, 0f)));
@@ -1365,11 +1438,13 @@ namespace Freefall.Graphics
             var ldrFrom = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
             Transition(list, LdrOutput.Native, ldrFrom, ResourceStates.UnorderedAccess);
 
-            var desc = Composite.Native.Description;
-            _finalizeCS.SetPushConstant(_kFinalize, "InputSrv", Composite.BindlessIndex);
+            _finalizeCS.SetPushConstant(_kFinalize, "InputSrv", PostSource.BindlessIndex);
             _finalizeCS.SetPushConstant(_kFinalize, "OutputUAV", LdrOutput.UavIndex);
-            _finalizeCS.SetPushConstant(_kFinalize, "ScreenWidth", (uint)desc.Width);
-            _finalizeCS.SetPushConstant(_kFinalize, "ScreenHeight", (uint)desc.Height);
+            _finalizeCS.SetPushConstant(_kFinalize, "ScreenWidth", (uint)DisplayWidth);
+            _finalizeCS.SetPushConstant(_kFinalize, "ScreenHeight", (uint)DisplayHeight);
+            // The bloom's take-back reads the depth, which is the render size
+            _finalizeCS.SetPushConstant(_kFinalize, "DepthWidth", (uint)RenderWidth);
+            _finalizeCS.SetPushConstant(_kFinalize, "DepthHeight", (uint)RenderHeight);
 
             // Bloom params (push constants — packed as uint)
             bool bloomActive = BloomPyramid != null && Engine.Settings.EnableBloom && BloomPyramid.MipCount > 0;
@@ -1391,13 +1466,38 @@ namespace Freefall.Graphics
             _finalizeCS.SetPushConstant(_kFinalize, "GradeOverlay", ScreenGrade.Overlay?.BindlessIndex ?? 0u);
             _finalizeCS.SetPushConstant(_kFinalize, "GradeOverlayAmountBits", BitConverter.SingleToUInt32Bits(ScreenGrade.OverlayAmount));
 
-            uint groupsX = ((uint)desc.Width + 7) / 8;
-            uint groupsY = ((uint)desc.Height + 7) / 8;
+            uint groupsX = ((uint)DisplayWidth + 7) / 8;
+            uint groupsY = ((uint)DisplayHeight + 7) / 8;
             _finalizeCS.Dispatch(_kFinalize, list, groupsX, groupsY);
 
             // UAV barrier, then transition to PixelShaderResource for SMAA/Blit
             list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(LdrOutput.Native)));
             Transition(list, LdrOutput.Native, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource);
+        }
+
+        /// <summary>
+        /// The composite (render size, in NonPixelShaderResource after the forward pass) scaled up into
+        /// <see cref="Upscaled"/> (display size, left in NonPixelShaderResource for the bloom and the finalize pass):
+        /// Catmull-Rom, held inside the four nearest texels so it does not ring round bright edges.
+        /// </summary>
+        private void Upscale(ID3D12GraphicsCommandList list)
+        {
+            var target = Upscaled!;
+            list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+
+            Transition(list, target.Native, _upscaledState, ResourceStates.UnorderedAccess);
+            _upscaleCS.SetPushConstant(_kUpscale, "InputSrv", Composite.BindlessIndex);
+            _upscaleCS.SetPushConstant(_kUpscale, "OutputUAV", target.UavIndex);
+            _upscaleCS.SetPushConstant(_kUpscale, "InputWidth", (uint)RenderWidth);
+            _upscaleCS.SetPushConstant(_kUpscale, "InputHeight", (uint)RenderHeight);
+            _upscaleCS.SetPushConstant(_kUpscale, "OutputWidth", (uint)DisplayWidth);
+            _upscaleCS.SetPushConstant(_kUpscale, "OutputHeight", (uint)DisplayHeight);
+            _upscaleCS.Dispatch(_kUpscale, list, ((uint)DisplayWidth + 7) / 8, ((uint)DisplayHeight + 7) / 8);
+
+            list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(target.Native)));
+            Transition(list, target.Native, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            _upscaledState = ResourceStates.NonPixelShaderResource;
         }
 
         /// <summary>Copy the composite (a render target, before and after) into CompositeSnapshot, which the forward passes read.</summary>
@@ -1501,8 +1601,8 @@ namespace Freefall.Graphics
                       new TextureCopyLocation(Normals.Native, 0), pickBox);
                   Transition(list, Normals.Native, ResourceStates.CopySource, ShaderRead);
 
-                  _readbackPixelX = _pickRequestX;
-                  _readbackPixelY = _pickRequestY;
+                  _readbackPixelX = _pickDisplayX;
+                  _readbackPixelY = _pickDisplayY;
                   _pickCopyPending = true;
                   _pickRequestX = -1;
                   _pickSeeThrough = null;
@@ -1584,8 +1684,12 @@ namespace Freefall.Graphics
         /// </param>
         public void RequestPick(int x, int y, Animator? seeThrough = null)
         {
-            _pickRequestX = x;
-            _pickRequestY = y;
+            // Asked in the view's pixels; read from the G-buffer, which is the render size (the same pixel when the
+            // scene is drawn at the view's size). The answer gives back the pixel asked for (PickedPixelX/Y).
+            _pickDisplayX = x;
+            _pickDisplayY = y;
+            _pickRequestX = Upscales && x >= 0 ? (int)((x + 0.5f) * RenderWidth / DisplayWidth) : x;
+            _pickRequestY = Upscales && y >= 0 ? (int)((y + 0.5f) * RenderHeight / DisplayHeight) : y;
             _pickSeeThrough = seeThrough;
             _pickResultReady = false;
         }
@@ -1670,7 +1774,7 @@ namespace Freefall.Graphics
         /// <summary>World-space surface normal at the picked pixel.</summary>
         public Vector3 PickedNormal { get; private set; }
 
-        /// <summary>Pixel coordinates of the last pick (viewport-local).</summary>
+        /// <summary>Pixel coordinates of the last pick (viewport-local, the display size: as it was asked for).</summary>
         public int PickedPixelX { get; private set; }
         public int PickedPixelY { get; private set; }
 
@@ -1687,6 +1791,8 @@ namespace Freefall.Graphics
             SkyVisibilityTex?.Dispose();
             Composite?.Dispose();
             CompositeSnapshot?.Dispose();
+            Upscaled?.Dispose();
+            _upscaleCS?.Dispose();
 
             ShadowTextureArray?.Dispose();
             LocalShadows?.Dispose();

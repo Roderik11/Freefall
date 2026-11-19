@@ -31,6 +31,8 @@ cbuffer PushConstants : register(b3)
     uint Param1Bits;    // SoftKnee  / InputTexelSize.y (reinterpreted as float)
     uint Param2Bits;    // MaxBrightness / BloomRadius (reinterpreted as float)
     uint DepthSrvIdx;   // Depth buffer SRV (threshold only — sky mask)
+    uint DepthWidth;    // the depth's size (the render size), which the picture's (OutputWidth) is scaled from
+    uint DepthHeight;
 };
 
 // ---------------------------------------------------------------------------
@@ -100,8 +102,10 @@ void CSBloomThreshold(uint3 id : SV_DispatchThreadID)
     if (DepthSrvIdx != 0)
     {
         Texture2D<float> depthTex = ResourceDescriptorHeap[DepthSrvIdx];
-        // Sample any corner of the 2x2 block — if it's sky, the whole block is sky
-        if (BloomIsSky(depthTex.Load(int3(base, 0)).r))
+        // Sample any corner of the 2x2 block — if it's sky, the whole block is sky. The depth is the render size:
+        // the same place in it (the same texel when the scene is drawn at the picture's size)
+        uint2 depthAt = uint2((float2(base) + 0.5) * float2(DepthWidth, DepthHeight) / float2(OutputWidth, OutputHeight));
+        if (BloomIsSky(depthTex.Load(int3(depthAt, 0)).r))
         {
             output[id.xy] = float4(0, 0, 0, 1);
             return;

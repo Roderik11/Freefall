@@ -736,6 +736,28 @@ namespace Freefall
          public bool VSync { get; set; } = true;                            // F1 - VSync
          public bool Wireframe { get; set; } = false;                       // F2 - Global wireframe
          public bool EnableSMAA { get; set; } = false;                      // Anti-aliasing
+
+         /// <summary>
+         /// The share of the view's width and height the scene is drawn at (UPSCALING_PLAN.md): the G-buffer, the
+         /// lights, the composition and the forward passes run at that size, and the picture is scaled up to the view
+         /// before the bloom and the tonemapper. 1 = the view's own size, as before. A change remakes every view's
+         /// targets at the next resize point (RenderView.ResizePipelines).
+         /// </summary>
+         [ValueRange(0.25f, 1.0f)]
+         [System.ComponentModel.Description("Share of the view's width and height the scene is drawn at before it is scaled up to the view (1 = full size; 0.5 = a quarter of the pixels).")]
+         public float RenderScale
+         {
+             get => _renderScale;
+             set
+             {
+                 float scale = float.IsFinite(value) ? Math.Clamp(value, 0.25f, 1f) : 1f;
+                 if (scale == _renderScale) return;
+                 _renderScale = scale;
+                 Graphics.RenderView.ResizePipelines();
+             }
+         }
+         private float _renderScale = 1f;
+
          public bool ShowGrid { get; set; } = true;                      // Show editor grid in scene view
          public bool ShowSystemGizmos { get; set; } = true;              // Markers systems draw in the scene view whatever is selected (Systems.Gizmos)
 
