@@ -31,7 +31,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=6, CullMode=None, LodFade=true)
+// @RenderState(RenderTargets=6, CullMode=None, LodFade=true, MotionVectors=true)
 
 // Foliage GBuffer shader — based on gbuffer.fx with:
 // - Two-sided rendering (CullMode=None)
@@ -64,6 +64,8 @@ struct VSOutput
     float3 DomeNormal : TEXCOORD7;  // original look (mostly up) — used for materials that have a normal map
     nointerpolation float3 TreeTint : TEXCOORD8;   // this tree's colour (common.fx TreeTint)
     nointerpolation uint LodFade : TEXCOORD9;      // DrawEntryFade (0 = no LOD crossfade)
+    float4 MotionNow : TEXCOORD10;                 // this frame's clip position without jitter (common.fx MotionClip)
+    float4 MotionBefore : TEXCOORD11;              // last frame's: last frame's transform and wind (PrevMotionClip)
 };
 
 // Wind (common.fx). The crown rides its trunk's bend (TreeSway, as gbuffer_trunk.fx), and the leaves flutter about
@@ -71,18 +73,24 @@ struct VSOutput
 // moves) each on their own rate and direction, harder in the gusts at the tree. Without per-leaf pivots in the mesh
 // this is the best a vertex shader can do; a smooth function of the world position here (the first version) made
 // waves run through the crown — "wiggles like it's underwater".
-float3 WindDisplacement(float3 worldPos, float3 localPos, float3 origin)
+// In a frame's wind 'w' with the push at the tree 'push' (WindPush at the origin): last frame's for the motion vectors.
+float3 WindDisplacementIn(float3 worldPos, float3 localPos, float3 origin, float push, WindFrame w)
 {
-    float3 sway = TreeSway(worldPos, origin);
+    float3 sway = TreeSwayIn(worldPos, origin, push, w);
 
     float3 cell = floor(localPos / 0.75);
     float seed = MacroHash(cell.xz + cell.y * 17.0 + origin.xz);
     float rate = 0.8 + 0.4 * seed;
-    float s = saturate(WindStrength / 12.0);
-    float wave = sin(WindPhase * 7.0 * rate + seed * 40.0) * 0.6 + sin(WindPhase * 11.3 * rate + seed * 23.0) * 0.4;
-    float amount = (0.01 + 0.05 * s) * (0.4 + 0.6 * saturate(WindPush(origin.xz)));
+    float s = saturate(w.Strength / 12.0);
+    float wave = sin(w.Phase * 7.0 * rate + seed * 40.0) * 0.6 + sin(w.Phase * 11.3 * rate + seed * 23.0) * 0.4;
+    float amount = (0.01 + 0.05 * s) * (0.4 + 0.6 * saturate(push));
     float angle = seed * 6.2831853;
     return sway + float3(cos(angle), 0.4 * (seed - 0.5), sin(angle)) * wave * amount;
+}
+
+float3 WindDisplacement(float3 worldPos, float3 localPos, float3 origin)
+{
+    return WindDisplacementIn(worldPos, localPos, origin, WindPush(origin.xz), WindNow());
 }
 
 // World position with the wind, and clip position. Shared by VS and VS_Depth: the depth pre-pass and the Shade pass
@@ -129,7 +137,15 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     FoliagePosition(pos, World, worldPos, output.Position);
 
     output.WorldPos = worldPos;
-    
+
+    // Where the leaf was last frame: last frame's transform and wind (this frame's push, common.fx GrassSwayIn)
+    row_major matrix prevWorld = PrevWorldMatrix(desc.TransformSlot, World);
+    float3 prevOrigin = float3(prevWorld._41, prevWorld._42, prevWorld._43);
+    float3 prevRest = mul(float4(pos, 1.0f), prevWorld).xyz;
+    float3 prevPos = prevRest + WindDisplacementIn(prevRest, pos, prevOrigin, WindPush(prevOrigin.xz), WindBefore());
+    output.MotionNow = MotionClip(worldPos.xyz);
+    output.MotionBefore = PrevMotionClip(prevPos);
+
     // Original canopy normal: mostly upward with a subtle outward dome from the tree origin. Kept for foliage whose
     // material has a normal map (Sweetgum, beech): those trees were authored against this look.
     float3 treeOrigin = float3(World._41, World._42, World._43);
@@ -166,7 +182,8 @@ struct PSOutput
     float4 Data : SV_Target2;
     float  Depth : SV_Target3;
     uint   EntityId : SV_Target4;
-    float2 Displacement : SV_Target5;    
+    float2 Displacement : SV_Target5;
+    float2 Motion : SV_Target6;          // last frame's UV minus this frame's (MotionVectors=true)
 };
 
 SamplerState Sampler : register(s0);
@@ -213,6 +230,7 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
     output.Depth = input.Depth;
     output.Displacement = float2(0,0);
     output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu) | (2u << 30);   // class 2: vegetation (decals_cs.hlsl receivers)
+    output.Motion = MotionVector(input.MotionNow, input.MotionBefore);
     return output;
 }
 

@@ -105,6 +105,12 @@ float3 Wind(float push, float t, float height, float phase)
     return GrassSway(push, phase) * (t * t * height);
 }
 
+// The same in a frame's wind 'w' (common.fx WindFrame: WindNow, or WindBefore for the motion vectors)
+float3 WindIn(float push, float t, float height, float phase, WindFrame w)
+{
+    return GrassSwayIn(push, phase, w) * (t * t * height);
+}
+
 // Triangle 'p' of a strip of 'segs' quads (left/right vertex pairs up from 'baseVertex') closed by a tip vertex
 uint3 StripTriangle(uint baseVertex, uint p, uint segs)
 {

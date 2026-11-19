@@ -56,6 +56,12 @@ namespace Freefall.Graphics
         public uint SrvIndex => _transforms.SrvIndex;
 
         /// <summary>
+        /// Bindless SRV index of last frame's transforms (StreamingBuffer.PreviousSrvIndex), for the motion vectors
+        /// (SceneConstants.PrevTransformsIdx). A slot new since then holds identity or zeros there.
+        /// </summary>
+        public uint PreviousSrvIndex => _transforms.PreviousSrvIndex;
+
+        /// <summary>
         /// Bindless SRV index for the current frame's materialID buffer.
         /// </summary>
         public uint MaterialSrvIndex => _materials.SrvIndex;

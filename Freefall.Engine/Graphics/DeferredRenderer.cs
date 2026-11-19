@@ -27,6 +27,151 @@ namespace Freefall.Graphics
         public RenderTexture2D DepthGBuffer;  // Linear view-space depth (R32_Float), cleared to 0
         public RenderTexture2D EntityIdBuffer; // Per-pixel entity ID (R32_UInt) for mouse picking
         public RenderTexture2D HeightBuffer;   // Per-pixel displacement vectors for SSDM (RG16_Float)
+
+        /// <summary>
+        /// Motion vectors (RG16F, render size): last frame's UV minus this frame's for the surface each pixel shows,
+        /// with neither frame's jitter (motion_cs.hlsl). The G-buffer's seventh target, cleared to "unwritten": effects
+        /// with MotionVectors=true write their surface's own motion, and <see cref="CameraMotion"/> gives every other
+        /// pixel the camera's after the forward pass. Read by the upscaler; in NonPixelShaderResource from then on.
+        /// </summary>
+        public RenderTexture2D Motion = null!;
+        private ResourceStates _motionState = ResourceStates.Common;
+        private ComputeShader _motionCS = null!;
+        private int _kCameraMotion, _kMotionView;
+
+        // What the cleared motion target holds (motion_cs.hlsl MOTION_UNWRITTEN)
+        private static readonly Color4 MotionUnwritten = new(32768f, 32768f, 0f, 0f);
+
+        // Last frame's camera for the motion vectors: its view-projection without translation or jitter, and where it was
+        private Matrix4x4 _prevMotionVP;
+        private Vector3 _prevMotionCameraPos;
+        private bool _motionHistory;
+        private Camera? _motionCamera;
+
+        /// <summary>
+        /// This frame's sub-pixel offset of the camera in render pixels (x right, y down, each within ±0.5), or zero
+        /// while no temporal upscaler wants one (<see cref="EngineSettings.CameraJitter"/> for now). The projection is
+        /// moved by it (Camera.Jitter); the motion vectors leave it out.
+        /// </summary>
+        public Vector2 JitterPixels { get; private set; }
+
+        /// <summary>How many different jitter offsets go round before the sequence repeats (8 × the upscale ratio², as FSR asks).</summary>
+        public int JitterPhases { get; private set; } = 1;
+        private int _jitterIndex;
+
+        // This frame's view-projection without translation, jittered as drawn, inverted (SceneConstants.CameraInverse)
+        private Matrix4x4 _cameraInverse;
+
+        /// <summary>
+        /// This frame's jitter (Halton 2, 3 over <see cref="JitterPhases"/>) set on the camera, or none. In render pixels:
+        /// the projection moves by 2 × pixels / render size in NDC, y flipped.
+        /// </summary>
+        private void UpdateJitter(Camera camera)
+        {
+            if (!Engine.Settings.CameraJitter)
+            {
+                JitterPixels = Vector2.Zero;
+                JitterPhases = 1;
+                camera.Jitter = Vector2.Zero;
+                return;
+            }
+            float ratio = (float)DisplayWidth / RenderWidth;
+            JitterPhases = Math.Max(8, (int)MathF.Ceiling(8f * ratio * ratio));
+            int i = (_jitterIndex++ % JitterPhases) + 1;
+            JitterPixels = new Vector2(Halton(i, 2) - 0.5f, Halton(i, 3) - 0.5f);
+            camera.Jitter = new Vector2(2f * JitterPixels.X / RenderWidth, -2f * JitterPixels.Y / RenderHeight);
+        }
+
+        private static float Halton(int index, int radix)
+        {
+            float result = 0f, f = 1f;
+            while (index > 0)
+            {
+                f /= radix;
+                result += f * (index % radix);
+                index /= radix;
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// The camera's motion for every pixel no effect wrote its own into (motion_cs.hlsl CSCameraMotion), after the
+        /// forward pass: the depth's point through this frame's jittered camera, projected by last frame's camera and
+        /// this frame's without jitter. The hardware depth is in ShaderRead; Motion is left in NonPixelShaderResource.
+        /// </summary>
+        /// <summary>
+        /// This frame's camera for the motion vectors (its view-projection without translation or jitter) beside last
+        /// frame's, before anything draws: the G-buffer effects with MotionVectors=true read both (SceneConstants
+        /// MotionVP, PrevMotionVP, PrevCamPos), and so does <see cref="CameraMotion"/>. A new camera (a switch, the
+        /// first frame) has no last frame: this frame stands for it.
+        /// </summary>
+        private void BeginMotion(Camera camera)
+        {
+            var rotation = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up);
+            _motionVP = rotation * camera.UnjitteredProjection;
+            _motionCameraPos = camera.Position;
+            // The wind as the effects get it this frame (Camera.SetShaderParams), for next frame's PrevWind*
+            _motionWind = new WindState(Wind.LocalDirection, Wind.LocalStrength, Wind.Phase, Wind.Offset);
+            if (!_motionHistory || !ReferenceEquals(_motionCamera, camera))
+            {
+                _prevMotionVP = _motionVP;
+                _prevMotionCameraPos = _motionCameraPos;
+                _prevMotionWind = _motionWind;
+            }
+        }
+
+        private Matrix4x4 _motionVP;
+        private Vector3 _motionCameraPos;
+
+        // The wind of a frame as the shaders' WindFrame has it (common.fx WindNow / WindBefore)
+        private readonly record struct WindState(Vector3 Direction, float Strength, float Phase, Vector2 Offset);
+        private WindState _motionWind, _prevMotionWind;
+
+        private void CameraMotion(Camera camera, ID3D12GraphicsCommandList list)
+        {
+            var currentVP = _motionVP;
+            var position = _motionCameraPos;
+
+            list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+            Transition(list, Motion.Native, _motionState, ResourceStates.UnorderedAccess);
+            _motionCS.SetPushConstant(_kCameraMotion, "Depth", Depth.BindlessIndex);
+            _motionCS.SetPushConstant(_kCameraMotion, "MotionUAV", Motion.UavIndex);
+            _motionCS.SetPushConstant(_kCameraMotion, "RenderWidth", (uint)RenderWidth);
+            _motionCS.SetPushConstant(_kCameraMotion, "RenderHeight", (uint)RenderHeight);
+            _motionCS.SetParam("JitteredInverse", _cameraInverse);
+            _motionCS.SetParam("CurrentVP", currentVP);
+            _motionCS.SetParam("PreviousVP", _prevMotionVP);
+            _motionCS.SetParam("CameraMove", position - _prevMotionCameraPos);
+            _motionCS.SetParam("MotionViewPixels", 16f);
+            _motionCS.Dispatch(_kCameraMotion, list, ((uint)RenderWidth + 7) / 8, ((uint)RenderHeight + 7) / 8);
+            list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(Motion.Native)));
+            Transition(list, Motion.Native, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            _motionState = ResourceStates.NonPixelShaderResource;
+
+            _prevMotionVP = currentVP;
+            _prevMotionCameraPos = position;
+            _prevMotionWind = _motionWind;
+            _motionHistory = true;
+            _motionCamera = camera;
+        }
+
+        /// <summary>DebugVizMode.Motion: the motion field painted over the tonemapped picture (LdrOutput in PixelShaderResource, before SMAA).</summary>
+        private void MotionView(ID3D12GraphicsCommandList list)
+        {
+            list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+            Transition(list, LdrOutput.Native, ResourceStates.PixelShaderResource, ResourceStates.UnorderedAccess);
+            _motionCS.SetPushConstant(_kMotionView, "MotionSrv", Motion.BindlessIndex);
+            _motionCS.SetPushConstant(_kMotionView, "OutputUAV", LdrOutput.UavIndex);
+            _motionCS.SetPushConstant(_kMotionView, "RenderWidth", (uint)RenderWidth);
+            _motionCS.SetPushConstant(_kMotionView, "RenderHeight", (uint)RenderHeight);
+            _motionCS.SetPushConstant(_kMotionView, "DisplayWidth", (uint)DisplayWidth);
+            _motionCS.SetPushConstant(_kMotionView, "DisplayHeight", (uint)DisplayHeight);
+            _motionCS.Dispatch(_kMotionView, list, ((uint)DisplayWidth + 7) / 8, ((uint)DisplayHeight + 7) / 8);
+            list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(LdrOutput.Native)));
+            Transition(list, LdrOutput.Native, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource);
+        }
         public DepthTexture2D Depth;
         
         public RenderTexture2D LightBuffer = null!;
@@ -335,6 +480,12 @@ namespace Freefall.Graphics
             // The composite scaled up to the display size (EngineSettings.RenderScale below 1)
             _upscaleCS = new ComputeShader("upscale_cs.hlsl");
             _kUpscale = _upscaleCS.FindKernel("CSUpscale");
+
+            // Motion vectors: the camera's motion where no effect wrote its own, and the debug view. One per renderer:
+            // a compute shader's parameters are one buffer a frame, and each view has its own camera
+            _motionCS = new ComputeShader("motion_cs.hlsl");
+            _kCameraMotion = _motionCS.FindKernel("CSCameraMotion");
+            _kMotionView = _motionCS.FindKernel("CSMotionView");
         }
 
         /// <summary>The display size is the view's; the render size that times EngineSettings.RenderScale, at least a pixel.</summary>
@@ -385,6 +536,8 @@ namespace Freefall.Graphics
             SkyVisibilityTex = new RenderTexture2D(Engine.Device, width, height, Format.R8G8_UNorm, randomWrite: true);
             _skyVisState = ResourceStates.Common;
             Composite = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: true);
+            Motion = new RenderTexture2D(Engine.Device, width, height, Format.R16G16_Float, randomWrite: true);
+            _motionState = ResourceStates.Common;
         }
 
         public override void Resize(int width, int height)
@@ -401,6 +554,7 @@ namespace Freefall.Graphics
             Composite?.Dispose();
             LdrOutput?.Dispose();
             Upscaled?.Dispose();
+            Motion?.Dispose();
 
             SetSizes(width, height);
             CreateRenderTextures(RenderWidth, RenderHeight);
@@ -535,6 +689,9 @@ namespace Freefall.Graphics
 
             PixMarker.Begin(list, "Deferred renderer");
 
+            // This frame's sub-pixel offset of the camera, before anything takes its matrices (SetShaderParams below)
+            UpdateJitter(camera);
+
             // Ensure Materials buffer is bound (creates SRV for bindless access)
             Material.BindMaterialsBuffer(list, Engine.Device);
 
@@ -584,6 +741,11 @@ namespace Freefall.Graphics
             LocalShadows?.EndFrame(list);
             _lightClusters.EndFrame(list);
 
+            // Motion vectors: the camera's motion where no effect wrote its surface's own, with the water's depth in
+            PixMarker.Begin(list, "Camera motion");
+            CameraMotion(camera, list);
+            PixMarker.End(list);
+
             // Auto exposure metering of the finished HDR image (deferred + forward + sky), before bloom
             var compositeDesc = Composite.Native.Description;
             AutoExposure.Measure(list, Composite.BindlessIndex, (int)compositeDesc.Width, (int)compositeDesc.Height, Atmosphere.Exposure);
@@ -614,6 +776,10 @@ namespace Freefall.Graphics
                 PixMarker.Begin(list, "Finalize");
                 Finalize(list);
                 PixMarker.End(list);
+
+                // The motion field over the picture (DebugVizMode.Motion)
+                if (Engine.Settings.DebugVisualizationMode == DebugVizMode.Motion)
+                    MotionView(list);
 
                 // 7. SMAA Anti-Aliasing (optional, on LDR output)
                 if (Smaa != null && Engine.Settings.EnableSMAA)
@@ -666,6 +832,10 @@ namespace Freefall.Graphics
              // Set before anything is drawn: the atmosphere's aerial perspective volume needs it too.
              var relativeVP = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up) * camera.Projection;
              Matrix4x4.Invert(relativeVP, out var cameraInverse);
+             _cameraInverse = cameraInverse;
+             BeginMotion(camera);
+             uint prevTransforms = _motionHistory && ReferenceEquals(_motionCamera, camera)
+                 ? TransformBuffer.Instance?.PreviousSrvIndex ?? 0u : 0u;
 
              // The near fog volume this view's passes read (filled after the shadows, 2e below, before anything reads it):
              // its index stays the same from frame to frame, so it is set here with the camera, not mid-frame
@@ -696,6 +866,17 @@ namespace Freefall.Graphics
                  pair.Value.SetParameter("LightClustersIdx", _lightClusters.ClustersSrv);
                  pair.Value.SetParameter("ClusterLightsIdx", _lightClusters.LightsSrv);
                  pair.Value.SetParameter("BlueNoiseIdx", Freefall.Assets.InternalAssets.BlueNoise?.BindlessIndex ?? 0u);
+                 // Motion vectors (common.fx MotionClip, PrevMotionClip, PrevWorldMatrix)
+                 pair.Value.SetParameter("MotionVP", _motionVP);
+                 pair.Value.SetParameter("PrevMotionVP", _prevMotionVP);
+                 pair.Value.SetParameter("PrevCamPos", _prevMotionCameraPos);
+                 pair.Value.SetParameter("PrevTransformsIdx", prevTransforms);
+                 pair.Value.SetParameter("FrameTick", (uint)Engine.TickCount);
+                 // Last frame's wind (common.fx WindBefore): plants and trees put where it had them
+                 pair.Value.SetParameter("PrevWindDirection", _prevMotionWind.Direction);
+                 pair.Value.SetParameter("PrevWindStrength", _prevMotionWind.Strength);
+                 pair.Value.SetParameter("PrevWindPhase", _prevMotionWind.Phase);
+                 pair.Value.SetParameter("PrevWindOffset", _prevMotionWind.Offset);
              }
 
              // The atmosphere's LUTs for this view (sky-view, aerial perspective, ambient): the sky dome, the
@@ -714,6 +895,9 @@ namespace Freefall.Graphics
              Transition(list, EntityIdBuffer.Native, fromState, ResourceStates.RenderTarget);
              // The height buffer ends its frame in NonPixelShaderResource (only the displacement compute reads it)
              Transition(list, HeightBuffer.Native, _isFirstFrame ? ResourceStates.Common : ResourceStates.NonPixelShaderResource, ResourceStates.RenderTarget);
+             // The motion target ends its frame in NonPixelShaderResource (the camera motion pass, the upscaler)
+             Transition(list, Motion.Native, _motionState, ResourceStates.RenderTarget);
+             _motionState = ResourceStates.RenderTarget;
              Transition(list, Depth.Native, depthFromState, ResourceStates.DepthWrite);
 
              // Run the RenderGroup: IDraw components (ScriptDrawSystem) and draw systems enqueue their commands.
@@ -730,21 +914,24 @@ namespace Freefall.Graphics
 
              // === GBuffer Draw ===
              // Cache GBuffer RTV handles to avoid per-frame allocation
-             _cachedGBufferRtvHandles ??= new CpuDescriptorHandle[6];
+             // Seven targets, in Material.GBufferFormats' order: every G-buffer pipeline names all seven
+             _cachedGBufferRtvHandles ??= new CpuDescriptorHandle[7];
              _cachedGBufferRtvHandles[0] = Albedo.RtvHandle;
              _cachedGBufferRtvHandles[1] = Normals.RtvHandle;
              _cachedGBufferRtvHandles[2] = Data.RtvHandle;
              _cachedGBufferRtvHandles[3] = DepthGBuffer.RtvHandle;
              _cachedGBufferRtvHandles[4] = EntityIdBuffer.RtvHandle;
              _cachedGBufferRtvHandles[5] = HeightBuffer.RtvHandle;
+             _cachedGBufferRtvHandles[6] = Motion.RtvHandle;
              list.OMSetRenderTargets(_cachedGBufferRtvHandles, Depth.DsvHandle);
-             
+
              list.ClearRenderTargetView(Albedo.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(Normals.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(Data.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(DepthGBuffer.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(EntityIdBuffer.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(HeightBuffer.RtvHandle, new Color4(0,0,0,0));
+             list.ClearRenderTargetView(Motion.RtvHandle, MotionUnwritten);
              list.ClearDepthStencilView(Depth.DsvHandle, ClearFlags.Depth, 0.0f, 0); // Reverse depth: far=0
 
              // Viewport
@@ -1793,6 +1980,8 @@ namespace Freefall.Graphics
             CompositeSnapshot?.Dispose();
             Upscaled?.Dispose();
             _upscaleCS?.Dispose();
+            Motion?.Dispose();
+            _motionCS?.Dispose();
 
             ShadowTextureArray?.Dispose();
             LocalShadows?.Dispose();

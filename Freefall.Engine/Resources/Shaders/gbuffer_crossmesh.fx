@@ -32,7 +32,7 @@ cbuffer PushConstants : register(b3)
 
 #include "common.fx"
 #include "far_forest.hlsli"
-// @RenderState(RenderTargets=6, CullMode=None, LodFade=true)
+// @RenderState(RenderTargets=6, CullMode=None, LodFade=true, MotionVectors=true)
 
 // Crossmesh/Far-LOD Tree GBuffer shader:
 // - Two-sided rendering (CullMode=None) for cross-planes
@@ -64,6 +64,8 @@ struct VSOutput
     float3 VolumeNormal : TEXCOORD8;               // out of the crown's centre: every card's normal, a normal map on top
     nointerpolation float4 Crown : TEXCOORD9;      // the crown's centre (world) and half width: the depth every card
     nointerpolation float2 CrownSpan : TEXCOORD10; // writes; and its half height, its centre's view depth
+    float4 MotionNow : TEXCOORD11;                 // this frame's clip position without jitter (common.fx MotionClip)
+    float4 MotionBefore : TEXCOORD12;              // last frame's: last frame's wind (PrevMotionClip)
 };
 
 
@@ -89,10 +91,16 @@ VSOutput CardVertex(MeshPartEntry part, uint vertexID, row_major matrix World)
 
     // Trunk sway — stronger at height, zero at base
     // The whole tree bends about its base in the scene wind (TreeSway, common.fx); foliage rides the same bend
-    worldPos.xyz += TreeSway(worldPos.xyz, treeOrigin);
+    float3 rest = worldPos.xyz;
+    float push = WindPush(treeOrigin.xz);
+    worldPos.xyz += TreeSwayIn(rest, treeOrigin, push, WindNow());
 
     output.WorldPos = worldPos;
     output.Position = mul(mul(worldPos, View), Projection);
+
+    // Where it was last frame: a tree's far cards never move, so only last frame's wind (common.fx TreeSwayedBefore)
+    output.MotionNow = MotionClip(worldPos.xyz);
+    output.MotionBefore = PrevMotionClip(TreeSwayedBefore(rest, treeOrigin, push));
 
     output.TreeTint = TreeTint(treeOrigin);
 
@@ -201,6 +209,7 @@ struct PSOutput
     float  Depth : SV_Target3;
     uint   EntityId : SV_Target4;
     float2 Displacement : SV_Target5;
+    float2 Motion : SV_Target6;     // last frame's UV minus this frame's (MotionVectors=true)
 };
 
 SamplerState Sampler : register(s0);
@@ -300,6 +309,7 @@ PSOutput PS(VSOutput input)
     output.Depth = input.CrownSpan.y - halfWidth * (bulge - 0.6 * (1.0 - aoValue));
     output.Displacement = float2(0, 0);
     output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu) | (2u << 30);   // class 2: vegetation (decals_cs.hlsl receivers)
+    output.Motion = MotionVector(input.MotionNow, input.MotionBefore);
     return output;
 }
 

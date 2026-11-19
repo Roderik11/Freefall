@@ -31,7 +31,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=6, LodFade=true)
+// @RenderState(RenderTargets=6, LodFade=true, MotionVectors=true)
 
 // Trunk/Branch GBuffer shader — based on gbuffer.fx with:
 // - Wind sway animation (low-frequency, large-scale)
@@ -57,6 +57,8 @@ struct VSOutput
     nointerpolation uint TransformSlot : TEXCOORD4;
     nointerpolation uint MeshPartIdx : TEXCOORD5;
     nointerpolation uint LodFade : TEXCOORD6;   // DrawEntryFade (0 = no LOD crossfade)
+    float4 MotionNow : TEXCOORD7;               // this frame's clip position without jitter (common.fx MotionClip)
+    float4 MotionBefore : TEXCOORD8;            // last frame's: last frame's transform and wind (PrevMotionClip)
 };
 
 
@@ -105,7 +107,14 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     // Trunk sway — stronger at height, zero at base
     // The whole tree bends about its base in the scene wind (TreeSway, common.fx); foliage rides the same bend
     worldPos.xyz += TreeSway(worldPos.xyz, float3(World._41, World._42, World._43));
-    
+
+    // Where it was last frame: last frame's transform and wind (this frame's push, common.fx TreeSwayedBefore)
+    row_major matrix prevWorld = PrevWorldMatrix(desc.TransformSlot, World);
+    float3 prevOrigin = float3(prevWorld._41, prevWorld._42, prevWorld._43);
+    float3 prevPos = TreeSwayedBefore(mul(float4(pos, 1.0f), prevWorld).xyz, prevOrigin, WindPush(prevOrigin.xz));
+    output.MotionNow = MotionClip(worldPos.xyz);
+    output.MotionBefore = PrevMotionClip(prevPos);
+
     output.WorldPos = worldPos;
     output.Position = mul(mul(worldPos, View), Projection);
     output.Normal = mul(norm, W3);
@@ -126,7 +135,8 @@ struct PSOutput
     float4 Data : SV_Target2;
     float  Depth : SV_Target3;
     uint   EntityId : SV_Target4;
-    float2 Displacement : SV_Target5;    
+    float2 Displacement : SV_Target5;
+    float2 Motion : SV_Target6;     // last frame's UV minus this frame's (MotionVectors=true)
 };
 
 SamplerState Sampler : register(s0);
@@ -226,6 +236,7 @@ PSOutput PS(VSOutput input)
     output.Depth = input.Depth;
     output.Displacement = float2(0,0);
     output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);
+    output.Motion = MotionVector(input.MotionNow, input.MotionBefore);
     return output;
 }
 

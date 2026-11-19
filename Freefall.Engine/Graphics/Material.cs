@@ -693,8 +693,9 @@ namespace Freefall.Graphics
         }
 
         // The deferred renderer's targets, in the order it binds them (DeferredRenderer.CreateRenderTextures):
-        // 3-6 = the G-buffer (Albedo, Normals, Data, DepthGBuffer, EntityId, Height; always all six bound, a shader with
-        // fewer outputs gets no writes to the rest), 2 = the forward pass (Composite +
+        // 3-7 = the G-buffer (Albedo, Normals, Data, DepthGBuffer, EntityId, Height, Motion; always all seven bound, a
+        // shader with fewer outputs gets no writes to the rest; Motion only from an effect that says MotionVectors=true),
+        // 2 = the forward pass (Composite +
         // EntityId), 1 = Composite (forward and post-process passes) or Albedo (transparent G-buffer pass): both
         // R16G16B16A16_Float. A pipeline's formats must match the bound targets'. Until 2026-10-17 the count of 1 and
         // 2 declared R8G8B8A8_UNorm and EntityId R32_Float while the targets are float16 and R32_UInt (undefined in
@@ -703,8 +704,11 @@ namespace Freefall.Graphics
         private static readonly Format[] GBufferFormats =
         {
             Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm,
-            Format.R32_Float, Format.R32_UInt, Format.R16G16_Float,
+            Format.R32_Float, Format.R32_UInt, Format.R16G16_Float, Format.R16G16_Float,
         };
+
+        /// <summary>The G-buffer's motion target (DeferredRenderer.Motion): written only by effects with MotionVectors=true.</summary>
+        internal const int MotionTarget = 6;
 
         /// <summary>
         /// The blend state fitted to the bound targets:
@@ -714,9 +718,12 @@ namespace Freefall.Graphics
         /// - no writes to the targets past the shader's own count (<paramref name="written"/>): a G-buffer shader with 4
         ///   outputs (grass, the sky) is drawn with all six G-buffer targets bound, so its pipeline names all six.
         /// The other targets keep the blend as it was (each its own copy of target 0's when it was shared).
+        /// - the G-buffer's motion target (<see cref="MotionTarget"/>) written, unblended, when the effect says
+        ///   MotionVectors=true (<paramref name="motion"/>), whatever its count: grass writes four targets and motion.
         /// </summary>
-        private static BlendDescription FitBlendToTargets(BlendDescription blend, Format[] formats, int written)
+        private static BlendDescription FitBlendToTargets(BlendDescription blend, Format[] formats, int written, bool motion = false)
         {
+            motion &= formats.Length > MotionTarget && ReferenceEquals(formats, GBufferFormats);
             bool integer = false;
             foreach (var f in formats) integer |= IsIntegerFormat(f);
             if (!integer && written >= formats.Length) return blend;
@@ -736,7 +743,13 @@ namespace Freefall.Graphics
                     rt.BlendEnable = false;
                     rt.LogicOpEnable = false;
                 }
-                if (i >= written)
+                if (motion && i == MotionTarget)
+                {
+                    rt.BlendEnable = false;
+                    rt.LogicOpEnable = false;
+                    rt.RenderTargetWriteMask = ColorWriteEnable.All;
+                }
+                else if (i >= written)
                     rt.RenderTargetWriteMask = ColorWriteEnable.None;
                 blend.RenderTarget[i] = rt;
             }
@@ -933,7 +946,9 @@ namespace Freefall.Graphics
                 var passDepthFormat = depthFormat;
                 var passDepthDesc = depthDesc;
                 var passRasterDesc = rasterizerDesc;
-                
+                // The G-buffer's motion target, written by the effect's own colour passes (not a depth-only one)
+                bool passMotion = renderState.MotionVectors && currentPass.RenderState?.BlendMode != "NoColor";
+
                 // Per-pass render state override (from SetRenderState() in pass block)
                 var passRS = currentPass.RenderState;
                 if (passRS != null)
@@ -1030,7 +1045,7 @@ namespace Freefall.Graphics
                         MeshShader = currentPass.MeshShader!.Bytecode,
                         PixelShader = currentPass.PixelShader?.Bytecode ?? default,
                         RasterizerState = passRasterDesc,
-                        BlendState = FitBlendToTargets(passBlendDesc, passRtvFormats, passWritten),
+                        BlendState = FitBlendToTargets(passBlendDesc, passRtvFormats, passWritten, passMotion),
                         DepthStencilState = passDepthDesc,
                         RenderTargetFormats = passRtvFormats,
                         DepthStencilFormat = passDepthFormat,
@@ -1074,7 +1089,7 @@ namespace Freefall.Graphics
                     psoDesc.DepthStencilFormat = passDepthFormat;
                     psoDesc.DepthStencilState = passDepthDesc;
                     psoDesc.RasterizerState = passRasterDesc;
-                    psoDesc.BlendState = FitBlendToTargets(passBlendDesc, passRtvFormats, passWritten);
+                    psoDesc.BlendState = FitBlendToTargets(passBlendDesc, passRtvFormats, passWritten, passMotion);
                     
                     set.Solid[passIndex] = MakePipeline(passName, () => new PipelineState(device, rootSignature, psoDesc, passName));
 

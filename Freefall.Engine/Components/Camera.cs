@@ -17,6 +17,20 @@ namespace Freefall.Components
         public Matrix4x4 View { get; private set; }
         public Matrix4x4 Projection { get; private set; }
 
+        /// <summary>
+        /// <see cref="Projection"/> without <see cref="Jitter"/>: what motion vectors are measured with (both the
+        /// frames' jitter left out, as DLSS and FSR take them).
+        /// </summary>
+        public Matrix4x4 UnjitteredProjection { get; private set; }
+
+        /// <summary>
+        /// This frame's sub-pixel offset of the projection in NDC units (2 × pixels / render width, −2 × pixels /
+        /// render height), set by the renderer before it draws while a temporal upscaler wants one
+        /// (DeferredRenderer.JitterPixels); zero otherwise. Every pass draws and reconstructs with it, so they agree;
+        /// only the motion vectors leave it out.
+        /// </summary>
+        public Vector2 Jitter { get; set; }
+
         // Position/Forward/Right convenience properties that map to Transform
         public Vector3 Position
         {
@@ -103,8 +117,13 @@ namespace Freefall.Components
             // Create reverse-Z projection matrix (near→1.0, far→0.0)
             // Can't use CreatePerspectiveFieldOfViewLeftHanded — it validates near < far
             float vFOV = FieldOfView * (MathF.PI / 180f);
-            Projection = CreateReverseZPerspectiveLH(vFOV, AspectRatio, NearPlane, FarPlane);
-        
+            UnjitteredProjection = CreateReverseZPerspectiveLH(vFOV, AspectRatio, NearPlane, FarPlane);
+            // The sub-pixel offset a temporal upscaler asks for (Jitter, set by the renderer): NDC = x·w / z + M31
+            var projection = UnjitteredProjection;
+            projection.M31 += Jitter.X;
+            projection.M32 += Jitter.Y;
+            Projection = projection;
+
             // radius² / distance² * FoVFactor = squared screen size, where screen size is the bounding
             // sphere diameter as a fraction of viewport height. Kept squared so LOD selection needs no sqrt.
             FoVFactor = 1f / MathF.Tan(vFOV * 0.5f);

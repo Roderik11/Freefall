@@ -46,6 +46,18 @@ namespace Freefall.Graphics
         public uint SrvIndex => _srvIndices[Engine.FrameIndex % FrameCount];
 
         /// <summary>
+        /// Bindless SRV index of last frame's buffer, which holds every slot as last frame drew it (each frame's buffer
+        /// is brought up to date at its own <see cref="Upload"/>): the previous transforms of the motion vectors. The
+        /// GPU is done with the frame before last before this frame writes (RenderView.Prepare), so nothing rewrites
+        /// it while this frame reads it. For two ticks after a <see cref="Grow"/> the new buffers are not all filled
+        /// yet: then the current one, as if nothing had moved.
+        /// </summary>
+        public uint PreviousSrvIndex => Engine.TickCount - _grownTick <= 2
+            ? SrvIndex
+            : _srvIndices[(Engine.FrameIndex + FrameCount - 1) % FrameCount];
+        private long _grownTick = long.MinValue / 2;
+
+        /// <summary>
         /// Frame index of last BulkWrite/Upload. Used to avoid redundant writes within a frame.
         /// </summary>
         public int LastWriteFrame = -1;
@@ -58,6 +70,9 @@ namespace Freefall.Graphics
         /// write. The current frame's slot before the first.
         /// </summary>
         public uint WrittenSrvIndex => _writtenSlot >= 0 ? _srvIndices[_writtenSlot] : SrvIndex;
+
+        /// <summary>Whether <see cref="BulkWriteNext"/> has written a slot yet (<see cref="WrittenSrvIndex"/> is one).</summary>
+        public bool Written => _writtenSlot >= 0;
 
         /// <summary>
         /// Current capacity in number of elements.
@@ -220,6 +235,7 @@ namespace Freefall.Graphics
 
             _capacity = target;
             AllocateGPUResources(target);
+            _grownTick = Engine.TickCount;
 
             // Re-upload all existing data to new buffers: everything dirty for all frames
             for (int f = 0; f < FrameCount; f++)

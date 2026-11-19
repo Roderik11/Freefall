@@ -313,6 +313,9 @@ namespace Freefall.Graphics
                             case "LodFade":
                                 state.LodFade = bool.Parse(value);
                                 break;
+                            case "MotionVectors":
+                                state.MotionVectors = bool.Parse(value);
+                                break;
                         }
                     }
                 }
@@ -408,5 +411,13 @@ namespace Freefall.Graphics
         /// Without it the instances switch at once.
         /// </summary>
         public bool LodFade { get; set; }
+
+        /// <summary>
+        /// The effect's G-buffer passes write their surface's own motion into the motion target (SV_Target6, last
+        /// frame's UV minus this frame's, without jitter: motion_cs.hlsl), for surfaces that move on their own (moved
+        /// entities, posed characters, plants in the wind). Without it the pixels get the camera's motion alone,
+        /// which is right for everything that stands still. Depth-only passes (Blend=NoColor) never write it.
+        /// </summary>
+        public bool MotionVectors { get; set; }
     }
 }

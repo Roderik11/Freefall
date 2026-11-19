@@ -75,6 +75,69 @@ cbuffer SceneConstants : register(b0)
     float FarTierBand;                 // over how many metres they dither into each other; 0 = no far tier
     float FarTierCell;                 // metres a side of a cell: the unit a far mesh's vertices and the instances fade by
     uint FarTierProfilesIdx;           // StructuredBuffer<float2> (from, band) per profile (FarTier.ProfilesSrv); 0 = profile 0 only
+
+    // ── Motion vectors (DeferredRenderer, set per view) — MotionClip, PrevMotionClip, MotionVector below ──
+    row_major float4x4 MotionVP;       // this frame's view-projection without translation or jitter
+    row_major float4x4 PrevMotionVP;   // last frame's, the same way (this frame's when there is no last frame)
+    float3 PrevCamPos;                 // where the camera was last frame
+    uint PrevTransformsIdx;            // StructuredBuffer<float4x4>: last frame's transforms (TransformBuffer.PreviousSrvIndex); 0 = none
+    uint FrameTick;                    // Engine.TickCount: tells a bone pose written this frame (PreviousBones)
+    float3 PrevWindDirection;          // last frame's WindDirection, WindStrength, WindPhase, WindOffset (WindBefore)
+    float PrevWindStrength;
+    float2 PrevWindOffset;
+    float PrevWindPhase;
+}
+
+// ── Motion vectors: an effect with MotionVectors=true writes its surface's own motion into the G-buffer's SV_Target6 ──
+
+// This frame's and last frame's clip position of a vertex for the motion vectors, without jitter. Relative to each
+// frame's camera: world coordinates kilometres out would lose the millimetres the difference is made of.
+float4 MotionClip(float3 worldPos)
+{
+    return mul(float4(worldPos - CamPos, 1.0), MotionVP);
+}
+
+float4 PrevMotionClip(float3 prevWorldPos)
+{
+    return mul(float4(prevWorldPos - PrevCamPos, 1.0), PrevMotionVP);
+}
+
+// What the motion target holds (motion_cs.hlsl): last frame's UV minus this frame's, from the two clip positions
+// interpolated to the pixel. Behind last frame's camera there was no picture of it: no motion then.
+float2 MotionVector(float4 clipNow, float4 clipBefore)
+{
+    float2 now = clipNow.xy / clipNow.w;
+    float2 before = clipBefore.w > 0.0 ? clipBefore.xy / clipBefore.w : now;
+    return (before - now) * float2(0.5, -0.5);
+}
+
+// Last frame's world matrix of a transform slot, or this frame's where there is none: a slot taken since holds
+// identity (a slot's value while free) or zeros there, and so does a slot whose object really sits at the origin
+// unrotated, where taking this frame's matrix loses at most one frame of its motion.
+row_major float4x4 PrevWorldMatrix(uint slot, row_major float4x4 world)
+{
+    if (PrevTransformsIdx == 0)
+        return world;
+    StructuredBuffer<row_major float4x4> previous = ResourceDescriptorHeap[PrevTransformsIdx];
+    row_major float4x4 m = previous[slot];
+    bool identity = all(m[0] == float4(1, 0, 0, 0)) && all(m[1] == float4(0, 1, 0, 0))
+                 && all(m[2] == float4(0, 0, 1, 0)) && all(m[3] == float4(0, 0, 0, 1));
+    return m._44 == 0.0 || identity ? world : m;
+}
+
+// The bone buffer of a character's pose last frame. A pose writes a stamp after the bones (Animator.Pose, the buffer's
+// last element): the tick, and the slot the pose before went to. Posed this tick: that slot. Not posed this tick
+// (posed by turns, or still): the same pose showed last frame. 0 (no pose) stays 0.
+uint PreviousBones(uint bonesIdx)
+{
+    if (bonesIdx == 0u)
+        return 0u;
+    StructuredBuffer<row_major float4x4> bones = ResourceDescriptorHeap[NonUniformResourceIndex(bonesIdx)];
+    uint count, stride;
+    bones.GetDimensions(count, stride);
+    row_major float4x4 stamp = bones[count - 1u];
+    uint previous = asuint(stamp._12);
+    return asuint(stamp._11) == FrameTick && previous != 0u ? previous : bonesIdx;
 }
 
 // ── Large-scale variation of the ground and what grows on it (gputerrain.fx, grass cards, blades, flowers) ──
@@ -150,6 +213,36 @@ bool FarTreeExposure(float flag, out float exposure)
 // radians while the wind changes and scrubs the animation), never a wave over dot(position, WindDirection) (far from
 // the origin it races through hundreds of radians whenever a transition turns the wind).
 
+// The wind of one frame. The functions below take one, so the motion vectors can put a vertex where last frame's wind
+// had it (WindBefore); their plain forms take this frame's (WindNow), as every caller did before.
+struct WindFrame
+{
+    float3 Direction;
+    float Strength;
+    float Phase;
+    float2 Offset;
+};
+
+WindFrame WindNow()
+{
+    WindFrame w;
+    w.Direction = WindDirection;
+    w.Strength = WindStrength;
+    w.Phase = WindPhase;
+    w.Offset = WindOffset;
+    return w;
+}
+
+WindFrame WindBefore()
+{
+    WindFrame w;
+    w.Direction = PrevWindDirection;
+    w.Strength = PrevWindStrength;
+    w.Phase = PrevWindPhase;
+    w.Offset = PrevWindOffset;
+    return w;
+}
+
 // Value noise whose lattice repeats every 'period' cells, for patterns scrolled by WindOffset (which wraps every 200 m)
 float PeriodicNoise(float2 p, float period)
 {
@@ -166,38 +259,55 @@ float PeriodicNoise(float2 p, float period)
 // Gusts at a place, 0..1: irregular fronts (~20 m) with smaller eddies (~8 m) in them, scrolled downwind by
 // WindOffset and slowly changing shape on WindPhase. The lattices repeat every 200 m, the offset's wrap. (Two sine
 // waves did this first: the field rolled in even bands and everything wiggled to one rhythm.)
+float GustPatternIn(float2 p, WindFrame w)
+{
+    float2 q = p - w.Offset;
+    float fronts = PeriodicNoise(q / 20.0, 10.0);
+    float eddies = PeriodicNoise(q / 8.0 + float2(w.Phase * 0.11, -w.Phase * 0.07), 25.0);
+    return smoothstep(0.2, 0.8, fronts * 0.65 + eddies * 0.35);
+}
+
 float GustPattern(float2 p)
 {
-    float2 q = p - WindOffset;
-    float fronts = PeriodicNoise(q / 20.0, 10.0);
-    float eddies = PeriodicNoise(q / 8.0 + float2(WindPhase * 0.11, -WindPhase * 0.07), 25.0);
-    return smoothstep(0.2, 0.8, fronts * 0.65 + eddies * 0.35);
+    return GustPatternIn(p, WindNow());
 }
 
 // How hard the wind pushes at a place, gusts and a little springiness: where a front is arriving the push runs ahead
 // of it, where one has passed it swings back below the base. The air that passed here 0.6 s ago is at p + wind x 0.6 s.
+float WindPushIn(float2 p, WindFrame w)
+{
+    float gust = GustPatternIn(p, w);
+    float before = GustPatternIn(p + w.Direction.xz * w.Strength * 0.6, w);
+    return clamp(gust + 0.7 * (gust - before), -0.2, 1.4);
+}
+
 float WindPush(float2 p)
 {
-    float gust = GustPattern(p);
-    float before = GustPattern(p + WindDirection.xz * WindStrength * 0.6);
-    return clamp(gust + 0.7 * (gust - before), -0.2, 1.4);
+    return WindPushIn(p, WindNow());
 }
 
 // GrassWind for parts rooted close together (a clump's blades, a plant's stems), with the push looked up once at
 // their common root (two gust noises per lookup, which per vertex were most of the procedural grass' cost): the sway
-// at the tip per metre of height, so GrassWind = GrassSway x t² x height
-float3 GrassSway(float push, float phase)
+// at the tip per metre of height, so GrassWind = GrassSway x t² x height. For the motion vectors last frame's sway takes
+// this frame's push: the gust pattern drifts a few centimetres a frame across fronts tens of metres wide, while the
+// flutter's phase is what moves the tip from frame to frame.
+float3 GrassSwayIn(float push, float phase, WindFrame w)
 {
-    float s = saturate(WindStrength / 12.0);                                    // calm .. gale
-    float2 dir = WindDirection.xz;
+    float s = saturate(w.Strength / 12.0);                                      // calm .. gale
+    float2 dir = w.Direction.xz;
     float2 across = float2(-dir.y, dir.x);
     float lean = s * (0.25 + 0.75 * push) * 0.6;
     float rate = 0.75 + 0.5 * frac(phase * 7.13);
-    float wave = sin(WindPhase * 4.0 * rate + phase) * 0.65 + sin(WindPhase * 6.7 * rate + phase * 2.3) * 0.35;
+    float wave = sin(w.Phase * 4.0 * rate + phase) * 0.65 + sin(w.Phase * 6.7 * rate + phase * 2.3) * 0.35;
     float flutter = wave * (0.02 + 0.05 * s) * (0.3 + 0.7 * saturate(push));
-    float calm = saturate(1.0 - WindStrength / 0.5);                           // no direction to flutter across
+    float calm = saturate(1.0 - w.Strength / 0.5);                             // no direction to flutter across
     float2 offset = dir * lean + across * flutter * (1.0 - calm) + float2(flutter, flutter * 0.5) * calm;
     return float3(offset.x, -0.3 * lean * lean, offset.y);   // bending over costs a little height
+}
+
+float3 GrassSway(float push, float phase)
+{
+    return GrassSwayIn(push, phase, WindNow());
 }
 
 // How a grass blade, card or flower stem sways at height fraction t of a part 'height' tall rooted at 'root': a lean
@@ -212,22 +322,41 @@ float3 GrassWind(float3 root, float t, float height, float phase)
 // foliage alike, so a crown rides with its trunk. The bend grows with the square of the height above the base
 // (15 m up: 1, capped at 4); downwind with the push at the tree, plus a slow swing on two rhythms with a per-tree
 // phase. A breeze moves a 15 m point ~0.15 m, a gale ~0.9 m. Bending keeps the trunk's length (it drops a little).
-float3 TreeSway(float3 worldPos, float3 origin)
+float3 TreeSwayIn(float3 worldPos, float3 origin, float push, WindFrame w)
 {
     float h = max(0.0, worldPos.y - origin.y);
     float bend = min((h / 15.0) * (h / 15.0), 4.0);
-    float s = saturate(WindStrength / 12.0);
+    float s = saturate(w.Strength / 12.0);
     float treePhase = MacroHash(origin.xz) * 6.2831853;
-    float push = WindPush(origin.xz);
-    float swing = sin(WindPhase * 0.9 + treePhase) * 0.6 + sin(WindPhase * 1.53 + treePhase * 1.7) * 0.4;
-    float calm = saturate(1.0 - WindStrength / 0.5);
-    float2 dir = WindDirection.xz;
+    float swing = sin(w.Phase * 0.9 + treePhase) * 0.6 + sin(w.Phase * 1.53 + treePhase * 1.7) * 0.4;
+    float calm = saturate(1.0 - w.Strength / 0.5);
+    float2 dir = w.Direction.xz;
     float2 across = float2(-dir.y, dir.x);
     float2 d = (dir * (s * (0.3 + 0.5 * push)) + (dir * 0.6 + across * 0.4) * swing * (0.05 + 0.25 * s)) * (1.0 - calm)
              + float2(swing, swing * 0.5) * 0.03 * calm;
     float3 offset = float3(d.x, 0, d.y) * bend;
     offset.y = -0.5 * dot(offset.xz, offset.xz) / max(h, 1.0);
     return offset;
+}
+
+float3 TreeSway(float3 worldPos, float3 origin)
+{
+    return TreeSwayIn(worldPos, origin, WindPush(origin.xz), WindNow());
+}
+
+// A tree's vertex as last frame's wind had it, for the motion vectors: 'swayed' is this frame's place with this frame's
+// TreeSway added, 'rest' the place without it (last frame's transform), 'sway' what was added. The push is this
+// frame's (see GrassSwayIn).
+float3 TreeSwayedBefore(float3 rest, float3 origin, float push)
+{
+    return rest + TreeSwayIn(rest, origin, push, WindBefore());
+}
+
+// Per-vertex screen motion (last frame's UV minus this frame's) for parts too small for the motion to change across a
+// triangle: grass blades, flower stems. Larger surfaces pass both clip positions to the pixel (MotionClip).
+float2 MotionOfVertex(float3 worldNow, float3 worldBefore)
+{
+    return MotionVector(MotionClip(worldNow), PrevMotionClip(worldBefore));
 }
 // Material data for bindless texture lookup via Material ID indirection
 // 80 bytes — matches C# MaterialData layout exactly

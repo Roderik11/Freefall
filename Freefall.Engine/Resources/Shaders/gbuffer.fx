@@ -31,7 +31,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=6, LodFade=true)
+// @RenderState(RenderTargets=6, LodFade=true, MotionVectors=true)
 
 
 // Helper to get material from instance's MaterialID (override common.fx version)
@@ -57,6 +57,8 @@ struct VSOutput
     nointerpolation uint TransformSlot : TEXCOORD4;
     nointerpolation uint MeshPartIdx : TEXCOORD5;
     nointerpolation uint LodFade : TEXCOORD6;   // DrawEntryFade (0 = no LOD crossfade)
+    float4 MotionNow : TEXCOORD7;               // this frame's clip position without jitter (common.fx MotionClip)
+    float4 MotionBefore : TEXCOORD8;            // last frame's, through last frame's transform (PrevMotionClip)
 };
 
 struct PSOutput
@@ -67,6 +69,7 @@ struct PSOutput
     float  Depth : SV_Target3;
     uint   EntityId : SV_Target4;
     float2 Displacement : SV_Target5;
+    float2 Motion : SV_Target6;     // last frame's UV minus this frame's (MotionVectors=true)
 };
 
 VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -128,7 +131,12 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     float4 worldPos = mul(float4(pos, 1.0f), World);
     output.WorldPos = worldPos;
     output.Position = mul(mul(worldPos, View), Projection);
-    
+
+    // Where this vertex is and was, for the motion vectors: a moved entity's last frame's transform
+    float4 prevWorldPos = mul(float4(pos, 1.0f), PrevWorldMatrix(slot, World));
+    output.MotionNow = MotionClip(worldPos.xyz);
+    output.MotionBefore = PrevMotionClip(prevWorldPos.xyz);
+
     output.Normal = mul(norm, W3);
     float3 push = norm;
     if (part.PushNormBufferIdx != 0)
@@ -360,6 +368,7 @@ PSOutput PS(VSOutput input)
     output.Depth = depth;
     output.Displacement = displacement;
     output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);
+    output.Motion = MotionVector(input.MotionNow, input.MotionBefore);
 
     return output;
 }

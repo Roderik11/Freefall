@@ -469,6 +469,13 @@ namespace Freefall.Components
                 if (entry.Buffer.LastWriteFrame != Engine.FrameIndex)
                 {
                     GetPose(skeleton, entry.StagingMatrices);
+                    // The stamp after the bones: this tick, and the slot the last pose went to (last frame's pose
+                    // when that was the frame before), for the motion vectors (common.fx PreviousBones)
+                    entry.StagingMatrices[^1] = new Matrix4x4
+                    {
+                        M11 = BitConverter.UInt32BitsToSingle((uint)Engine.TickCount),
+                        M12 = BitConverter.UInt32BitsToSingle(entry.Buffer.Written ? entry.Buffer.WrittenSrvIndex : 0u),
+                    };
                     entry.Buffer.BulkWriteNext(entry.StagingMatrices);
                     entry.Buffer.LastWriteFrame = Engine.FrameIndex;
                 }
@@ -1299,12 +1306,14 @@ namespace Freefall.Components
             if (_boneBuffers.TryGetValue(skeleton, out var existing))
                 return existing;
 
+            // One element past the bones: the pose's stamp (Pose), the buffer's last element, where common.fx
+            // PreviousBones finds it by the buffer's length
             int boneCount = skeleton.Bones.Length;
-            var buffer = new StreamingBuffer<Matrix4x4>(Engine.Device, boneCount);
+            var buffer = new StreamingBuffer<Matrix4x4>(Engine.Device, boneCount + 1);
             var entry = new BoneBufferEntry
             {
                 Buffer = buffer,
-                StagingMatrices = new Matrix4x4[boneCount]
+                StagingMatrices = new Matrix4x4[boneCount + 1]
             };
             _boneBuffers[skeleton] = entry;
             return entry;

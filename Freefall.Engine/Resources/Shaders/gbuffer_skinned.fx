@@ -31,7 +31,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=6, LodFade=true)
+// @RenderState(RenderTargets=6, LodFade=true, MotionVectors=true)
 
 inline MaterialData GetMaterial(uint id)
 {
@@ -94,6 +94,8 @@ struct VSOutput
     nointerpolation uint MeshPartIdx : TEXCOORD5;
     nointerpolation uint PickThrough : TEXCOORD6;   // 1 = part of the character the pick sees through (see PS)
     nointerpolation uint LodFade : TEXCOORD7;       // DrawEntryFade (0 = no LOD crossfade)
+    float4 MotionNow : TEXCOORD8;                   // this frame's clip position without jitter (common.fx MotionClip)
+    float4 MotionBefore : TEXCOORD9;                // last frame's: last frame's pose and transform (PrevMotionClip)
 };
 
 
@@ -153,10 +155,12 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     // descriptor 0 instead was an invalid resource to GPU-based validation. A piece that moves as cloth has its
     // vertices' places from the simulation instead.
     float3 clothPos, clothNorm;
+    float3 prevPos;     // the vertex in last frame's pose, for the motion vectors
     if (ClothVertex(desc.CustomDataIdx, vertexID, clothPos, clothNorm))
     {
         pos = clothPos;
         norm = clothNorm;
+        prevPos = pos;  // the cloth's own motion is not kept: only its object's and the camera's
     }
     else if (desc.BoneBufferIdx != 0u)
     {
@@ -185,16 +189,40 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
         skinnedNormal += mul(norm, (float3x3)bone2) * bw.Weights.z;
         skinnedNormal += mul(norm, (float3x3)bone3) * bw.Weights.w;
 
+        // Last frame's pose: skinned again only when the character was posed this frame (PreviousBones). A slot
+        // nothing was written to yet (a bone buffer just grown) holds zeros: this frame's pose then.
+        prevPos = skinned.xyz;
+        uint prevBonesIdx = PreviousBones(desc.BoneBufferIdx);
+        if (prevBonesIdx != desc.BoneBufferIdx)
+        {
+            StructuredBuffer<row_major matrix> before = ResourceDescriptorHeap[NonUniformResourceIndex(prevBonesIdx)];
+            matrix p0 = before[(uint)bw.BoneIDs.x];
+            matrix p1 = before[(uint)bw.BoneIDs.y];
+            matrix p2 = before[(uint)bw.BoneIDs.z];
+            matrix p3 = before[(uint)bw.BoneIDs.w];
+            float4 was = mul(float4(pos, 1), p0) * bw.Weights.x + mul(float4(pos, 1), p1) * bw.Weights.y
+                       + mul(float4(pos, 1), p2) * bw.Weights.z + mul(float4(pos, 1), p3) * bw.Weights.w;
+            if (p0._44 != 0.0)
+                prevPos = was.xyz;
+        }
+
         pos = skinned.xyz;
         norm = normalize(skinnedNormal);
     }
-    
+    else
+        prevPos = pos;
+
     // Apply world transform
     float4 worldPos = mul(float4(pos, 1.0f), World);
-    
+
     output.WorldPos = worldPos;
     output.Position = mul(mul(worldPos, View), Projection);
-    
+
+    // Where this vertex is and was: last frame's pose through last frame's transform
+    float4 prevWorldPos = mul(float4(prevPos, 1.0f), PrevWorldMatrix(slot, World));
+    output.MotionNow = MotionClip(worldPos.xyz);
+    output.MotionBefore = PrevMotionClip(prevWorldPos.xyz);
+
     output.Normal = mul(norm, W3);
     output.TexCoord = uv;
     output.TexCoord.y = 1 - output.TexCoord.y;
@@ -217,6 +245,7 @@ struct PSOutput
     float  Depth : SV_Target3;
     uint   EntityId : SV_Target4;
     float2 Displacement : SV_Target5;
+    float2 Motion : SV_Target6;     // last frame's UV minus this frame's (MotionVectors=true)
 };
 
 
@@ -453,7 +482,8 @@ PSOutput PS(VSOutput input)
     output.Depth = depth;
     output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu) | (3u << 30);   // class 3: characters (decals_cs.hlsl receivers)
     output.Displacement = displacement;
-    
+    output.Motion = MotionVector(input.MotionNow, input.MotionBefore);
+
     return output;
 }
 

@@ -559,7 +559,7 @@ namespace Freefall
             // F6: Cycle debug visualization mode
             if (Input.IsKeyPressed(Keys.F6))
             {
-                Settings.DebugVisualizationMode = (DebugVizMode)(((int)Settings.DebugVisualizationMode + 1) % 10);
+                Settings.DebugVisualizationMode = (DebugVizMode)(((int)Settings.DebugVisualizationMode + 1) % 11);
                 Debug.Log($"[Engine] Debug Viz: {Settings.DebugVisualizationMode}");
             }
             
@@ -694,7 +694,8 @@ namespace Freefall
         HeightMap = 6,
         RCDebug = 7,
         SkyVisibility = 8,          // light_directional_cs: the sky's share a surface sees past terrain and meshes
-        MeshSkyVisibility = 9       // the meshes' part of it alone (SkyCapture)
+        MeshSkyVisibility = 9,      // the meshes' part of it alone (SkyCapture)
+        Motion = 10                 // motion_cs CSMotionView: where each pixel came from (hue = direction, brightness = up to 16 px)
     }
 
     /// <summary>EngineSettings.ShadowReceiverCulling</summary>
@@ -757,6 +758,14 @@ namespace Freefall
              }
          }
          private float _renderScale = 1f;
+
+         /// <summary>
+         /// The camera moved by a sub-pixel amount each frame (DeferredRenderer.JitterPixels), as a temporal upscaler
+         /// needs. Until one exists (UPSCALING_PLAN.md stage 3) it is only for checking that the motion vectors leave it
+         /// out (DebugVizMode.Motion stays grey with a still camera): on its own the picture shakes.
+         /// </summary>
+         [System.ComponentModel.Description("Moves the camera by under a pixel each frame, as a temporal upscaler needs; on its own (no upscaler yet) the picture shakes. For testing.")]
+         public bool CameraJitter { get; set; } = false;
 
          public bool ShowGrid { get; set; } = true;                      // Show editor grid in scene view
          public bool ShowSystemGizmos { get; set; } = true;              // Markers systems draw in the scene view whatever is selected (Systems.Gizmos)

@@ -98,7 +98,7 @@ float PlantGrowth(DecoInstance di)
     return sqrt(min(1.0 / max(di.Kept, 1e-4), PLANT_MAX_GROWTH));
 }
 
-Stem MakeStem(DecoInstance di, DecoratorSlot slot, uint stem, float dist, float push)
+Stem MakeStem(DecoInstance di, DecoratorSlot slot, uint stem, float dist, float push, WindFrame wind)
 {
     uint h = pcg(asuint(di.InstanceSeed) ^ (stem * 0x9E3779B9u) ^ 0x51ED270Bu);
     Stem s;
@@ -114,7 +114,7 @@ Stem MakeStem(DecoInstance di, DecoratorSlot slot, uint stem, float dist, float 
     s.Phase = Rand(h) * 6.2831853;
     s.Width = max(0.004, dist * 0.0009);
     s.Brightness = lerp(0.8, 1.1, Rand(h));
-    s.Sway = GrassSway(push, s.Phase);
+    s.Sway = GrassSwayIn(push, s.Phase, wind);
     s.Hash = h;
     return s;
 }
@@ -151,7 +151,7 @@ void LeafVertex(inout PlantVertexData o, uint v, float3 base, float3 outDir, flo
 // rachis). The crown leans with the slope and a little its own way. The first version rose at 52..80 degrees with
 // every axis near vertical: every plant the same upright shuttlecock. The frond's length is the instance height;
 // its width the atlas' squeezed by FROND_WIDTH.
-PlantVertexData FernVertex(DecoInstance di, DecoratorSlot slot, uint vi, float push)
+PlantVertexData FernVertex(DecoInstance di, DecoratorSlot slot, uint vi, float push, WindFrame wind)
 {
     uint frond = vi / FROND_VERTS;
     uint v = vi % FROND_VERTS;
@@ -196,7 +196,7 @@ PlantVertexData FernVertex(DecoInstance di, DecoratorSlot slot, uint vi, float p
     float halfWidth = len * FROND_HALF_U / 0.98 * FROND_WIDTH;
     float sideSign = float(column) - 1.0;              // -1, 0, 1
     p += across * sideSign * halfWidth + normal * abs(sideSign) * halfWidth * FROND_CUP;
-    p += Wind(push, t, len * 0.6, phase);
+    p += WindIn(push, t, len * 0.6, phase, wind);
 
     PlantVertexData o;
     o.WorldPos = p;
@@ -233,7 +233,7 @@ uint3 FernTriangle(uint ti)
 // crossed at right angles (the parts atlas' spike cell: the ear with its awns, from the side). A sown field is even:
 // the culms stand nearly straight and nearly as tall as each other. The ear carries on from the culm's top and bends
 // over by a nod of its own, more towards its tip, the way a ripe ear hangs; the wind sways the culm and the ear with it.
-PlantVertexData GrainVertex(DecoInstance di, DecoratorSlot slot, uint vi, float dist, float push)
+PlantVertexData GrainVertex(DecoInstance di, DecoratorSlot slot, uint vi, float dist, float push, WindFrame wind)
 {
     uint culm = vi / GRAIN_VERTS;
     uint v = vi % GRAIN_VERTS;
@@ -252,7 +252,7 @@ PlantVertexData GrainVertex(DecoInstance di, DecoratorSlot slot, uint vi, float 
     float3 tint = slot.HealthyColor * lerp(0.82, 1.08, Rand(h));
     float culmLen = height * (1.0 - GRAIN_EAR);
     float earLen = height * GRAIN_EAR;
-    float3 sway = GrassSway(push, phase);
+    float3 sway = GrassSwayIn(push, phase, wind);
     float3 side = float3(-dir.z, 0, dir.x);
 
     StructuredBuffer<float4> colors = ResourceDescriptorHeap[BladeColorsSRV];
@@ -345,17 +345,17 @@ uint3 GrainTriangle(uint ti)
 }
 
 // Vertex 'vi' of a flower or spike plant: per stem the stalk, the leaves, then the bloom cap or the spike strips
-PlantVertexData PlantVertex(DecoInstance di, DecoratorSlot slot, uint vi, float dist, float push)
+PlantVertexData PlantVertex(DecoInstance di, DecoratorSlot slot, uint vi, float dist, float push, WindFrame wind)
 {
     if (di.Mode == MODE_FERNS)
-        return FernVertex(di, slot, vi, push);
+        return FernVertex(di, slot, vi, push, wind);
     if (di.Mode == MODE_GRAIN)
-        return GrainVertex(di, slot, vi, dist, push);
+        return GrainVertex(di, slot, vi, dist, push, wind);
 
     bool spikes = di.Mode == MODE_SPIKES;
     uint vertsPerStem = spikes ? SPIKE_VERTS : FLOWER_VERTS;
     uint v = vi % vertsPerStem;
-    Stem s = MakeStem(di, slot, vi / vertsPerStem, dist, push);
+    Stem s = MakeStem(di, slot, vi / vertsPerStem, dist, push, wind);
 
     StructuredBuffer<float4> colors = ResourceDescriptorHeap[BladeColorsSRV];
     float4 foliage = colors[di.SlotIdx * COLORS_PER_VARIANT + COLOR_FOLIAGE];
@@ -565,6 +565,7 @@ struct MSOutput
     float  Depth       : TEXCOORD1;
     float2 UV          : TEXCOORD2;
     nointerpolation uint TextureIdx : TEXCOORD3;   // parts atlas, 0 = flat colour
+    float2 Motion      : TEXCOORD4;     // last frame's UV minus this frame's (common.fx MotionOfVertex)
 };
 
 [outputtopology("triangle")]
@@ -592,7 +593,7 @@ void MS(
         GroupVertex(gtid, firstUnit, parts, partVerts, plant, plantVertex);
         PlantSetup p = gs_Plants[plant];
         StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
-        PlantVertexData pv = PlantVertex(p.Instance, slots[p.Instance.SlotIdx], plantVertex, p.Dist, p.Push);
+        PlantVertexData pv = PlantVertex(p.Instance, slots[p.Instance.SlotIdx], plantVertex, p.Dist, p.Push, WindNow());
         MSOutput o;
         o.Position = mul(float4(pv.WorldPos, 1.0), ViewProjection);
         o.Color = pv.Color * p.Variation;
@@ -601,6 +602,9 @@ void MS(
         o.Depth = o.Position.w;
         o.UV = pv.UV;
         o.TextureIdx = pv.Textured ? p.PartsIdx : 0;
+        // Last frame's place: the same vertex of the same plant in last frame's wind (this frame's push)
+        PlantVertexData before = PlantVertex(p.Instance, slots[p.Instance.SlotIdx], plantVertex, p.Dist, p.Push, WindBefore());
+        o.Motion = MotionOfVertex(pv.WorldPos, before.WorldPos);
         verts[gtid] = o;
     }
 
@@ -618,6 +622,7 @@ struct PSOutput
     float  Depth  : SV_Target3;
     uint   EntityId : SV_Target4;
     float2 Displacement : SV_Target5;
+    float2 Motion : SV_Target6;     // last frame's UV minus this frame's (MotionVectors=true)
 };
 
 PSOutput PS(MSOutput input, bool isFrontFace : SV_IsFrontFace)
@@ -644,6 +649,7 @@ PSOutput PS(MSOutput input, bool isFrontFace : SV_IsFrontFace)
     output.Depth = input.Depth;
     output.EntityId = 2u << 30;   // class 2: vegetation (decals_cs.hlsl receivers)
     output.Displacement = float2(0, 0);
+    output.Motion = input.Motion;
     return output;
 }
 
@@ -690,7 +696,7 @@ void MS_Shadow(
         PlantSetup p = gs_Plants[plant];
         StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
         StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
-        PlantVertexData pv = PlantVertex(p.Instance, slots[p.Instance.SlotIdx], plantVertex, p.Dist, p.Push);
+        PlantVertexData pv = PlantVertex(p.Instance, slots[p.Instance.SlotIdx], plantVertex, p.Dist, p.Push, WindNow());
         ShadowMSOutput o;
         o.Position = mul(float4(pv.WorldPos, 1.0), cascades[0].VP);
         o.UV = pv.UV;
@@ -716,7 +722,7 @@ void PS_Shadow(ShadowMSOutput input)
 
 // ─── Technique ─────────────────────────────────────────────────────────────
 
-// @RenderState(RenderTargets=4, CullMode=None)
+// @RenderState(RenderTargets=4, CullMode=None, MotionVectors=true)
 technique11 GrassPlants
 {
     pass Opaque

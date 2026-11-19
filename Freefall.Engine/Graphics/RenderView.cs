@@ -392,6 +392,10 @@ namespace Freefall.Graphics
 
                 // Wait for the GPU to be done with this specific frame buffer from the previous cycle
                 SyncFrame(_frameIndex);
+                // ... and with the frame before last: that one read the buffers this frame is about to write as its
+                // previous ones (StreamingBuffer.PreviousSrvIndex: last frame's transforms and bone poses, for the
+                // motion vectors). The frame-latency wait already keeps it done; this says so instead of relying on it.
+                SyncFrame((_frameIndex + 1) % FrameCount);
 
                 // Ensure GPU has finished any pending copy queue texture uploads before we render
                 _graphicsDevice.WaitForCopyQueue();

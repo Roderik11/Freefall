@@ -132,6 +132,7 @@ struct MSOutput
     nointerpolation uint SlotIdx : TEXCOORD8;
     nointerpolation float FadeFactor : TEXCOORD9;
     nointerpolation float3 Variation : TEXCOORD10;    // at the card's root: GroundVariation (common.fx) x the ground tint (spawn)
+    float2 Motion : TEXCOORD11;                       // last frame's UV minus this frame's (common.fx MotionOfVertex)
 };
 
 [outputtopology("triangle")]
@@ -232,13 +233,20 @@ void MS(
         worldNorm = di.TerrainNormal;
     }
 
-    // Wind
-    worldPos += GrassWind(di.Position, lp.y, scaleH, di.InstanceSeed * 6.2831853);   // the scene wind (common.fx), per card
+    // Wind: the scene wind (common.fx GrassWind, its push looked up once), per card; and where last frame's wind had
+    // the vertex, for the motion vectors (this frame's push, common.fx GrassSwayIn)
+    float push = WindPush(di.Position.xz);
+    float phase = di.InstanceSeed * 6.2831853;
+    float reach = lp.y * lp.y * scaleH;
+    float3 sway = GrassSway(push, phase);
+    float3 rest = worldPos;
+    worldPos += sway * reach;
 
     MSOutput o;
     float4 wp = float4(worldPos, 1.0);
     o.WorldPos = wp;
     o.Position = mul(wp, ViewProjection);
+    o.Motion = MotionOfVertex(worldPos, rest + GrassSwayIn(push, phase, WindBefore()) * reach);
     o.Normal = worldNorm;
     o.TexCoord = uv;
     o.Depth = o.Position.w;
@@ -269,7 +277,8 @@ struct PSOutput
     float4 Data   : SV_Target2;
     float  Depth  : SV_Target3;
     uint   EntityId : SV_Target4;
-    float2 Displacement : SV_Target5;    
+    float2 Displacement : SV_Target5;
+    float2 Motion : SV_Target6;     // last frame's UV minus this frame's (MotionVectors=true)
 };
 
 PSOutput PS(MSOutput input)
@@ -332,6 +341,7 @@ PSOutput PS(MSOutput input)
     output.Depth = dist;
     output.EntityId = 2u << 30;   // class 2: vegetation (decals_cs.hlsl receivers)
     output.Displacement = float2(0, 0);
+    output.Motion = input.Motion;
 
     return output;
 }
@@ -558,7 +568,7 @@ void PS_Shadow_SP(ShadowMSOutput input)
 
 // ─── Technique ─────────────────────────────────────────────────────────────
 
-// @RenderState(RenderTargets=4, CullMode=None)
+// @RenderState(RenderTargets=4, CullMode=None, MotionVectors=true)
 technique11 GroundCoverage
 {
     pass Opaque

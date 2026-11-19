@@ -85,6 +85,7 @@ struct BladeSetup
     float  Lean;
     float  Width;
     float3 Sway;            // the wind at the tip per metre of height (GrassSway)
+    float3 SwayBefore;      // the same in last frame's wind, for the motion vectors (GrassSwayIn, WindBefore)
     float  Brightness;
     uint   Clump;           // in gs_Clumps
 };
@@ -110,6 +111,7 @@ BladeSetup MakeBlade(ClumpSetup c, uint blade)
     // per radian)
     b.Width = max(lerp(0.008, 0.016, Rand(h)) * c.WidthScale, c.Dist * 0.0009);
     b.Sway = GrassSway(c.Push, phase);
+    b.SwayBefore = GrassSwayIn(c.Push, phase, WindBefore());
     b.Clump = 0;
     return b;
 }
@@ -189,6 +191,7 @@ struct MSOutput
     float3 BladeNormal : NORMAL;
     nointerpolation float3 TerrainNormal : TEXCOORD0;
     float  Depth       : TEXCOORD1;
+    float2 Motion      : TEXCOORD2;     // last frame's UV minus this frame's (common.fx MotionOfVertex)
 };
 
 [outputtopology("triangle")]
@@ -233,6 +236,8 @@ void MS(
         o.BladeNormal = normalize(faceN + side * sideSign * 0.4);
         o.TerrainNormal = c.TerrainNormal;
         o.Depth = o.Position.w;
+        // Last frame's place: the same blade in last frame's wind (BladePoint is linear in the sway)
+        o.Motion = MotionOfVertex(worldPos, worldPos + (b.SwayBefore - b.Sway) * (t * t * b.Height));
         verts[gtid] = o;
     }
 
@@ -250,6 +255,7 @@ struct PSOutput
     float  Depth  : SV_Target3;
     uint   EntityId : SV_Target4;
     float2 Displacement : SV_Target5;
+    float2 Motion : SV_Target6;     // last frame's UV minus this frame's (MotionVectors=true)
 };
 
 [earlydepthstencil]
@@ -267,6 +273,7 @@ PSOutput PS(MSOutput input, bool isFrontFace : SV_IsFrontFace)
     output.Depth = input.Depth;
     output.EntityId = 2u << 30;   // class 2: vegetation (decals_cs.hlsl receivers)
     output.Displacement = float2(0, 0);
+    output.Motion = input.Motion;
     return output;
 }
 
@@ -327,7 +334,7 @@ void PS_Shadow(ShadowMSOutput input)
 
 // ─── Technique ─────────────────────────────────────────────────────────────
 
-// @RenderState(RenderTargets=4, CullMode=None)
+// @RenderState(RenderTargets=4, CullMode=None, MotionVectors=true)
 technique11 GrassBlades
 {
     pass Opaque
