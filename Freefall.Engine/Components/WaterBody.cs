@@ -252,6 +252,9 @@ namespace Freefall.Components
             public float RipplesOriginX;   // the ripple grid's corner (world xz) and the metres it spans
             public float RipplesOriginZ;
             public float RipplesSpan;
+            public uint HullsSRV;          // Graphics.WaterHulls: where hulls keep the water out (0 = none)
+            public uint HullCount;
+            public float _hullPad0, _hullPad1;
         }
 
         protected override void Awake()
@@ -1517,6 +1520,8 @@ namespace Freefall.Components
                 RipplesOriginX = WaterRipples.Origin.X,
                 RipplesOriginZ = WaterRipples.Origin.Y,
                 RipplesSpan = WaterRipples.Span,
+                HullsSRV = WaterHulls.Srv,
+                HullCount = WaterHulls.Count,
             });
 
             CommandBuffer.Enqueue(mesh, _material, _params, Transform.TransformSlot);

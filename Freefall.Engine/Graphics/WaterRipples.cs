@@ -142,6 +142,8 @@ namespace Freefall.Graphics
             // Once a tick, by the first view drawn (the editor's other viewports read the same water)
             if (_steppedTick == Engine.TickCount) return;
             _steppedTick = Engine.TickCount;
+            // The hulls nearest the camera keep the water out (WaterHulls): measured from here
+            WaterHulls.Eye = camera;
             float dt = MathF.Min(Base.Time.SmoothDelta, 0.1f);
             int count = 0;
             bool live = Engine.Settings.WaterRipples;

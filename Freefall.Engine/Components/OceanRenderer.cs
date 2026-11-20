@@ -411,6 +411,9 @@ namespace Freefall.Components
             public float RipplesOriginX; // the ripple grid's corner (world xz) and the metres it spans
             public float RipplesOriginZ;
             public float RipplesSpan;
+            public uint HullsSRV;        // Graphics.WaterHulls: where hulls keep the water out (0 = none)
+            public uint HullCount;
+            public Vector2 _hullPad;
         }
 
         private const int GridSize = 128;
@@ -1093,6 +1096,8 @@ namespace Freefall.Components
                 RipplesOriginX = WaterRipples.Origin.X,
                 RipplesOriginZ = WaterRipples.Origin.Y,
                 RipplesSpan = WaterRipples.Span,
+                HullsSRV = WaterHulls.Srv,
+                HullCount = WaterHulls.Count,
             };
             _params.SetParameter("OceanData", data);
 

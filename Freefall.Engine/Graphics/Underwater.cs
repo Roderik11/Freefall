@@ -188,7 +188,7 @@ namespace Freefall.Graphics
             if (probes > 0)
             {
                 _probe.Transition(list, ResourceStates.UnorderedAccess);
-                _shader.Dispatch(_kProbe, list, 1);
+                _shader.Dispatch(_kProbe, list, (uint)(probes + 7) / 8);   // eight places a group (CSProbe)
                 list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_probe.Native)));
             }
             if (near)

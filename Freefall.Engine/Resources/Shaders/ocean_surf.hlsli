@@ -69,6 +69,9 @@ struct OceanData
     uint RipplesSRV;            // Graphics.WaterRipples: the ripples round the camera (water_ripples.hlsli); 0 = still
     float2 RipplesOrigin;       // the ripple grid's corner (world xz)
     float RipplesSpan;          // metres it spans
+    uint HullsSRV;              // Graphics.WaterHulls: where hulls keep the water out (water_hulls.hlsli); 0 = none
+    uint HullCount;
+    float2 _hullPad;
 };
 
 SamplerState OceanSampler : register(s0);

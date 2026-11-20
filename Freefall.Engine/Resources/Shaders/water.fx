@@ -39,6 +39,7 @@ cbuffer PushConstants : register(b3)
 #include "water_common.fx"
 #include "underwater.hlsli"
 #include "water_ripples.hlsli"
+#include "water_hulls.hlsli"
 // @RenderState(RenderTargets=1, CullMode=None)
 
 // Must match WaterBody.WaterData (C#)
@@ -80,6 +81,9 @@ struct WaterData
     uint RipplesSRV;            // Graphics.WaterRipples: the ripples round the camera (water_ripples.hlsli); 0 = still
     float2 RipplesOrigin;       // the ripple grid's corner (world xz)
     float RipplesSpan;          // metres it spans
+    uint HullsSRV;              // Graphics.WaterHulls: where hulls keep the water out (water_hulls.hlsli); 0 = none
+    uint HullCount;
+    float2 _hullPad;
 };
 
 SamplerState WaterSampler : register(s0);
@@ -534,6 +538,9 @@ PSOutput PS(VSOutput input, bool front : SV_IsFrontFace)
 
     float3 camPos = ViewInverse[3].xyz;
     float3 worldPos = input.WorldPos;
+    // Inside a boat's hull there is no water (WaterHulls)
+    if (InsideHull(water.HullsSRV, water.HullCount, worldPos))
+        discard;
     // How much sky this pixel of water sees past the terrain (per pixel: a lake is a few big triangles whose rim lies
     // under the banks, and per vertex those dark corners painted wedges across it)
     float skyVisible = SkyVisibility(worldPos, float3(0, 1, 0));
@@ -665,9 +672,12 @@ PSOutput PS(VSOutput input, bool front : SV_IsFrontFace)
     if (covered > 0.0)
         specular += WaterPointSpecular(rel, N, V, alpha, input.Position.xy * water.InvViewportSize, input.Depth) * covered;
 
+    // A boat's hull seen through the water fades within a metre of it (water_hulls.hlsli)
+    float clarity = WaterVisibilityOverHulls(water.HullsSRV, water.HullCount, water.DepthGBufferSRV, WaterSampler,
+        input.Position.xy * water.InvViewportSize, input.Depth, dist, worldPos, V, water.Visibility);
     WaterColumn column = GetWaterColumn(WaterSampler, water.DepthGBufferSRV, water.CompositeSRV,
         input.Position.xy * water.InvViewportSize, input.Depth, dist, abs(camPos.y - worldPos.y), N,
-        water.RefractionStrength, scatter, water.ShallowColor, water.Visibility, 1.0);
+        water.RefractionStrength, scatter, water.ShallowColor, clarity, 1.0);
 
     // Light scattered back from a bright shallow bed
     float shallow = exp(-max(column.bufDepth, 0.0) / max(0.01, water.Visibility)) * saturate(column.pathLen);

@@ -2,6 +2,7 @@
 #include "ocean_shade.hlsli"
 #include "underwater.hlsli"
 #include "water_ripples.hlsli"
+#include "water_hulls.hlsli"
 // Both faces: from under the sea its surface is seen from below (PS, Snell's window). A back face seen from above is a
 // crest folded over itself and is dropped, as the culling did before
 // @RenderState(RenderTargets=1, CullMode=None)
@@ -127,6 +128,9 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
     OceanData ocean = oceanData[input.InstanceIdx];
 
     if (OutsideSea(ocean, input.UndisplacedXZ.xy))
+        discard;
+    // Inside a ship's hull there is no sea (WaterHulls)
+    if (InsideHull(ocean.HullsSRV, ocean.HullCount, input.WorldPos))
         discard;
     // A back face over the eye is the sea seen from under it; one under the eye is a fold of a choppy crest
     bool fromBelow = !front;
@@ -286,9 +290,12 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
         }
     }
 
+    // A ship's hull seen through the water fades within a metre of it (water_hulls.hlsli)
+    float clarity = WaterVisibilityOverHulls(ocean.HullsSRV, ocean.HullCount, ocean.DepthGBufferSRV, OceanSampler,
+        input.Position.xy * ocean.InvViewportSize, input.Depth, dist, worldPos, V, ocean.ShoreFadeDepth);
     WaterColumn column = GetWaterColumn(OceanSampler, ocean.DepthGBufferSRV, ocean.CompositeSRV,
         input.Position.xy * ocean.InvViewportSize, input.Depth, dist, abs(camPos.y - worldPos.y), N,
-        ocean.RefractionStrength, scatter, ocean.ShallowColor, ocean.ShoreFadeDepth, seabedFade);
+        ocean.RefractionStrength, scatter, ocean.ShallowColor, clarity, seabedFade);
     float3 body = column.body;
     float edgeFade = column.edgeFade;
     float pathLen = column.pathLen;

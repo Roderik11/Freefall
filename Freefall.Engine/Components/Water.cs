@@ -62,8 +62,16 @@ namespace Freefall.Components
         /// sea's level, one river over another) the lowest that qualifies: the one the point is in or just over.
         /// </summary>
         public static bool SurfaceAt(Vector3 point, float above, out WaterSurface surface)
+            => SurfaceAt(point, above, out surface, false);
+
+        /// <summary>
+        /// As <see cref="SurfaceAt(Vector3, float, out WaterSurface)"/>; inside a ship's hull (Graphics.WaterHulls) there is
+        /// no water, unless <paramref name="throughHulls"/>: the water the hull floats in (its own buoyancy).
+        /// </summary>
+        public static bool SurfaceAt(Vector3 point, float above, out WaterSurface surface, bool throughHulls)
         {
             surface = default;
+            if (!throughHulls && Graphics.WaterHulls.Inside(point)) return false;
             float best = float.MaxValue;
             float floor = point.Y - above;
 
@@ -108,16 +116,16 @@ namespace Freefall.Components
         // ── The sea's waves where somebody is: measured on the GPU by the underwater pass (Graphics.Underwater), read back
         // a few frames later. A place asked for is measured from the next frame on for as long as it keeps being asked for ──
 
-        /// <summary>Places the sea's height is measured at, at most.</summary>
-        public const int SeaProbes = 8;
+        /// <summary>Places the sea's height is measured at, at most: swimmers and the points ships float on.</summary>
+        public const int SeaProbes = 64;
 
         private static readonly object _watchLock = new();
         private static readonly Vector2[] _watched = new Vector2[SeaProbes];
         private static int _watchedCount;
 
         // The last read back: place, height, slope, and the tick it was measured at
-        private static readonly Vector4[] _measured = new Vector4[SeaProbes];   // x, z, height, (unused)
-        private static readonly Vector2[] _measuredSlope = new Vector2[SeaProbes];
+        private static readonly Vector4[] _measured = new Vector4[SeaProbes + 1];   // x, z, height, (unused)
+        private static readonly Vector2[] _measuredSlope = new Vector2[SeaProbes + 1];
         private static int _measuredCount;
         private static int _measuredTick = -1000;
         private static readonly object _measuredLock = new();
@@ -154,7 +162,7 @@ namespace Freefall.Components
         {
             lock (_measuredLock)
             {
-                int n = Math.Min(places.Length, SeaProbes);
+                int n = Math.Min(places.Length, SeaProbes + 1);   // the camera's and every place asked for
                 for (int i = 0; i < n; i++)
                 {
                     _measured[i] = new Vector4(places[i].X, places[i].Y, results[i].X, 0f);
