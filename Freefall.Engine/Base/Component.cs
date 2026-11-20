@@ -53,6 +53,13 @@ namespace Freefall.Base
         /// <summary>ComponentCache&lt;T&gt;.Added was raised for this component and Removed is still owed.</summary>
         internal bool Announced;
 
+        /// <summary>
+        /// Its Awake has run. A component made in play (a prefab's copy, AddComponent) wakes at the next wake-up step, not
+        /// when it is made: what game code sets on it before then is set again by its Awake (a Health's full health).
+        /// </summary>
+        [Browsable(false)]
+        public bool IsAwake => _awake;
+
         internal void WakeUp()
         {
             if (_awake || IsDestroyed) return;

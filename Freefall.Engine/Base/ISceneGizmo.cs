@@ -15,4 +15,15 @@ namespace Freefall.Base
     {
         void DrawGizmos(GizmoContext ctx);
     }
+
+    /// <summary>
+    /// An <see cref="EntitySystem"/> whose gizmos are a debug view worth seeing while the game plays (forces on a ship, a
+    /// path being followed): drawn while playing as well, in the editor's play mode and in a published game alike
+    /// (<see cref="Graphics.PlayGizmoSystem"/>, which the editor's own gizmos do not reach: its camera is gone in play).
+    /// It draws only what a switch of its own turns on (a Dev tab option); with nothing on it draws nothing. In edit mode
+    /// it is an <see cref="ISceneGizmo"/> like any other.
+    /// </summary>
+    public interface IPlayGizmo : ISceneGizmo
+    {
+    }
 }
