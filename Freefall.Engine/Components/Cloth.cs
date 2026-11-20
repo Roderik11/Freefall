@@ -43,6 +43,90 @@ namespace Freefall.Components
         [Freefall.Reflection.DontSerialize]
         public int Particles => ClothMesh?.ParticleCount ?? 0;
 
+        /// <summary>
+        /// Its particles' places at rest in the mesh's space, in the order <see cref="Hold"/> takes them; null until the
+        /// cloth system has made its mesh into cloth (the first frame it is looked at).
+        /// </summary>
+        [Freefall.Reflection.DontSerialize]
+        [System.ComponentModel.Browsable(false)]
+        public IReadOnlyList<Vector3>? RestPlaces => ClothMesh?.RestPlaces;
+
+        /// <summary>
+        /// The air it is blown by, in metres a second in the world, in place of the wind where it is (Wind.Local); null =
+        /// the wind. The cloth feels this less its own motion, so on something that moves the air should carry that
+        /// motion: a ship's sails take the wind over the deck plus the ship's own velocity, or its speed through a light
+        /// breeze blew them aft. Game code's, never saved.
+        /// </summary>
+        [Freefall.Reflection.DontSerialize]
+        [System.ComponentModel.Browsable(false)]
+        public Vector3? Wind { get; set; }
+
+        /// <summary>
+        /// Game code holds it, in place of its settings' holds: per particle (<see cref="RestPlaces"/>' order) a place in
+        /// the mesh's space (xyz) and how far it may leave it in metres (w; 0 = held there). A sail let down from its yard
+        /// and taken in again: held along its yard and at its foot, free between, what is rolled up held where the roll is.
+        /// Each free particle is tethered to the held one nearest it at rest (its settings' Tether). Kept until
+        /// <see cref="ReleaseHold"/> or another Hold; while held it is simulated with all its particles. False when its
+        /// mesh is not made into cloth yet or the count is not its particles'.
+        /// </summary>
+        public bool Hold(ReadOnlySpan<Vector4> holds)
+        {
+            var rest = ClothMesh?.RestPlaces;
+            if (rest == null || holds.Length != rest.Count) return false;
+            int n = rest.Count;
+            if (Holds == null || Holds.Length != n * 2) Holds = new Vector4[n * 2];
+            _heldMask ??= new bool[n];
+            if (_heldMask.Length != n) { _heldMask = new bool[n]; _tethers = null; }
+
+            // The tethers only when which particles are held has changed (a sail taken in moves its holds every frame,
+            // but changes which are held only as the roll passes a row)
+            bool changed = _tethers == null;
+            for (int i = 0; i < n; i++)
+            {
+                bool held = holds[i].W <= 0f;
+                if (held != _heldMask[i]) { _heldMask[i] = held; changed = true; }
+            }
+            if (changed)
+            {
+                _tethers ??= new Vector2[n];
+                float factor = (Settings ?? ClothSettings.Default).Tether;
+                var held = new List<int>();
+                for (int k = 0; k < n; k++)
+                    if (_heldMask[k]) held.Add(k);
+                for (int i = 0; i < n; i++)
+                {
+                    _tethers[i] = new Vector2(-1f, 0f);
+                    if (_heldMask[i] || factor <= 0f) continue;
+                    float nearest = float.MaxValue;
+                    int best = -1;
+                    foreach (int k in held)
+                    {
+                        float d = Vector3.DistanceSquared(rest[i], rest[k]);
+                        if (d < nearest) { nearest = d; best = k; }
+                    }
+                    if (best >= 0) _tethers[i] = new Vector2(best, MathF.Sqrt(nearest) * factor);
+                }
+            }
+            for (int i = 0; i < n; i++)
+            {
+                Holds[i * 2] = holds[i];
+                Holds[i * 2 + 1] = new Vector4(_tethers![i].X, _tethers[i].Y, 0f, 0f);
+            }
+            return true;
+        }
+
+        /// <summary>Back to its settings' holds.</summary>
+        public void ReleaseHold()
+        {
+            Holds = null;
+            _tethers = null;
+        }
+
+        // Game code's holds (Hold): two float4 a particle, its place and reach, its tether and the tether's length
+        internal Vector4[]? Holds;
+        private bool[]? _heldMask;
+        private Vector2[]? _tethers;
+
         // ClothSystem's: its row in the system, the mesh made into cloth it simulates, the tick it was simulated last
         internal int SystemIndex = -1;
         internal ClothMesh? ClothMesh;
@@ -145,6 +229,9 @@ namespace Freefall.Components
         // Each particle's place at rest (the mesh's space), and the hips' height, for what hangs free and the tethers
         private Vector3[] _rest;
         private float _hipsY;
+
+        /// <summary>Each particle's place at rest (the mesh's space): Cloth.RestPlaces.</summary>
+        public IReadOnlyList<Vector3>? RestPlaces => _rest;
 
         // Each particle's limits by the settings that decide them, shared by every cloth of this mesh with those values
         private readonly Dictionary<LimitsKey, GraphicsBuffer> _limits = new();
@@ -497,6 +584,10 @@ namespace Freefall.Components
             foreach (var list in linksOf) linkCount += list.Count;
             int vertexTriCount = 0;
             foreach (var list in trianglesOf) vertexTriCount += list?.Count ?? 0;
+            // (and a twin with none of its own takes its particle's own vertex's again)
+            for (int v = 0; v < vertexCount; v++)
+                if (particleOf[v] >= 0 && trianglesOf[v] == null && follows[v] < 0)
+                    vertexTriCount += trianglesOf[vertexOf[particleOf[v]]]?.Count ?? 0;
 
             cloth.Particles = GraphicsBuffer.CreateUpload<Particle>(count, mapped: true);
             cloth.Links = GraphicsBuffer.CreateUpload<Link>(Math.Max(1, linkCount), mapped: true);
@@ -534,8 +625,22 @@ namespace Freefall.Components
                         }
                     }
                     else if (follows[v] >= 0) vertexData[v] = Blend(follows[v], positions[first + v]);
-                    // (a particle's twin at the same place whose own triangles all fell away: with its particle)
-                    else if (particleOf[v] >= 0) vertexData[v] = Blend(particleOf[v], positions[first + v]);
+                    else if (particleOf[v] >= 0)
+                    {
+                        // A particle's twin at the same place whose own triangles all fell away (where a lateen's foot
+                        // meets in its clew): drawn at its particle, with the triangles round the particle's own
+                        // vertex. As a following vertex it was drawn at its own rest moved as its particle moved from
+                        // its held place, which is not its particle once game code holds the cloth elsewhere
+                        // (Cloth.Hold): a sail's clew held up at the roll drew a triangle down to where it rests.
+                        var own = trianglesOf[vertexOf[particleOf[v]]];
+                        vertexData[v] = new UInt4 { X = (uint)particleOf[v], Y = (uint)nextTri, Z = (uint)(own?.Count ?? 0) };
+                        if (own != null)
+                            foreach (int t in own)
+                            {
+                                var tri = welded[t];
+                                triData[nextTri++] = new UInt4 { X = (uint)tri.A, Y = (uint)tri.B, Z = (uint)tri.C };
+                            }
+                    }
                     else vertexData[v] = new UInt4 { X = uint.MaxValue };
                 }
             }

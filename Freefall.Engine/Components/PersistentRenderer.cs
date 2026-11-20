@@ -370,6 +370,24 @@ namespace Freefall.Components
             BoundingSphere = new BoundingSphere(center, MathF.Sqrt(radiusSquared));
         }
 
+        [System.ComponentModel.Description("Whether it darkens the sky's light under it and shelters from rain and snow " +
+                                           "(the sky captures and the shelter map). Those are drawn once and kept while " +
+                                           "the camera stays put, so something that moves leaves its darkness where it " +
+                                           "was: off for what moves (a ship's hull, rig and sails). Its sun shadows are " +
+                                           "not affected; what lies inside it gets the open sky. Characters (the skinned " +
+                                           "effect) are never in them.")]
+        public bool InSkyCaptures
+        {
+            get => _inSkyCaptures;
+            set
+            {
+                if (_inSkyCaptures == value) return;
+                _inSkyCaptures = value;
+                Invalidate();
+            }
+        }
+        private bool _inSkyCaptures = true;
+
         // Drawn by something else for the time being (Cloth's skinned twin of a mesh): no draws of its own. Not saved
         private bool _drawnElsewhere;
 

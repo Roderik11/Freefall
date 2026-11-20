@@ -137,6 +137,7 @@ cbuffer PushConstants : register(b3)
 #define SubbatchCount         SubbatchCountIdx
 #define SortSize              SortSizeIdx
 #define SortStride            SortStrideIdx
+#define ShadowSkipBits        SortStrideIdx   // the cascade chain (it never sorts): instances with any of these bits are in no view
 #define SortCount             SortCountIdx
 #define HistogramIdx          HistogramUAVIdx
 #define UniquePartCount       UniquePartCountIdx
@@ -225,7 +226,11 @@ struct MeshPartLod
 // MeshRenderer.CastPointLightShadows off (DrawBucket.NoPointShadowBit): the instance is in no point light's shadow
 // views (CSVisibilityLocalShadows). A lamp's own post, arm and cage, a brazier's basket.
 #define NO_POINT_SHADOW_BIT 0x40000000u
-#define SUBBATCH_PART_MASK (~(LOD_MANAGED_BIT | NO_POINT_SHADOW_BIT))
+// MeshRenderer.InSkyCaptures off (DrawBucket.NoSkyCaptureBit): left out of the cascade chains that pass it in
+// ShadowSkipBits (the sky captures, the shelter map), which are drawn once and kept: something that moves (a ship)
+// would leave its darkness where it was drawn
+#define NO_SKY_CAPTURE_BIT 0x20000000u
+#define SUBBATCH_PART_MASK (~(LOD_MANAGED_BIT | NO_POINT_SHADOW_BIT | NO_SKY_CAPTURE_BIT))
 #define INVALID_PART    0xFFFFFFFFu
 
 //-----------------------------------------------------------------------------
@@ -1655,6 +1660,18 @@ void CSVisibilityCascades(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
     
+    // Left out of this chain (the sky captures and the shelter map leave out what moves: NO_SKY_CAPTURE_BIT)
+    if (ShadowSkipBits != 0)
+    {
+        StructuredBuffer<uint> skipIds = ResourceDescriptorHeap[SubbatchIdsIdx];
+        if ((skipIds[instanceIdx] & ShadowSkipBits) != 0)
+        {
+            combinedVis[instanceIdx] = 0;
+            cascadeMasks[instanceIdx] = 0;
+            return;
+        }
+    }
+
     // World sphere and LOD part, found once for all cascades (the camera's InstanceBounds when slot 38 is set)
     float3 worldCenter;
     float worldRadius;

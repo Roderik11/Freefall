@@ -316,8 +316,11 @@ namespace Freefall.Graphics
             if (batches.Count > 0)
             {
                 PixMarker.Begin(list, "Culling");
+                // What moves (MeshRenderer.InSkyCaptures off: a ship) is left out, as from the sky captures: its shelter
+                // from the rain would stay where it was drawn
                 InstanceBatch.CullShadowAll(list, batches, cullBuffer.SrvIndex, cullBuffer.Native.GPUVirtualAddress,
-                    shadowHiZSrv: 0, culler, cascadeCount: 1, minCasterClip: -MinCasterTexels * 2f / DrawResolution, receiversUav: 0);
+                    shadowHiZSrv: 0, culler, cascadeCount: 1, minCasterClip: -MinCasterTexels * 2f / DrawResolution, receiversUav: 0,
+                    skipBits: DrawBucket.NoSkyCaptureBit);
                 PixMarker.End(list);
 
                 // A single-slice DSV: the vertex shader routes the view to array index 0

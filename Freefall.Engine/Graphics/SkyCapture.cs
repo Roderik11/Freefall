@@ -220,8 +220,11 @@ namespace Freefall.Graphics
 
             var cullBuffer = _cullBuffers[slot]!;
             PixMarker.Begin(list, "Culling");
+            // What moves (MeshRenderer.InSkyCaptures off: a ship) is left out: kept while the camera stays in its cell, its
+            // darkness would stay where it was drawn while the ship sailed out from under it
             InstanceBatch.CullShadowAll(list, _batches, cullBuffer.SrvIndex, cullBuffer.Native.GPUVirtualAddress,
-                shadowHiZSrv: 0, culler, cascadeCount: CullViews, minCasterClip: -MinCasterTexels * 2f / Resolution, receiversUav: 0);
+                shadowHiZSrv: 0, culler, cascadeCount: CullViews, minCasterClip: -MinCasterTexels * 2f / Resolution, receiversUav: 0,
+                skipBits: DrawBucket.NoSkyCaptureBit);
             PixMarker.End(list);
 
             // A single-slice DSV: the vertex shader routes the view to array index 0

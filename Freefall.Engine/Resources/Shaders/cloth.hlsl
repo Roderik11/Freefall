@@ -14,7 +14,8 @@
 //   3. every LOD 0 vertex's place and normal (from the triangles round it, turned the way the mesh's own normal faces
 //      at the first frame) in the renderer's object space; then every vertex of the other LODs: its own held place
 //      moved by as much as its particle was, with that particle's normal.
-// The skinned vertex shader draws these instead of skinning. A particle with MaxAway 0 is held. Positions are in the
+// The skinned vertex shader draws these instead of skinning. A particle with MaxAway 0 is held. Game code may hold a
+// cloth itself (Cloth.Hold: per particle a held place and reach, the row's HoldsIdx), its LOD 0 only. Positions are in the
 // world: gravity and wind are. Every buffer index comes from the group's row, the same for all its threads.
 //
 // A cloth nobody sees does nothing. The engine's own culling says which: each cloth's row names the camera's visibility
@@ -73,11 +74,13 @@ struct ClothRow
     uint MeshPositionsIdx;          // the mesh's buffers: positions, normals, bone weights (0 = none)
     uint MeshNormalsIdx;
     uint MeshWeightsIdx;
-    uint _pad;
+    uint HoldsIdx;                  // StructuredBuffer<float4>: game code's holds (Cloth.Hold), 0 = its limits as made
+                                    // from its settings; two a particle from HoldsFirst: its held place in the mesh's
+                                    // space and how far it may leave it (w), its tether and the tether's length (xy)
     uint SeenIdx;                   // StructuredBuffer<uint>: the camera's visibility flags of its batch last frame (0 = not seen); 0 = not known
     uint CastsIdx;                  // StructuredBuffer<uint>: the sun's cascade masks of its batch last frame (low bits, a cascade each); 0 = not known
     uint Instance;                  // its instance in both
-    uint _pad2;
+    uint HoldsFirst;
 };
 
 struct ClothParticle
@@ -149,6 +152,19 @@ float3 HeldWorld(float3 pos, float4 boneIds, float4 weights, ClothRow row)
     return mul(float4(pos, 1), row.World).xyz;
 }
 
+// How far a particle may leave its held place (x, 0 = held), its tether (y: the held particle nearest it, -1 none) and the
+// tether's length (z): as made from its settings, or as game code holds it (a sail let down and taken in)
+float4 LimitOf(uint p, ClothRow row)
+{
+    if (row.HoldsIdx != 0u)
+    {
+        StructuredBuffer<float4> holds = ResourceDescriptorHeap[row.HoldsIdx];
+        return float4(holds[row.HoldsFirst + p * 2u].w, holds[row.HoldsFirst + p * 2u + 1u].xy, 0);
+    }
+    StructuredBuffer<float4> limits = ResourceDescriptorHeap[row.LimitsIdx];
+    return limits[p];
+}
+
 // A direction of the mesh skinned the same way, in object space
 float3 HeldNormal(float3 normal, float4 boneIds, float4 weights, ClothRow row)
 {
@@ -196,7 +212,6 @@ void CSCloth(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
 
     StructuredBuffer<ClothParticle> particles = ResourceDescriptorHeap[row.ParticlesIdx];
     StructuredBuffer<ClothLink> links = ResourceDescriptorHeap[row.LinksIdx];
-    StructuredBuffer<float4> limits = ResourceDescriptorHeap[row.LimitsIdx];
     RWStructuredBuffer<float4> state = ResourceDescriptorHeap[StateUAVIdx];
     RWStructuredBuffer<float4> output = ResourceDescriptorHeap[OutputUAVIdx];
     float time = asfloat(TimeBits);
@@ -229,7 +244,8 @@ void CSCloth(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
         return;
     }
     // Back after frames sat out: a skinned cloth where its bones hold it now (they went on without it)
-    bool reset = row.Reset == 1u || (satOut && row.BonesIdx != 0u);
+    // (or one game code holds: a ship's sail went on with its ship)
+    bool reset = row.Reset == 1u || (satOut && (row.BonesIdx != 0u || row.HoldsIdx != 0u));
 
     // Only its shadow shows: one substep of the whole frame and a quarter of its passes
     uint substeps = row.Substeps, iterations = row.Iterations;
@@ -253,7 +269,14 @@ void CSCloth(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
     {
         uint p = i1;
         ClothParticle particle = particles[p];
-        float3 next = HeldWorld(particle.Rest, particle.BoneIds, particle.Weights, row);
+        float3 next;
+        if (row.HoldsIdx != 0u)
+        {
+            StructuredBuffer<float4> holds = ResourceDescriptorHeap[row.HoldsIdx];
+            next = mul(float4(holds[row.HoldsFirst + p * 2u].xyz, 1), row.World).xyz;
+        }
+        else
+            next = HeldWorld(particle.Rest, particle.BoneIds, particle.Weights, row);
         state[s0 + STATE_NEXT * count + p] = float4(next, 0);
         if (reset)
         {
@@ -284,7 +307,7 @@ void CSCloth(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
             float3 target = lerp(state[s0 + STATE_TARGET * count + p].xyz, state[s0 + STATE_NEXT * count + p].xyz, share);
             float3 x;
             float3 previous;
-            if (limits[p].x <= 0.0)
+            if (LimitOf(p, row).x <= 0.0)
             {
                 x = target;
                 previous = target;
@@ -339,7 +362,7 @@ void CSCloth(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
             {
                 uint p = i3;
                 float3 target = lerp(state[s0 + STATE_TARGET * count + p].xyz, state[s0 + STATE_NEXT * count + p].xyz, share);
-                float4 limit = limits[p];
+                float4 limit = LimitOf(p, row);
                 float most = limit.x;
                 float3 x = state[from + p].xyz;
                 if (most <= 0.0)
@@ -358,7 +381,7 @@ void CSCloth(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
                     float3 d = x - other;
                     float length = sqrt(max(dot(d, d), 1e-12));
                     // A held neighbour does not give: this particle takes the whole correction
-                    float give = limits[link.Other].x <= 0.0 ? 1.0 : 0.5;
+                    float give = LimitOf(link.Other, row).x <= 0.0 ? 1.0 : 0.5;
                     float k = link.Bend != 0u ? row.Bending : row.Stiffness;
                     move -= d * ((length - link.Rest) / length) * give * k;
                     weight += 1.0;

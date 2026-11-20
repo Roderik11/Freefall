@@ -174,7 +174,7 @@ namespace Freefall.Components
                 var mat = GetMaterial(meshParts[partIdx].MaterialSlot);
                 if (mat != null)
                     CommandBuffer.AddPersistent(group, mesh, partIdx, mat, _params ?? NoParams, transformSlot, lodManaged: true, instanceSlot: InstanceSlotFor(mat),
-                                               noPointShadow: !_castPointLightShadows);
+                                               noPointShadow: !_castPointLightShadows, noSkyCapture: !InSkyCaptures);
             }
         }
     }

@@ -72,8 +72,8 @@ namespace Freefall.Graphics
             public uint PartCount;      public uint ParticleCount;  public uint VertexCount;    public uint VertexFirst;
             public uint StateBase;      public uint OutputBase;     public uint Particles;      public uint Links;
             public uint Vertices;       public uint VertexTris;     public uint Limits;         public uint Bones;
-            public uint MeshPositions;  public uint MeshNormals;    public uint MeshWeights;    public uint Pad;
-            public uint Seen;           public uint Casts;          public uint Instance;       public uint Pad2;
+            public uint MeshPositions;  public uint MeshNormals;    public uint MeshWeights;    public uint Holds;
+            public uint Seen;           public uint Casts;          public uint Instance;       public uint HoldsFirst;
         }
 
         /// <summary>Everything the system keeps per cloth.</summary>
@@ -115,10 +115,11 @@ namespace Freefall.Graphics
         private readonly List<(int Start, int Count)> _stateFree = [], _outputFree = [];
         private int _stateCapacity, _outputCapacity;
 
-        // The frame's table and body parts, a buffer per frame in flight
+        // The frame's table, body parts and game code's holds (Cloth.Hold), a buffer per frame in flight
         private readonly GraphicsBuffer?[] _rows = new GraphicsBuffer?[FrameCount];
         private readonly GraphicsBuffer?[] _parts = new GraphicsBuffer?[FrameCount];
-        private readonly int[] _rowCapacity = new int[FrameCount], _partCapacity = new int[FrameCount];
+        private readonly GraphicsBuffer?[] _holds = new GraphicsBuffer?[FrameCount];
+        private readonly int[] _rowCapacity = new int[FrameCount], _partCapacity = new int[FrameCount], _holdCapacity = new int[FrameCount];
 
         private ComputeShader? _compute;
         private int _kernel;
@@ -168,6 +169,7 @@ namespace Freefall.Graphics
             {
                 device?.DeferDispose(_rows[i]);
                 device?.DeferDispose(_parts[i]);
+                device?.DeferDispose(_holds[i]);
             }
         }
 
@@ -282,9 +284,10 @@ namespace Freefall.Graphics
                     substeps = Math.Max(1, substeps / 2);
                     iterations = Math.Max(2, iterations / 2);
                 }
-                // Fewer particles the smaller it shows (ClothMesh.Level, LevelFor)
+                // Fewer particles the smaller it shows (ClothMesh.Level, LevelFor); all of them while game code holds
+                // it, since its holds are LOD 0's particles
                 int levelMode = Engine.Settings.ClothParticleLevel;
-                SetLevel(entry, levelMode >= 3 ? LevelFor(entry.Level, onScreen / distanceSq) : Math.Clamp(levelMode, 0, 2), settings);
+                SetLevel(entry, cloth.Holds != null ? 0 : levelMode >= 3 ? LevelFor(entry.Level, onScreen / distanceSq) : Math.Clamp(levelMode, 0, 2), settings);
 
                 // Half the passes a level: links twice as long carry a pull twice as far a pass, so a coarser cloth is
                 // as stiff with half of them, and a pass costs about the same however few its particles (its group sync)
@@ -446,6 +449,14 @@ namespace Freefall.Graphics
                 var partData = parts.WritePtr<Vector4>();
                 int partNext = 0;
 
+                // Game code's holds, copied every frame it is simulated (two float4 a particle: a sail's few hundred)
+                int holdCount = 0;
+                foreach (var entry in _picked)
+                    if (HoldsOf(entry) is { } h) holdCount += h.Length;
+                var holds = holdCount > 0 ? EnsureUpload<Vector4>(_holds, _holdCapacity, frame, holdCount) : null;
+                var holdData = holds != null ? holds.WritePtr<Vector4>() : null;
+                int holdNext = 0;
+
                 // A frame's seconds on the real clock kept within 1/240 and 1/30, then at the game clock's pace: slow
                 // motion slows the cloth as it slows everything else
                 float frameSeconds = Math.Clamp(Time.SmoothDelta / Time.Scale, 1f / 240f, 1f / 30f) * Time.Scale;
@@ -490,11 +501,20 @@ namespace Freefall.Graphics
                         }
                     }
 
+                    uint holdsIdx = 0, holdsFirst = 0;
+                    if (holdData != null && HoldsOf(entry) is { } held)
+                    {
+                        held.AsSpan().CopyTo(new Span<Vector4>(holdData + holdNext, held.Length));
+                        holdsIdx = holds!.SrvIndex;
+                        holdsFirst = (uint)holdNext;
+                        holdNext += held.Length;
+                    }
+
                     rowData[i] = new ClothRow
                     {
                         World = world,
                         ToObject = toObject,
-                        Wind = wind,
+                        Wind = cloth.Wind ?? wind,
                         Dt = frameSeconds / entry.Substeps,
                         Drag = settings.Drag,
                         Damping = settings.Damping,
@@ -526,6 +546,8 @@ namespace Freefall.Graphics
                         Seen = seenSrv,
                         Casts = castsSrv,
                         Instance = instance,
+                        Holds = holdsIdx,
+                        HoldsFirst = holdsFirst,
                     };
                     cloth.SimulatedTick = Engine.TickCount;
                     SimulatedParticles += mesh.ParticleCount;
@@ -566,6 +588,13 @@ namespace Freefall.Graphics
                 if (entry.Output < 0 || entry.SimulatedTick == long.MinValue || entry.Cloth.Renderer == null) continue;
                 Show(entry, entry.Cloth.Renderer);
             }
+        }
+
+        // Game code's holds when they are for the particles it is simulated with (Cloth.Hold)
+        private static Vector4[]? HoldsOf(Entry entry)
+        {
+            var held = entry.Cloth.Holds;
+            return held != null && entry.Mesh != null && held.Length == entry.Mesh.ParticleCount * 2 ? held : null;
         }
 
         private void Show(Entry entry, PersistentRenderer renderer)

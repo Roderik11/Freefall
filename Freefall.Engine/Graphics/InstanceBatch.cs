@@ -398,7 +398,8 @@ namespace Freefall.Graphics
             };
             WriteCore(DrawBucket.DescriptorsHash, 20, index, descriptor);
             WriteCore(DrawBucket.SubbatchIdsHash, 4, index, (uint)meshPartId | (call.LodManaged ? DrawBucket.LodManagedBit : 0u)
-                                                           | (call.NoPointShadow ? DrawBucket.NoPointShadowBit : 0u));
+                                                           | (call.NoPointShadow ? DrawBucket.NoPointShadowBit : 0u)
+                                                           | (call.NoSkyCapture ? DrawBucket.NoSkyCaptureBit : 0u));
 
             if (call.MaterialBlock != null)
             {
@@ -1470,9 +1471,11 @@ namespace Freefall.Graphics
         /// <param name="minCasterClip">Cascades 1+: smallest caster diameter in clip units (EngineSettings.ShadowMinCasterTexels * 2 / resolution; 0 = off; negative: -minCasterClip for every view).</param>
         /// <param name="receiversUav">The receiver tiles to test casters against (ShadowReceivers; 0 = none); null = the sun's this frame.</param>
         /// <param name="casterStats">Counts each batch's casters into its row of these receivers (EngineSettings.ShadowCasterStats; the sun's only).</param>
+        /// <param name="skipBits">Instances whose staged subbatch ID has any of these bits are in none of the views: the sky
+        /// captures and the shelter map pass DrawBucket.NoSkyCaptureBit (what moves); 0 = none left out (the sun).</param>
         public static void CullShadowAll(ID3D12GraphicsCommandList list, IReadOnlyList<InstanceBatch> batches,
             uint cascadeBufferSrv, ulong cascadeBufferGpuAddress, uint shadowHiZSrv, GPUCuller? culler, int cascadeCount,
-            float minCasterClip = 0f, uint? receiversUav = null, ShadowReceivers? casterStats = null)
+            float minCasterClip = 0f, uint? receiversUav = null, ShadowReceivers? casterStats = null, uint skipBits = 0)
         {
             if (culler?.VisibilityCascadesPSO == null || culler.MainPSO == null || culler.HistogramCascadesPSO == null
                 || culler.ScatterCascadesPSO == null || culler.HistogramPrefixSumPSO == null) return;
@@ -1490,7 +1493,7 @@ namespace Freefall.Graphics
             uint receivers = receiversUav ?? DirectionalLight.CurrentShadowReceiversUav;
             uint cascades = (uint)Math.Clamp(cascadeCount, 0, DirectionalLight.MaxCascades);
             foreach (var batch in _stageBatches)
-                batch.PrepareCullShadow(list, cascadeBufferSrv, shadowHiZSrv, minCasterClip, receivers, cascades);
+                batch.PrepareCullShadow(list, cascadeBufferSrv, shadowHiZSrv, minCasterClip, receivers, cascades, skipBits);
             if (casterStats != null && receivers != 0)
                 foreach (var batch in _stageBatches)
                     batch._cullConstants[32] = casterStats.CasterRow(batch.ProfileName);   // CasterStatsRow (the chain never sorts)
@@ -1571,7 +1574,7 @@ namespace Freefall.Graphics
         // Constants and clears of this batch's cascade culling. The draw count is cleared
         // here already: nothing touches it before the compaction at the end.
         private void PrepareCullShadow(ID3D12GraphicsCommandList list, uint cascadeBufferSrv, uint shadowHiZSrv, float minCasterClip,
-            uint receiversUav, uint cascadeCount)
+            uint receiversUav, uint cascadeCount, uint skipBits = 0)
         {
             // The draw count and the counters it clears are the camera cull's (InitializeCullerResources): a batch the camera
             // has not culled since it was made or grew (ResizeBuffers drops them) has none yet, and the clear crashed
@@ -1593,6 +1596,7 @@ namespace Freefall.Graphics
             c[11] = shadowCombinedVisUAVIndices[f];           // VisibilityFlagsIdx = combined
             c[13] = (uint)_drawCount;
             c[18] = 0;                                        // DrawCountUAVIdx = 0: fixed-index commands
+            c[21] = skipBits;                                 // ShadowSkipBits: instances with any of them are left out (the sort's slot)
             c[22] = cascadeCount;                             // ShadowCascadeCount (the sort's slot: the chain never sorts)
             c[24] = shadowCombinedVisUAVIndices[f];           // CombinedShadowVisIdx
             c[25] = Material.MaterialsBufferIndex;

@@ -55,6 +55,10 @@ namespace Freefall.Graphics
         /// </summary>
         public bool NoPointShadow;
         /// <summary>
+        /// Left out of the sky captures and the shelter map (MeshRenderer.InSkyCaptures off): something that moves.
+        /// </summary>
+        public bool NoSkyCapture;
+        /// <summary>
         /// The object's slot of the instance data buffer (InstanceData), the draw's InstanceDescriptor.CustomDataIdx.
         /// 0 = none of its own: the effect's defaults (Effect.DefaultInstanceSlot).
         /// </summary>
@@ -141,8 +145,14 @@ namespace Freefall.Graphics
         public const uint LodManagedBit = 0x80000000u;
         /// <summary>Bit 30 of a staged subbatch ID: the instance casts no shadow in point lights (cull_instances.hlsl NO_POINT_SHADOW_BIT).</summary>
         public const uint NoPointShadowBit = 0x40000000u;
+        /// <summary>
+        /// Bit 29 of a staged subbatch ID: the instance is left out of the sky captures and the shelter map, which are drawn
+        /// once and kept while the camera stays in a cell: something that moves would leave its darkness, or its shelter
+        /// from the rain, where it was (cull_instances.hlsl NO_SKY_CAPTURE_BIT, InstanceBatch.CullShadowAll skipBits).
+        /// </summary>
+        public const uint NoSkyCaptureBit = 0x20000000u;
 
-        public void Add(Mesh mesh, int partIndex, Material material, MaterialBlock block, int transformSlot, uint boneBufferIdx = 0, bool lodManaged = false, bool noPointShadow = false)
+        public void Add(Mesh mesh, int partIndex, Material material, MaterialBlock block, int transformSlot, uint boneBufferIdx = 0, bool lodManaged = false, bool noPointShadow = false, bool noSkyCapture = false)
         {
             // Get or register MeshPartId (done during parallel Enqueue!)
             int meshPartId = mesh.GetMeshPartId(partIndex);
@@ -176,7 +186,8 @@ namespace Freefall.Graphics
             };
 
             StageCore(DescriptorsHash, 20, descriptor);       // InstanceDescriptor: 20 bytes (5 uints)
-            StageCore(SubbatchIdsHash, 4,  (uint)meshPartId | (lodManaged ? LodManagedBit : 0u) | (noPointShadow ? NoPointShadowBit : 0u)); // uint: 4 bytes
+            StageCore(SubbatchIdsHash, 4,  (uint)meshPartId | (lodManaged ? LodManagedBit : 0u) | (noPointShadow ? NoPointShadowBit : 0u)
+                                          | (noSkyCapture ? NoSkyCaptureBit : 0u)); // uint: 4 bytes
             UniqueMeshPartIds.Add(meshPartId);
             
             if(block == null) return;
@@ -365,7 +376,7 @@ namespace Freefall.Graphics
                     bucket = new DrawBucket();
                     buckets[drawCall.Key] = bucket;
                 }
-                bucket.Add(drawCall.Mesh, drawCall.MeshPartIndex, drawCall.Material, drawCall.MaterialBlock, drawCall.TransformSlot, drawCall.BoneBufferIdx, drawCall.LodManaged, drawCall.NoPointShadow);
+                bucket.Add(drawCall.Mesh, drawCall.MeshPartIndex, drawCall.Material, drawCall.MaterialBlock, drawCall.TransformSlot, drawCall.BoneBufferIdx, drawCall.LodManaged, drawCall.NoPointShadow, drawCall.NoSkyCapture);
             }
 
             /// <summary>
@@ -788,7 +799,7 @@ namespace Freefall.Graphics
         /// add a new one. <paramref name="farTier"/>: an instance of the far tier's near side (DrawCall.FarTier), giving
         /// way at <paramref name="farProfile"/> (DrawCall.FarProfile).
         /// </summary>
-        public static void AddPersistent(DrawGroup group, Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot, uint boneBufferIdx = 0, bool lodManaged = false, int instanceSlot = 0, bool farTier = false, int farProfile = 0, bool noPointShadow = false)
+        public static void AddPersistent(DrawGroup group, Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot, uint boneBufferIdx = 0, bool lodManaged = false, int instanceSlot = 0, bool farTier = false, int farProfile = 0, bool noPointShadow = false, bool noSkyCapture = false)
         {
             var op = new PersistentOp
             {
@@ -805,6 +816,7 @@ namespace Freefall.Graphics
                     BoneBufferIdx = boneBufferIdx,
                     LodManaged = lodManaged,
                     NoPointShadow = noPointShadow,
+                    NoSkyCapture = noSkyCapture,
                     InstanceSlot = instanceSlot,
                     FarTier = farTier,
                     FarProfile = (byte)(farProfile & (Graphics.FarTier.MaxProfiles - 1)),
