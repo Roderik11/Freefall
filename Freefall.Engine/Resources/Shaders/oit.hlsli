@@ -23,12 +23,16 @@
 #define OIT_MAX_ALPHA 0.999         // absorbance −ln(1 − alpha) stays finite
 #define OIT_MOMENT_BIAS 5e-7        // towards a broad distribution, so the Hankel matrix stays invertible (fp32 moments)
 #define OIT_OVERESTIMATION 0.25     // share of the absorbance at the fragment's own depth counted as in front of it
+#define OIT_MAX_REACTIVE 0.9        // the most a fragment asks the upscaler to trust this frame (AMD's advice for FSR)
+#define OIT_REACTIVE_GAIN 8.0       // a fragment that brightens its pixel by an eighth of what is behind it is fully reactive
+#define OIT_REACTIVE_FLOOR 0.02     // what is behind counts as at least this light (pre-exposed): no fuss over black
 
-// The accumulation pass's targets (RenderTargetFormat=OIT: both R16G16B16A16_Float, added)
+// The accumulation pass's targets (RenderTargetFormat=OIT: two R16G16B16A16_Float added, one R8_UNorm kept at its max)
 struct OITTargets
 {
     float4 Accum : SV_Target0;      // rgb Σ w·C, a Σ w·alpha
     float4 Extra : SV_Target1;      // rgb Σ additive light (× the transmittance in front with moments), a Σ absorbance
+    float Reactive : SV_Target2;    // the reactive mask (OITReactive), the largest a fragment wrote
 };
 
 // The moments pass's targets (RenderTargetFormat=OITMoments: R32_Float, R32G32B32A32_Float, added)
@@ -122,8 +126,33 @@ OITMomentTargets OITMoments(float alpha, float viewDepth)
     return o;
 }
 
-// The accumulation pass: premultiplied light and coverage, at its depth and pixel (SV_Position.xy)
-OITTargets OITAccumulate(float4 premultiplied, float viewDepth, float2 pixel)
+// How far a temporal upscaler (FSR's reactive mask, DLSS's bias-current-colour mask) should trust this frame over its
+// history under the fragment: what it hides (its alpha), or how much it brightens the pixel against what is behind it
+// (the composite before these draws) times OIT_REACTIVE_GAIN, whichever is more. Brightening against what is behind,
+// not against a fixed light: a raindrop adds little light by day, yet it shows on the cobbles, and judged by its light
+// alone it stayed out of the mask and left a fading trail. Dimming counts by the alpha alone, with no gain: thin smoke
+// would otherwise take the anti-aliasing from everything seen through it. These draws write no motion vectors, so the
+// pixel carries the motion of what is behind them, and the history it points to holds the fragment where it was, or
+// not at all. Times `reactive`: 1 for what moves or changes on its own (particles, trails, vfx), 0 for glass, which
+// stands still with what it shows.
+float OITReactive(float alpha, float3 light, float2 pixel, float reactive)
+{
+    if (reactive <= 0.0) return 0.0;
+    float3 behind = 0.0;
+    if (OITBehindIdx != 0)
+    {
+        Texture2D<float4> composite = ResourceDescriptorHeap[OITBehindIdx];
+        behind = composite.Load(int3(int2(pixel), 0)).rgb;
+    }
+    const float3 luma = float3(0.2126, 0.7152, 0.0722);
+    float behindLight = dot(behind, luma);
+    float brightens = max(dot(light, luma) - alpha * behindLight, 0.0) / max(behindLight, OIT_REACTIVE_FLOOR);
+    return min(max(alpha, saturate(brightens * OIT_REACTIVE_GAIN)), OIT_MAX_REACTIVE) * saturate(reactive);
+}
+
+// The accumulation pass: premultiplied light and coverage, at its depth and pixel (SV_Position.xy). `reactive`: what
+// OITReactive scales by
+OITTargets OITAccumulate(float4 premultiplied, float viewDepth, float2 pixel, float reactive)
 {
     float alpha = saturate(premultiplied.a);
     bool moments = OITMomentsAt(pixel);
@@ -150,7 +179,14 @@ OITTargets OITAccumulate(float4 premultiplied, float viewDepth, float2 pixel)
         o.Accum = float4(premultiplied.rgb, alpha) * w;
         o.Extra = float4(0.0, 0.0, 0.0, OITAbsorbance(alpha));
     }
+    o.Reactive = OITReactive(alpha, premultiplied.rgb * t, pixel, reactive);
     return o;
+}
+
+// The same for what moves or changes on its own: fully reactive
+OITTargets OITAccumulate(float4 premultiplied, float viewDepth, float2 pixel)
+{
+    return OITAccumulate(premultiplied, viewDepth, pixel, 1.0);
 }
 
 #endif

@@ -9,7 +9,8 @@ namespace Freefall.Graphics
     /// <summary>
     /// Order-independent transparency (EngineSettings.Transparency; oit.hlsli, oit_resolve_cs.hlsl): glass, particles,
     /// trails and vfx drawn in any order after the Forward pass's water, into two accumulation targets (RenderPass.OIT),
-    /// then laid over the composite. With Moments a pass before it (RenderPass.OITMoments) sums the moments of the
+    /// then laid over the composite. A third target of that pass is the temporal upscaler's reactive mask
+    /// (ComposeReactive). With Moments a pass before it (RenderPass.OITMoments) sums the moments of the
     /// absorbance over depth, so each fragment is weighed by what lies in front of it. The water stays the one ordered
     /// layer: it refracts the scene behind it and writes depth. A split compare (TransparencySplit) draws the left half
     /// with another mode in the same frame, the sorted draws kept to their side by the scissor.
@@ -33,16 +34,31 @@ namespace Freefall.Graphics
 
         private RenderTexture2D? _accum, _extra, _zeroth, _moments;
         private bool _accumNew, _momentsNew;            // just made: still in Common
+
+        // The reactive mask: the accumulation's third target, two in turn so last frame's is still there
+        // (oit_reactive_cs.hlsl), and the mask composed from both that the upscaler reads
+        private readonly RenderTexture2D?[] _reactive = new RenderTexture2D?[2];
+        private readonly ResourceStates[] _reactiveState = { ResourceStates.Common, ResourceStates.Common };
+        private RenderTexture2D? _reactiveMask;
+        private ResourceStates _maskState = ResourceStates.Common;
+        private int _reactiveNow;                       // which of the two this frame's accumulation wrote
+        private int _drawnTick = int.MinValue, _prevDrawnTick = int.MinValue;   // Engine.TickCount of the last two
+        private bool _reactiveDrawn;                    // the accumulation ran for this view
+        private bool _maskComposed;                     // ComposeReactive ran for this view
+
         private int _width, _height;
         private int _resolveFrom, _resolveTo, _momentsFrom, _momentsTo;
         private float _logNear, _logScale;
-        private readonly ComputeShader _resolve;
-        private readonly int _kResolve;
+        private readonly ComputeShader _resolve, _reactiveCS;
+        private readonly int _kResolve, _kReactive, _kReactiveView;
 
         public OrderIndependentTransparency()
         {
             _resolve = new ComputeShader("oit_resolve_cs.hlsl");
             _kResolve = _resolve.FindKernel("CSResolve");
+            _reactiveCS = new ComputeShader("oit_reactive_cs.hlsl");
+            _kReactive = _reactiveCS.FindKernel("CSReactive");
+            _kReactiveView = _reactiveCS.FindKernel("CSReactiveView");
         }
 
         /// <summary>
@@ -66,6 +82,8 @@ namespace Freefall.Graphics
             (_momentsFrom, _momentsTo) = Columns(m => m == TransparencyMode.Moments);
 
             Active = _resolveTo > _resolveFrom;
+            _reactiveDrawn = false;
+            _maskComposed = false;
             Sorted = sorted.to > sorted.from;
             MomentsDue = _momentsTo > _momentsFrom;
             FullScissor = new RectI(0, 0, width, height);
@@ -78,6 +96,64 @@ namespace Freefall.Graphics
             _logScale = 2f / (MathF.Log(far) - _logNear);
 
             if (Active) EnsureTargets(width, height);
+        }
+
+        /// <summary>
+        /// After the camera's motion pass, before the temporal upscaler: the reactive mask it reads (R8_UNorm at the
+        /// render size, left in NonPixelShaderResource), how far to trust this frame over its history. This frame's
+        /// mask from the accumulation (where particles, trails and vfx are now, oit.hlsli OITReactive; 0 elsewhere,
+        /// glass included), with last frame's taken where this pixel's history is read from (oit_reactive_cs.hlsl), so
+        /// what has moved on leaves no fading trail. Null when no pixel took the transparents through the accumulation
+        /// (EngineSettings.Transparency Sorted). <paramref name="motion"/>: the Motion target, readable by compute;
+        /// <paramref name="reset"/>: the history starts over (a cut), last frame's mask is not taken.
+        /// </summary>
+        public RenderTexture2D? ComposeReactive(ID3D12GraphicsCommandList list, RenderTexture2D motion, bool reset)
+        {
+            if (!_reactiveDrawn || _reactiveMask == null) return null;
+            var now = _reactive[_reactiveNow]!;
+            var prev = _reactive[_reactiveNow ^ 1];
+            bool hasPrev = !reset && prev != null && _prevDrawnTick == _drawnTick - 1
+                           && _reactiveState[_reactiveNow ^ 1] == ResourceStates.NonPixelShaderResource;
+
+            PixMarker.Begin(list, "Reactive mask");
+            list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+            if (_maskState != ResourceStates.UnorderedAccess)
+                list.ResourceBarrierTransition(_reactiveMask.Native, _maskState, ResourceStates.UnorderedAccess);
+            _reactiveCS.SetPushConstant(_kReactive, "Now", now.BindlessIndex);
+            _reactiveCS.SetPushConstant(_kReactive, "Prev", hasPrev ? prev!.BindlessIndex : 0u);
+            _reactiveCS.SetPushConstant(_kReactive, "Motion", motion.BindlessIndex);
+            _reactiveCS.SetPushConstant(_kReactive, "OutUAV", _reactiveMask.UavIndex);
+            _reactiveCS.SetPushConstant(_kReactive, "RenderWidth", (uint)_width);
+            _reactiveCS.SetPushConstant(_kReactive, "RenderHeight", (uint)_height);
+            _reactiveCS.Dispatch(_kReactive, list, (uint)(_width + 7) / 8, (uint)(_height + 7) / 8);
+            list.ResourceBarrierTransition(_reactiveMask.Native, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            _maskState = ResourceStates.NonPixelShaderResource;
+            PixMarker.End(list);
+            _maskComposed = true;
+            return _reactiveMask;
+        }
+
+        /// <summary>
+        /// DebugVizMode.Reactive: the composed mask painted red over the tonemapped picture (<paramref name="ldr"/>,
+        /// display size, in PixelShaderResource before and after). Nothing when no mask was composed this view (no
+        /// temporal upscaler, or Sorted).
+        /// </summary>
+        public void ReactiveView(ID3D12GraphicsCommandList list, RenderTexture2D ldr, int displayWidth, int displayHeight)
+        {
+            if (!_maskComposed || _reactiveMask == null) return;
+            list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+            list.ResourceBarrierTransition(ldr.Native, ResourceStates.PixelShaderResource, ResourceStates.UnorderedAccess);
+            _reactiveCS.SetPushConstant(_kReactiveView, "Mask", _reactiveMask.BindlessIndex);
+            _reactiveCS.SetPushConstant(_kReactiveView, "OutputUAV", ldr.UavIndex);
+            _reactiveCS.SetPushConstant(_kReactiveView, "RenderWidth", (uint)_width);
+            _reactiveCS.SetPushConstant(_kReactiveView, "RenderHeight", (uint)_height);
+            _reactiveCS.SetPushConstant(_kReactiveView, "DisplayWidth", (uint)displayWidth);
+            _reactiveCS.SetPushConstant(_kReactiveView, "DisplayHeight", (uint)displayHeight);
+            _reactiveCS.Dispatch(_kReactiveView, list, (uint)(displayWidth + 7) / 8, (uint)(displayHeight + 7) / 8);
+            list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(ldr.Native)));
+            list.ResourceBarrierTransition(ldr.Native, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource);
         }
 
         /// <summary>The scene constants every effect reads (common.fx SceneConstants, oit.hlsli).</summary>
@@ -104,6 +180,14 @@ namespace Freefall.Graphics
             {
                 _accum = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float);
                 _extra = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float);
+                for (int i = 0; i < 2; i++)
+                {
+                    _reactive[i] = new RenderTexture2D(Engine.Device, width, height, Format.R8_UNorm);
+                    _reactiveState[i] = ResourceStates.Common;
+                }
+                _reactiveMask = new RenderTexture2D(Engine.Device, width, height, Format.R8_UNorm, randomWrite: true);
+                _maskState = ResourceStates.Common;
+                _drawnTick = _prevDrawnTick = int.MinValue;
                 _accumNew = true;
             }
             if (MomentsDue && _zeroth == null)
@@ -148,15 +232,25 @@ namespace Freefall.Graphics
             var accumFrom = _accumNew ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
             list.ResourceBarrierTransition(_accum!.Native, accumFrom, ResourceStates.RenderTarget);
             list.ResourceBarrierTransition(_extra!.Native, accumFrom, ResourceStates.RenderTarget);
+            // This frame's mask goes into the other of the two: last frame's stays for ComposeReactive
+            _reactiveNow ^= 1;
+            _prevDrawnTick = _drawnTick;
+            _drawnTick = Engine.TickCount;
+            var reactive = _reactive[_reactiveNow]!;
+            list.ResourceBarrierTransition(reactive.Native, _reactiveState[_reactiveNow], ResourceStates.RenderTarget);
             _accumNew = false;
             list.ClearRenderTargetView(_accum.RtvHandle, clear);
             list.ClearRenderTargetView(_extra.RtvHandle, clear);
-            list.OMSetRenderTargets(new[] { _accum.RtvHandle, _extra.RtvHandle }, depth.DsvHandle);
+            list.ClearRenderTargetView(reactive.RtvHandle, clear);
+            list.OMSetRenderTargets(new[] { _accum.RtvHandle, _extra.RtvHandle, reactive.RtvHandle }, depth.DsvHandle);
             list.RSSetViewport(viewport);
             list.RSSetScissorRect(FullScissor);
             CommandBuffer.Execute(RenderPass.OIT, list, device);
             list.ResourceBarrierTransition(_accum.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
             list.ResourceBarrierTransition(_extra.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
+            list.ResourceBarrierTransition(reactive.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
+            _reactiveState[_reactiveNow] = ResourceStates.NonPixelShaderResource;
+            _reactiveDrawn = true;
             PixMarker.End(list);
 
             PixMarker.Begin(list, "Resolve");
@@ -179,10 +273,12 @@ namespace Freefall.Graphics
         private void ReleaseTextures()
         {
             // RenderTexture2D.Dispose hides Texture.Dispose, so wrap it or DeferDispose would skip the descriptors
-            foreach (var texture in new[] { _accum, _extra, _zeroth, _moments })
+            foreach (var texture in new[] { _accum, _extra, _reactive[0], _reactive[1], _reactiveMask, _zeroth, _moments })
                 if (texture != null)
                     Engine.Device.DeferDispose(new DeferredTexture(texture));
-            _accum = _extra = _zeroth = _moments = null;
+            _accum = _extra = _reactiveMask = _zeroth = _moments = null;
+            _reactive[0] = _reactive[1] = null;
+            _reactiveDrawn = _maskComposed = false;
         }
 
         private sealed class DeferredTexture(RenderTexture2D texture) : IDisposable
@@ -194,6 +290,10 @@ namespace Freefall.Graphics
         {
             _accum?.Dispose();
             _extra?.Dispose();
+            _reactive[0]?.Dispose();
+            _reactive[1]?.Dispose();
+            _reactiveMask?.Dispose();
+            _reactiveCS.Dispose();
             _zeroth?.Dispose();
             _moments?.Dispose();
             _resolve.Dispose();

@@ -48,7 +48,7 @@ namespace Freefall.Graphics.Upscaling
 
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
         private static extern int FfDlss_Evaluate(IntPtr handle, IntPtr list, IntPtr color, IntPtr output, IntPtr depth,
-            IntPtr motion, IntPtr exposure, float jitterX, float jitterY, float mvScaleX, float mvScaleY,
+            IntPtr motion, IntPtr exposure, IntPtr biasMask, float jitterX, float jitterY, float mvScaleX, float mvScaleY,
             uint renderWidth, uint renderHeight, int reset, float preExposure, float frameMs);
 
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
@@ -192,7 +192,7 @@ namespace Freefall.Graphics.Upscaling
         }
 
         public bool Dispatch(ID3D12GraphicsCommandList list, ID3D12Resource color, ID3D12Resource depth, ID3D12Resource motion,
-            ID3D12Resource exposure, ID3D12Resource output, int renderWidth, int renderHeight, int displayWidth, int displayHeight,
+            ID3D12Resource exposure, ID3D12Resource? reactive, ID3D12Resource output, int renderWidth, int renderHeight, int displayWidth, int displayHeight,
             Vector2 jitterPixels, bool reset, float near, float far, float fovYRadians, float frameMs, float sharpness)
         {
             if (!_created) return false;
@@ -216,6 +216,7 @@ namespace Freefall.Graphics.Upscaling
             // (mean |Laplacian| over mean light 11.2–11.6 against 13.6–14.8, two shots each, alternated)
             int done = FfDlss_Evaluate(_feature, list.NativePointer, color.NativePointer, output.NativePointer,
                 depth.NativePointer, motion.NativePointer, exposure.NativePointer,
+                reactive?.NativePointer ?? IntPtr.Zero,     // the bias-current-colour mask: FSR's reactive mask
                 jitterPixels.X, jitterPixels.Y, renderWidth, renderHeight,   // UV units to the render size's pixels
                 (uint)renderWidth, (uint)renderHeight, reset ? 1 : 0, 1f, frameMs);
             if (done != 1)

@@ -154,7 +154,10 @@ namespace Freefall.Graphics
                 list.ResourceBarrierTransition(_upscaleExposure.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
             }
 
-            bool done = _upscaler!.Dispatch(list, Composite.Native, Depth.Native, Motion.Native, _upscaleExposure.Native, target.Native,
+            // Particles, trails and vfx write no motion vectors: where they are, and where the history still holds them,
+            // it is told to count for less
+            var reactive = Engine.Settings.UpscaleReactiveMask ? _oit.ComposeReactive(list, Motion, _upscalerReset)?.Native : null;
+            bool done = _upscaler!.Dispatch(list, Composite.Native, Depth.Native, Motion.Native, _upscaleExposure.Native, reactive, target.Native,
                 RenderWidth, RenderHeight, DisplayWidth, DisplayHeight, JitterPixels, _upscalerReset,
                 camera.NearPlane, camera.FarPlane, camera.FieldOfView * (MathF.PI / 180f),
                 MathF.Max(Time.RealDelta, 1e-4f) * 1000f, Engine.Settings.UpscaleSharpness);
@@ -902,6 +905,9 @@ namespace Freefall.Graphics
                 // The motion field over the picture (DebugVizMode.Motion)
                 if (Engine.Settings.DebugVisualizationMode == DebugVizMode.Motion)
                     MotionView(list);
+                // The temporal upscaler's reactive mask over the picture (DebugVizMode.Reactive)
+                if (Engine.Settings.DebugVisualizationMode == DebugVizMode.Reactive)
+                    _oit.ReactiveView(list, LdrOutput, DisplayWidth, DisplayHeight);
 
                 // 7. SMAA Anti-Aliasing (optional, on LDR output); a temporal upscaler anti-aliases already
                 if (Smaa != null && Engine.Settings.EnableSMAA && !TemporalUpscaling)
@@ -977,6 +983,8 @@ namespace Freefall.Graphics
              foreach (var pair in Effect.MasterEffects)
              {
                  _oit.SetParameters(pair.Value);
+                 // What the OIT draws lie over (taken just before them), for the reactive mask (oit.hlsli OITReactive)
+                 pair.Value.SetParameter("OITBehindIdx", CompositeSnapshot?.BindlessIndex ?? 0u);
                  pair.Value.SetParameter("CameraInverse", cameraInverse);
                  pair.Value.SetParameter("CameraRelativeVP", relativeVP);
                  pair.Value.SetParameter("FogVolumeIdx", _fogVolumeIdx);

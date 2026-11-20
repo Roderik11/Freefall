@@ -695,7 +695,8 @@ namespace Freefall
         RCDebug = 7,
         SkyVisibility = 8,          // light_directional_cs: the sky's share a surface sees past terrain and meshes
         MeshSkyVisibility = 9,      // the meshes' part of it alone (SkyCapture)
-        Motion = 10                 // motion_cs CSMotionView: where each pixel came from (hue = direction, brightness = up to 16 px)
+        Motion = 10,                // motion_cs CSMotionView: where each pixel came from (hue = direction, brightness = up to 16 px)
+        Reactive = 11               // oit_reactive_cs CSReactiveView: how far the temporal upscaler distrusts its history (red)
     }
 
     /// <summary>EngineSettings.Upscaler: the temporal upscaler (UPSCALING_PLAN.md)</summary>
@@ -826,6 +827,13 @@ namespace Freefall
          [ValueRange(0f, 1f)]
          [System.ComponentModel.Description("Sharpening FSR adds to its picture: 0 = none, 1 = the most. DLSS has no sharpening.")]
          public float UpscaleSharpness { get; set; } = 0f;
+
+         /// <summary>
+         /// Gives the temporal upscaler the reactive mask the OIT pass writes (OrderIndependentTransparency.ReactiveMask):
+         /// FSR's reactive mask, DLSS's bias-current-colour mask. Off only to compare.
+         /// </summary>
+         [System.ComponentModel.Description("Tells FSR and DLSS where particles, trails and vfx are, so they trust this frame there instead of smearing them from the last. Needs Transparency Moments or Weighted Blended. Off only to compare.")]
+         public bool UpscaleReactiveMask { get; set; } = true;
 
          public bool ShowGrid { get; set; } = true;                      // Show editor grid in scene view
          public bool ShowSystemGizmos { get; set; } = true;              // Markers systems draw in the scene view whatever is selected (Systems.Gizmos)

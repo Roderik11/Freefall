@@ -463,9 +463,10 @@ OITMomentTargets PS_OITMoments(VSOutput input)
     return OITMoments(PS(input).Color.a, input.Depth);
 }
 
+// Not in the upscaler's reactive mask: glass stands still with what it shows, so its history is good
 OITTargets PS_OIT(VSOutput input)
 {
-    return OITAccumulate(PS(input).Color, input.Depth, input.Position.xy);
+    return OITAccumulate(PS(input).Color, input.Depth, input.Position.xy, 0.0);
 }
 
 technique11 GBuffer

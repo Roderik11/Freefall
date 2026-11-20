@@ -66,6 +66,7 @@ cbuffer SceneConstants : register(b0)
     float OITMomentsTo;                // ... up to here are weighed by the moments; elsewhere by WBOIT's depth weight
     float OITLogNear;                  // ln of the near plane: the warped depth's −1
     float OITLogScale;                 // 2 / (ln far − ln near): the warp to [−1, 1]
+    uint OITBehindIdx;                 // Texture2D<float4>: the composite just before the OIT draws (CompositeSnapshot); 0 = none yet
 
     // ── The scene's terrain (Graphics.Atmosphere.TerrainIdx) — terrain_pages.hlsli LoadTerrain ──
     uint TerrainIdx;                   // StructuredBuffer<TerrainPagesParams> of this frame; 0 = no terrain

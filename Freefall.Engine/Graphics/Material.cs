@@ -766,6 +766,24 @@ namespace Freefall.Graphics
         /// </summary>
         private static BlendDescription AccumulateAll() => new(Blend.One, Blend.One, Blend.One, Blend.One);
 
+        /// <summary>
+        /// Blend "OIT" into RenderTargetFormat "OIT": the two accumulation targets added, the reactive mask (the third,
+        /// oit.hlsli OITReactive) kept at the largest value written.
+        /// </summary>
+        private static BlendDescription AccumulateWithReactive()
+        {
+            var blend = AccumulateAll();
+            blend.IndependentBlendEnable = true;
+            var reactive = blend.RenderTarget[OITReactiveTarget];
+            reactive.BlendOperation = BlendOperation.Max;
+            reactive.BlendOperationAlpha = BlendOperation.Max;
+            blend.RenderTarget[OITReactiveTarget] = reactive;
+            return blend;
+        }
+
+        /// <summary>The OIT accumulation's reactive mask target (oit.hlsli OITTargets.Reactive).</summary>
+        private const int OITReactiveTarget = 2;
+
         /// <summary>Blend "Premultiplied": the colour as given plus what its alpha lets through of what is there (vfx_volume.fx).</summary>
         private static BlendDescription Premultiplied() => new(Blend.One, Blend.InverseSourceAlpha, Blend.One, Blend.InverseSourceAlpha);
 
@@ -773,7 +791,7 @@ namespace Freefall.Graphics
         {
             // The order-independent transparency's targets (OrderIndependentTransparency, oit.hlsli)
             if (overrideFormat == "OIT")
-                return new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_Float };
+                return new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_Float, Format.R8_UNorm };
             if (overrideFormat == "OITMoments")
                 return new[] { Format.R32_Float, Format.R32G32B32A32_Float };
             if (overrideFormat != null && count <= 1 && Enum.TryParse<Format>(overrideFormat, true, out var single))
@@ -955,7 +973,10 @@ namespace Freefall.Graphics
                 {
                     // Resolve RT formats for this pass
                     passRtvFormats = TargetFormats(passRS.RenderTargetCount, passRS.RenderTargetFormat);
-                    
+                    // The OIT accumulation's effects name its two colour targets; OITTargets writes the reactive mask too
+                    if (passRS.RenderTargetFormat == "OIT")
+                        passWritten = Math.Max(passWritten, passRtvFormats.Length);
+
                     // Per-pass DepthFunc override (e.g. preview shaders use LessEqual vs reverse depth)
                     var passDepthFunc = parsedDepthFunc;
                     if (passRS.DepthFunc != null)
@@ -1013,7 +1034,7 @@ namespace Freefall.Graphics
                         "AlphaBlend" => BlendDescription.AlphaBlend,
                         "Premultiplied" => Premultiplied(),
                         "NoColor" => NoColorWrites(),
-                        "OIT" => AccumulateAll(),
+                        "OIT" => passRS.RenderTargetFormat == "OIT" ? AccumulateWithReactive() : AccumulateAll(),
                         _ => blendDesc
                     };
                 }

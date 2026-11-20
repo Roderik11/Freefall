@@ -27,11 +27,12 @@ namespace Freefall.Graphics.Upscaling
         /// Upscale this frame into <paramref name="output"/> (display size, R16G16B16A16_Float, in UnorderedAccess). The
         /// inputs are the render size and readable by compute: the pre-exposed HDR colour, the reverse-Z depth (R32
         /// typeless), the motion vectors (R16G16_Float, last frame's UV minus this frame's, no jitter), the exposure (1x1
-        /// R32_Float holding 1). The SDK may set its own descriptor heaps and root signature: the caller sets the
-        /// engine's again after it. False if it failed.
+        /// R32_Float holding 1), and the reactive mask (R8_UNorm, how far to trust this frame over the history; null for
+        /// none). The SDK may set its own descriptor heaps and root signature: the caller sets the engine's again after
+        /// it. False if it failed.
         /// </summary>
         bool Dispatch(ID3D12GraphicsCommandList list, ID3D12Resource color, ID3D12Resource depth, ID3D12Resource motion,
-            ID3D12Resource exposure, ID3D12Resource output, int renderWidth, int renderHeight, int displayWidth, int displayHeight,
+            ID3D12Resource exposure, ID3D12Resource? reactive, ID3D12Resource output, int renderWidth, int renderHeight, int displayWidth, int displayHeight,
             Vector2 jitterPixels, bool reset, float near, float far, float fovYRadians, float frameMs, float sharpness);
     }
 }

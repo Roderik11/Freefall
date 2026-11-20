@@ -113,15 +113,17 @@ FF_API void *FfDlss_Create(ID3D12GraphicsCommandList *list, unsigned renderWidth
 }
 
 // One frame through DLSS, recorded on 'list'. Inputs at the render size readable by compute (color, depth, motion,
-// exposure: a 1x1 R32_Float), output at the display size in unordered access. jitter: render pixels; mvScale: what
-// turns the motion vectors into render pixels. Returns 1, or the NVSDK_NGX_Result that failed.
+// exposure: a 1x1 R32_Float; biasMask: an R8_UNorm of how far to trust this frame over the history, or null), output
+// at the display size in unordered access. jitter: render pixels; mvScale: what turns the motion vectors into render
+// pixels. Returns 1, or the NVSDK_NGX_Result that failed.
 FF_API int FfDlss_Evaluate(void *handle, ID3D12GraphicsCommandList *list, ID3D12Resource *color, ID3D12Resource *output,
-                           ID3D12Resource *depth, ID3D12Resource *motion, ID3D12Resource *exposure,
+                           ID3D12Resource *depth, ID3D12Resource *motion, ID3D12Resource *exposure, ID3D12Resource *biasMask,
                            float jitterX, float jitterY, float mvScaleX, float mvScaleY,
                            unsigned renderWidth, unsigned renderHeight, int reset, float preExposure, float frameMs)
 {
     if (!g_params || !handle) return 0;
     NVSDK_NGX_D3D12_DLSS_Eval_Params eval = {};
+    eval.pInBiasCurrentColorMask = biasMask;
     eval.Feature.pInColor = color;
     eval.Feature.pInOutput = output;
     eval.pInDepth = depth;

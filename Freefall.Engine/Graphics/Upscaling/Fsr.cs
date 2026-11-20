@@ -38,6 +38,7 @@ namespace Freefall.Graphics.Upscaling
         private const uint ResourceTexture2D = 2;                          // FFX_API_RESOURCE_TYPE_TEXTURE2D
         private const uint FormatR16G16B16A16Float = 4;                    // FfxApiSurfaceFormat, in its order
         private const uint FormatR16G16Float = 18;
+        private const uint FormatR8Unorm = 25;
         private const uint FormatR32Float = 28;
         private const uint UsageReadOnly = 0, UsageUav = 1u << 1;          // FFX_API_RESOURCE_USAGE_*
         private const uint StateUnorderedAccess = 1u << 1;                 // FFX_API_RESOURCE_STATE_*
@@ -267,11 +268,12 @@ namespace Freefall.Graphics.Upscaling
         /// left there). The inputs are the render size: <paramref name="color"/> R16G16B16A16_Float in
         /// NonPixelShaderResource, <paramref name="depth"/> the hardware depth (R32 typeless, reverse Z) readable by
         /// both stages, <paramref name="motion"/> R16G16_Float (last frame's UV minus this frame's) in
-        /// NonPixelShaderResource, <paramref name="exposure"/> a 1x1 R32_Float holding 1 in NonPixelShaderResource. The
-        /// SDK returns each to the state it was handed in.
+        /// NonPixelShaderResource, <paramref name="exposure"/> a 1x1 R32_Float holding 1 in NonPixelShaderResource,
+        /// <paramref name="reactive"/> R8_UNorm in NonPixelShaderResource or null. The SDK returns each to the state it
+        /// was handed in.
         /// </summary>
         public bool Dispatch(ID3D12GraphicsCommandList list, ID3D12Resource color, ID3D12Resource depth, ID3D12Resource motion,
-            ID3D12Resource exposure, ID3D12Resource output, int renderWidth, int renderHeight, int displayWidth, int displayHeight,
+            ID3D12Resource exposure, ID3D12Resource? reactive, ID3D12Resource output, int renderWidth, int renderHeight, int displayWidth, int displayHeight,
             Vector2 jitterPixels, bool reset, float near, float far, float fovYRadians, float frameMs, float sharpness)
         {
             if (_context == IntPtr.Zero) return false;
@@ -284,6 +286,8 @@ namespace Freefall.Graphics.Upscaling
                 MotionVectors = Texture(motion, FormatR16G16Float, renderWidth, renderHeight, UsageReadOnly, StateComputeRead),
                 // 1x1 R32_Float holding 1: the colour is pre-exposed, so its exposure for FSR's tonemapping is one
                 Exposure = Texture(exposure, FormatR32Float, 1, 1, UsageReadOnly, StateComputeRead),
+                // Where particles, trails and vfx are: less of the history there (OrderIndependentTransparency.ReactiveMask)
+                Reactive = reactive != null ? Texture(reactive, FormatR8Unorm, renderWidth, renderHeight, UsageReadOnly, StateComputeRead) : default,
                 Output = Texture(output, FormatR16G16B16A16Float, displayWidth, displayHeight, UsageUav, StateUnorderedAccess),
                 JitterOffset = new FloatCoords2D { X = jitterPixels.X, Y = jitterPixels.Y },
                 // UV units to the render size's pixels
