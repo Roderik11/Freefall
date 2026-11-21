@@ -1345,6 +1345,12 @@ namespace Freefall
         public bool DisableWakeCalm { get; set; } = false;
         [System.ComponentModel.Description("Draws the sea as its old fixed grid, 128 cells a side over the whole ocean (512 m cells in a 65 km sea), instead of the quadtree round the camera: to compare the detail near the eye and the cost.")]
         public bool OceanUniformGrid { get; set; } = false;
+        [System.ComponentModel.Description("How long the sea's triangles are on screen, in pixels of a 1024-pixel-high screen (about 0.8 of a render pixel at 1249 high): smaller is finer waves near the eye and costs more. The cost is the sea's pixel shading, which runs more often on small triangles (2 x 2 pixel quads shared by their edges): at TestWorld's ship bench 10 px cost 3.0 ms, 20 px 2.4, 40 px 2.0.")]
+        [ValueRange(4f, 64f)]
+        public float OceanPixelsPerEdge { get; set; } = 20f;
+        [System.ComponentModel.Description("Within this distance of the eye (m) the sea's triangles keep OceanPixelsPerEdge; beyond it they grow with the distance (twice as long on screen at twice the distance), where the waves' height is a pixel or two and the normal maps carry them. 0 keeps the same size everywhere. Saves little: behind a ship 1.94 ms -> 1.78 at 100 m, 1.68 at 50 (crests softer 60-150 m out); nothing from near the water.")]
+        [ValueRange(0f, 2000f)]
+        public float OceanFineDistance { get; set; } = 100f;
 
          public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
     }

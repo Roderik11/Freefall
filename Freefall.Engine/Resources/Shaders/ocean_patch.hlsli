@@ -29,8 +29,8 @@ cbuffer PushConstants : register(b3)
     // Slot 16: Debug
     uint DebugMode;                 // 16: Debug visualization mode
     uint OceanMaxDepth;             // 17: the deepest level
-    uint _reserved18;
-    uint _reserved19;
+    float OceanPixelsPerEdge;       // 18: EngineSettings.OceanPixelsPerEdge (OceanEdgePixels)
+    float OceanFineDistance;        // 19: EngineSettings.OceanFineDistance (OceanEdgeFactor)
     // Slots 20-21: Shadow pass
     uint ExpansionBufferIdx;        // 20: SRV: expansion buffer
     uint CascadeBufferSRVIdx;       // 21: SRV: StructuredBuffer<CascadeData>
@@ -48,8 +48,17 @@ static const float TessMinFactor = 1.0;
 static const float TessMaxFactor = 48.0;
 // Tessellate until edges are ~20 pixels of a 1024-high screen (WorldEdgeFactor), ~16 render pixels under DLSS Quality at
 // 1249. It was 10 until 2026-11-21: with the quadtree's 2 m cells that put ~10 px triangles everywhere the sea is near,
-// and the pixel shader on them cost 0.6 ms more at TestWorld's ship bench (3.0 against 2.42) for no visible difference
+// and the pixel shader on them cost 0.6 ms more at TestWorld's ship bench (3.0 against 2.42) for no visible difference.
+// The default; EngineSettings.OceanPixelsPerEdge sets it (push slot 18, OceanEdgePixels)
 static const float TargetPixelsPerEdge = 20.0;
+
+// The surface's edge length on screen: the setting, or the default where nothing set it (a draw that does not set slot 18
+// leaves whatever the last draw put there, so anything outside the setting's range reads as unset)
+float OceanEdgePixels()
+{
+    float p = OceanPixelsPerEdge;
+    return p >= 4.0 && p <= 64.0 ? p : TargetPixelsPerEdge;
+}
 
 // An edge's tessellation factor by its length in the world against a pixel's size at its distance, whichever way it
 // faces (pixelsPerEdge: the segments' length on screen). The control points lie flat at sea level, and seen low that
@@ -61,6 +70,20 @@ float WorldEdgeFactor(float3 p0, float3 p1, float pixelsPerEdge, float maxFactor
     float dist = max(distance(0.5 * (p0 + p1), ViewInverse[3].xyz), 0.5);
     float edgePixels = distance(p0, p1) * abs(Projection[1][1]) * 512.0 / dist;
     return clamp(edgePixels / pixelsPerEdge, TessMinFactor, maxFactor);
+}
+
+// The surface's edges (ocean.fx HS): OceanEdgePixels within EngineSettings.OceanFineDistance of the eye (push slot 19; 0,
+// or anything a draw that does not set it left there, keeps that size everywhere), growing in proportion to the distance
+// beyond it: past a few hundred metres a wave's height is a pixel or two, and the sea's look is its normal maps. The
+// pixel shader is most of the sea's cost and runs more often on small triangles (2 x 2 quads along their edges). Both
+// sides of an edge get the same factor: it depends on the edge's two ends alone, in either order
+float OceanEdgeFactor(float3 p0, float3 p1)
+{
+    float pixels = OceanEdgePixels();
+    float fine = OceanFineDistance;
+    if (fine > 0.0 && fine <= 2000.0)
+        pixels *= max(1.0, distance(0.5 * (p0 + p1), ViewInverse[3].xyz) / fine);
+    return WorldEdgeFactor(p0, p1, pixels, TessMaxFactor);
 }
 
 // How far the waves can move a point of the grid, in every direction (metres): patch bounds are widened by it

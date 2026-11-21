@@ -210,6 +210,10 @@ namespace Freefall.Graphics
             cmd.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(_finestCell), 15);
             cmd.SetGraphicsRoot32BitConstant(0, (uint)Engine.Settings.DebugVisualizationMode, 16);
             cmd.SetGraphicsRoot32BitConstant(0, _maxDepth, 17);                                // OceanMaxDepth
+            cmd.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(
+                Math.Clamp(Engine.Settings.OceanPixelsPerEdge, 4f, 64f)), 18);                  // OceanPixelsPerEdge
+            cmd.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(
+                Math.Clamp(Engine.Settings.OceanFineDistance, 0f, 2000f)), 19);                 // OceanFineDistance
             cmd.ExecuteIndirect(device.DrawInstancedSignature, 1, _args.Native, 0, null, 0);
             PixMarker.End(cmd);
         }
