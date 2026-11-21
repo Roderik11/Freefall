@@ -73,18 +73,17 @@ struct VSOutput
 float SeaHeight(OceanData ocean, float2 xz, float camDist)
 {
     float2 p = xz;
-    float2 at = xz;
     float3 d = 0;
     [unroll]
     for (int k = 0; k < 2; k++)
     {
         OceanShore shore;
         SurfWave surf;
-        at = p;
         d = OceanSurfaceDisplacement(ocean, p, camDist, WakeCalmAt(ocean, p), shore, surf);
         p = xz - d.xz;
     }
-    return ocean.OceanPlaneY + d.y + WakeAt(ocean, at).x;
+    // The ships' waves where the surface is, as the ocean's DS reads them (where its point ends up, not its grid point)
+    return ocean.OceanPlaneY + d.y + WakeAt(ocean, xz).x;
 }
 
 VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -292,7 +291,14 @@ float4 WakeColor(VSOutput input, bool fogged)
             Texture2D<float4> noise = ResourceDescriptorHeap[oceans[0].NoiseSRV];
             float2 heading = float2(-input.Right.y, input.Right.x);
             float footprint = input.Depth * 2.0 / (Projection._22 * max(ViewportSize.y, 1.0));
-            SurfFoamMass m = SurfFoamLook(noise, input.World.xz, Time, amount, 1.0, heading, input.Depth, footprint);
+            // The stern's trail in its own metres (across, along: q), drawn out along its y. In the world's, the look's
+            // squeeze along the heading turns the texture's space about the world's origin, thousands of metres off:
+            // where the trail bent (a ship turning) every hundredth of a radian moved the texture by tens of metres, and
+            // its white water was wound into whorls of pixel grain (user, 2026-11-22: "swirled pixelnoise"). A bow
+            // wave's collar and arm keep the world's metres, where they must meet
+            bool trail = !crest && !collar;
+            SurfFoamMass m = SurfFoamLook(noise, trail ? q : input.World.xz, Time, amount, 1.0,
+                                          trail ? float2(0.0, 1.0) : heading, input.Depth, footprint);
             foam = m.cover;
             shade = SurfFoamShade(m, amount);
             [branch]

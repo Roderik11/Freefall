@@ -38,6 +38,14 @@ namespace Freefall.Graphics
         /// <summary>Off, the water is drawn through it again.</summary>
         public bool Enabled = true;
 
+        /// <summary>
+        /// Where the sea stands at each station against the waterline (m, in the hull's frame: 0 at its waterline, below
+        /// it negative), as game code measured it along the hull this frame; 0 where it did not. Only the ships' waves
+        /// (Graphics.WakeWaves) read it, and only where it is below the waterline: the hull presses and churns the water
+        /// where it is in it, so a bow lifted clear over a trough no longer churns the sea under it.
+        /// </summary>
+        public readonly float[] Sea = new float[Stations];
+
         internal Matrix4x4 WorldToLocal = Matrix4x4.Identity;
         internal Vector3 Centre;
         internal float Radius;
@@ -173,8 +181,9 @@ namespace Freefall.Graphics
         private static WaterHull[] _all = Array.Empty<WaterHull>();
         private static readonly object _lock = new();
         private static readonly GraphicsBuffer?[] _buffers = new GraphicsBuffer?[FrameCount];
+        private static readonly GraphicsBuffer?[] _seaBuffers = new GraphicsBuffer?[FrameCount];
         private static int _uploadedTick = -1;
-        private static uint _srv, _count;
+        private static uint _srv, _count, _seaSrv;
         private static readonly List<(float Distance, WaterHull Hull)> _nearest = new();
 
         /// <summary>Where the camera was when the water was last drawn: the hulls nearest it are uploaded.</summary>
@@ -248,6 +257,19 @@ namespace Freefall.Graphics
             }
         }
 
+        /// <summary>
+        /// Where the sea stands along each hull of <see cref="Srv"/>, in the same order (StructuredBuffer&lt;float&gt;,
+        /// <see cref="WaterHull.Stations"/> a hull: <see cref="WaterHull.Sea"/>), 0 when there are no hulls.
+        /// </summary>
+        public static uint SeaSrv
+        {
+            get
+            {
+                Upload();
+                return _seaSrv;
+            }
+        }
+
         // Once a tick, when the first water asks: the nearest hulls into this frame's upload buffer
         private static unsafe void Upload()
         {
@@ -255,6 +277,7 @@ namespace Freefall.Graphics
             _uploadedTick = Engine.TickCount;
             _srv = 0;
             _count = 0;
+            _seaSrv = 0;
             var all = _all;
             if (all.Length == 0 || Engine.Device == null) return;
 
@@ -272,6 +295,8 @@ namespace Freefall.Graphics
             int slot = Engine.FrameIndex % FrameCount;   // a buffer per frame in flight, as the ocean's own data
             var buffer = _buffers[slot] ??= GraphicsBuffer.CreateUpload<Gpu>(MaxDrawn, mapped: true);
             var write = buffer.WritePtr<Gpu>();
+            var seaBuffer = _seaBuffers[slot] ??= GraphicsBuffer.CreateUpload<float>(MaxDrawn * WaterHull.Stations, mapped: true);
+            var sea = seaBuffer.WritePtr<float>();
             for (int i = 0; i < n; i++)
             {
                 var hull = _nearest[i].Hull;
@@ -288,9 +313,12 @@ namespace Freefall.Graphics
                 g.Top = hull.Top;
                 fixed (float* b = g.Breadth)
                     for (int k = 0; k < hull.Breadth.Length; k++) b[k] = hull.Breadth[k];
+                for (int k = 0; k < WaterHull.Stations; k++)
+                    sea[i * WaterHull.Stations + k] = hull.Sea[k];
             }
             _srv = buffer.SrvIndex;
             _count = (uint)n;
+            _seaSrv = seaBuffer.SrvIndex;
         }
     }
 }

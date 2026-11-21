@@ -46,6 +46,8 @@ cbuffer PushConstants : register(b3)
     uint FoamSrvIdx;        // CSFoam: Texture2D<float4> foam, nearness a step ago, calm; CSSurface: the foam now
     uint CalmUAVIdx;        // CSSurface: RWTexture2D<float> the calm the ocean reads (published with the surface)
     uint NoCalm;            // CSFoam: 1 = no calm is made (EngineSettings.DisableWakeCalm): white water at FOAM_LIFE everywhere
+    uint SeaSrvIdx;         // CSForce, CSFoam: StructuredBuffer<float>, HULL_STATIONS a hull in HullsSrv's order: where the
+                            // sea stands against its waterline (WaterHull.Sea; 0 = none: at the waterline everywhere)
 };
 
 #define SIZE 512
@@ -165,7 +167,19 @@ float HullDepth(float2 xz, float seaLevel, out float near, out float edge)
         uint ix = min((uint)fx, HULL_STATIONS - 2);
         float tx = fx - ix;
         float az = abs(l.z);
-        float water = clamp(0.0, y0, y1);
+        // The water's height in its frame: its waterline, or lower where the sea has fallen away under it there (as the
+        // ship measures the sea along its sides: WaterHull.Sea). A bow lifted over a trough pressed and churned the sea
+        // under it as if it were in it, white before it came down (user, 2026-11-22: "there is already churn before the
+        // hull even hits the water"). Never higher than the waterline, which brought back the pumping (above)
+        float water = 0.0;
+        if (SeaSrvIdx != 0)
+        {
+            StructuredBuffer<float> sea = ResourceDescriptorHeap[SeaSrvIdx];
+            water = min(lerp(sea[i * HULL_STATIONS + ix], sea[i * HULL_STATIONS + ix + 1], tx), 0.0);
+        }
+        if (water <= y0)
+            continue;                                   // clear of the sea here
+        water = min(water, y1);
         // The half-breadth at the water's height, and the lowest level reaching past |z|
         float fyW = saturate((water - y0) / (y1 - y0)) * (HULL_LEVELS - 1);
         uint iyW = min((uint)fyW, HULL_LEVELS - 2);

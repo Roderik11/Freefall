@@ -93,7 +93,7 @@ namespace Freefall.Graphics
             var oceans = ComponentCache<OceanRenderer>.All;
             for (int i = 0; i < oceans.Count; i++)
                 if (oceans[i] is { Enabled: true } o) { ocean = o; break; }
-            uint hulls = WaterHulls.Srv, hullCount = WaterHulls.Count;
+            uint hulls = WaterHulls.Srv, hullCount = WaterHulls.Count, hullSea = WaterHulls.SeaSrv;
             if (ocean == null || Engine.Settings.DisableShipWaves || Engine.Device == null)
             {
                 Sleep();
@@ -168,6 +168,7 @@ namespace Freefall.Graphics
                     s.SetPushConstant(k, "HullCount", hullCount);
                     s.SetPushConstant(k, "SeaLevelBits", BitConverter.SingleToUInt32Bits(seaLevel));
                     s.SetPushConstant(k, "PushBits", BitConverter.SingleToUInt32Bits(9.81f * Engine.Settings.ShipWavePush * stepDt));
+                    s.SetPushConstant(k, "SeaSrv", hullSea);
                 });
                 // The white water: carried by this step's water, made where it breaks and where the hulls churn it; and
                 // the calm the hulls leave in their track, which turns the sea's short waves down and makes the white
@@ -186,6 +187,7 @@ namespace Freefall.Graphics
                     s.SetPushConstant(k, "HullCount", hullCount);
                     s.SetPushConstant(k, "SeaLevelBits", BitConverter.SingleToUInt32Bits(seaLevel));
                     s.SetPushConstant(k, "NoCalm", Engine.Settings.DisableWakeCalm ? 1u : 0u);
+                    s.SetPushConstant(k, "SeaSrv", hullSea);
                 });
                 _foamCur ^= 1;
                 steps++;
