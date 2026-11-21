@@ -18,16 +18,17 @@ cbuffer PushConstants : register(b3)
     uint MaterialsIdx;              // 7: Index to materials buffer
     uint GlobalTransformBufferIdx;  // 8: Index to global TransformBuffer
     // Slots 9-15: Custom / Reserved
-    uint OceanDataIdx;              // 9: Per-instance OceanData buffer
-    uint _reserved10;
-    uint _reserved11;
-    uint _reserved12;
-    uint _reserved13;
-    uint _reserved14;
-    uint _reserved15;
+    uint OceanDataIdx;              // 9: Per-instance OceanData buffer (the surface: Graphics.OceanQuadtree's, an entry per view)
+    // The surface's quadtree (Graphics.OceanQuadtree.Record, VS_Leaf; the lips are a batch and do not read these)
+    uint OceanLeavesIdx;            // 10: StructuredBuffer<uint>: the leaves the walk wrote (ocean_leaf.hlsli)
+    uint OceanSlot;                 // 11: this draw's OceanData entry
+    float OceanRootMinX;            // 12: the root square's corner (world xz)
+    float OceanRootMinZ;            // 13
+    uint _reserved14;               // 14: Material.Apply's materials buffer
+    float OceanFinestCell;          // 15: a cell of the deepest leaves (m): every control point lies on its lattice
     // Slot 16: Debug
     uint DebugMode;                 // 16: Debug visualization mode
-    uint _reserved17;
+    uint OceanMaxDepth;             // 17: the deepest level
     uint _reserved18;
     uint _reserved19;
     // Slots 20-21: Shadow pass
@@ -40,11 +41,15 @@ cbuffer PushConstants : register(b3)
 #include "water_common.fx"
 
 #include "ocean_surf.hlsli"
+#include "ocean_leaf.hlsli"
 
 // Tessellation params
 static const float TessMinFactor = 1.0;
 static const float TessMaxFactor = 48.0;
-static const float TargetPixelsPerEdge = 10.0; // tessellate until edges are ~10 pixels
+// Tessellate until edges are ~20 pixels of a 1024-high screen (WorldEdgeFactor), ~16 render pixels under DLSS Quality at
+// 1249. It was 10 until 2026-11-21: with the quadtree's 2 m cells that put ~10 px triangles everywhere the sea is near,
+// and the pixel shader on them cost 0.6 ms more at TestWorld's ship bench (3.0 against 2.42) for no visible difference
+static const float TargetPixelsPerEdge = 20.0;
 
 // An edge's tessellation factor by its length in the world against a pixel's size at its distance, whichever way it
 // faces (pixelsPerEdge: the segments' length on screen). The control points lie flat at sea level, and seen low that
@@ -128,42 +133,52 @@ bool CullTriangle(float3 p0, float3 p1, float3 p2, uint hiZSrv)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// CONTROL POINT SHADER — pass world position through
+// CONTROL POINT SHADER — a quadtree leaf's cells (the surface; the lips have their own, ocean_lip.fx VS_Lip)
 // ═══════════════════════════════════════════════════════════════════════
 
 struct ControlPoint
 {
     float3 WorldPos : WORLDPOS;
-    nointerpolation uint InstanceIdx : TEXCOORD0;
+    nointerpolation uint InstanceIdx : TEXCOORD0;   // the OceanData entry
 };
 
-ControlPoint VS_Control(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+// A cell's two triangles as the old grid's index buffer had them, (x, z+1) (x+1, z) (x, z), then (x, z+1) (x+1, z+1)
+// (x+1, z): the same winding, so the pixel shader's front face (from above or from under the sea) is unchanged
+static const uint2 OceanCellCorners[6] = { uint2(0, 1), uint2(1, 0), uint2(0, 0), uint2(0, 1), uint2(1, 1), uint2(1, 0) };
+
+// Instance = a leaf of the walk (Graphics.OceanQuadtree, ocean_quadtree.hlsl), vertex = a corner of one of its cells.
+// Every point is placed on the lattice of the deepest level's cells by an integer, so a point two leaves share comes out
+// the same to the bit on both sides. On an edge whose neighbour is a level coarser, every second point is moved onto the
+// one before it: that edge then runs between the neighbour's own points, and the triangle it collapses has no area (the
+// hull shader leaves it out)
+ControlPoint VS_Leaf(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
     ControlPoint output;
 
-    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
-    StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
-    StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
+    StructuredBuffer<uint> leaves = ResourceDescriptorHeap[OceanLeavesIdx];
+    uint depth, stitch, ix, iz;
+    UnpackOceanNode(leaves[instanceID], depth, stitch, ix, iz);
 
-    // Look up mesh buffer indices from MeshRegistry
-    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
-    MeshPartEntry part = meshRegistry[MeshPartId];
+    uint cell = vertexID / 6;
+    uint2 local = uint2(cell % OCEAN_LEAF_CELLS, cell / OCEAN_LEAF_CELLS) + OceanCellCorners[vertexID % 6];
+    if ((stitch & 1) && local.x == 0)                local.y &= ~1u;
+    if ((stitch & 2) && local.x == OCEAN_LEAF_CELLS) local.y &= ~1u;
+    if ((stitch & 4) && local.y == 0)                local.x &= ~1u;
+    if ((stitch & 8) && local.y == OCEAN_LEAF_CELLS) local.x &= ~1u;
 
-    StructuredBuffer<uint> indices = ResourceDescriptorHeap[part.IndexBufferIdx];
-    uint vertexID = indices[primitiveVertexID + part.BaseIndex];
-    StructuredBuffer<float3> positions = ResourceDescriptorHeap[part.PosBufferIdx];
-
-    uint dataPos = InstanceBaseOffset + instanceID;
-    uint packedIdx = sortedIndices[dataPos];
-    uint idx = packedIdx & 0x7FFFFFFFu;
-
-    InstanceDescriptor desc = descriptors[idx];
-    row_major matrix World = globalTransforms[desc.TransformSlot];
-
-    output.WorldPos = mul(float4(positions[vertexID], 1.0f), World).xyz;
-    output.InstanceIdx = idx;
-
+    uint2 lattice = (uint2(ix, iz) * OCEAN_LEAF_CELLS + local) << (OceanMaxDepth - depth);
+    StructuredBuffer<OceanData> oceanData = ResourceDescriptorHeap[OceanDataIdx];
+    output.WorldPos = float3(OceanRootMinX + (float)lattice.x * OceanFinestCell,
+                             oceanData[OceanSlot].OceanPlaneY,
+                             OceanRootMinZ + (float)lattice.y * OceanFinestCell);
+    output.InstanceIdx = OceanSlot;
     return output;
+}
+
+// A patch with two corners on one point (a stitched edge collapsed it): nothing to draw
+bool DegeneratePatch(float3 p0, float3 p1, float3 p2)
+{
+    return all(p0 == p1) || all(p1 == p2) || all(p2 == p0);
 }
 
 struct HullConstantOutput

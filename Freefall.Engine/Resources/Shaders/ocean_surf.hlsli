@@ -75,10 +75,40 @@ struct OceanData
     float WakeSpan;             // metres the grid spans
     float2 WakeOrigin;          // its corner (world xz)
     float WakeShow;             // EngineSettings.ShowShipWaves: 1 paints them over the sea (ocean.fx)
-    float _wakePad;
+    uint WakeCalmSRV;           // the calm the hulls left in their track over the same grid (WakeCalmAt); 0 = none. Was padding
 };
 
 SamplerState OceanSampler : register(s0);
+
+// How calm the hulls have left the sea at a point, 0..1 (Graphics/WakeWaves.cs, wake_waves_cs.hlsl CSFoam): made behind a
+// moving hull's stern, carried with the water and fading over CALM_LIFE. Like WakeAt, read only by what draws the sea
+// (the ocean's DS and PS, the wakes' ribbons): a ship's buoyancy and the swimmers' readback feel the full sea
+float WakeCalmAt(OceanData ocean, float2 xz)
+{
+    if (ocean.WakeCalmSRV == 0)
+        return 0.0;
+    float2 uv = (xz - ocean.WakeOrigin) / ocean.WakeSpan;
+    if (any(uv <= 0.0) || any(uv >= 1.0))
+        return 0.0;
+    Texture2D<float> calm = ResourceDescriptorHeap[ocean.WakeCalmSRV];
+    return saturate(calm.SampleLevel(OceanSampler, uv, 0));
+}
+
+// What of a band's waves stands in a hull's track: a hull going through the sea breaks up the short waves and leaves a
+// smoother band behind it (the wake's slick), while the swell runs on under it. The shortest band is turned down by
+// CALM_MOST at full calm, the bands down to CALM_LONG less by their length (log scale: the 64 m band about half),
+// longer ones not at all. Until 2026-11-21 the ships' waves only added to the sea, and in a storm the track was the
+// busiest water round the ship (user: "shouldn't the wake calm the water? it seems to do the opposite")
+#define CALM_MOST 0.8
+#define CALM_SHORT 17.0
+#define CALM_LONG 250.0
+float CalmShare(float calm, float tileScale)
+{
+    if (calm <= 0.0)
+        return 1.0;
+    float shortness = saturate((log2(CALM_LONG) + log2(tileScale)) / (log2(CALM_LONG) - log2(CALM_SHORT)));
+    return 1.0 - CALM_MOST * calm * shortness;
+}
 
 // The ships' waves at a point of the sea (Graphics/WakeWaves.cs, wake_waves_cs.hlsl): height (m), its slopes
 // (∂h/∂x, ∂h/∂z) and the white water they made (0..1.5); 0 off the grid or while no ship is near. Not part of
@@ -430,9 +460,10 @@ float DepthLimit(float y, float depth, out float slopeScale)
 
 //   shoreAtten, depth: as BandShoreAtten (1 and a large depth away from the shore)
 //   terrainUV, surf: the point's terrain UV for the surf's warp (SampleBandWarp), and whether to warp at all
+//   calm: the hulls' calm here (WakeCalmAt, CalmShare), 0 for the full sea
 //   wave: the surf's wave here (its carried bands)
 float3 SampleDisplacement(OceanData ocean, float2 worldXZ, float depthAtten, float camDist, float shoreAtten, float depth,
-                          float2 terrainUV, bool surf, out SurfWave wave)
+                          float2 terrainUV, bool surf, float calm, out SurfWave wave)
 {
     wave = (SurfWave)0;
     Texture2DArray<float4> dispTex = ResourceDescriptorHeap[ocean.DisplacementSRV];
@@ -462,6 +493,7 @@ float3 SampleDisplacement(OceanData ocean, float2 worldXZ, float depthAtten, flo
         }
         else
             amp = BandShoreAtten(shoreAtten, depth, tileScales[i]);
+        amp *= CalmShare(calm, tileScales[i]);
 
         float2 uv = RotateUV(p, BandAngles[i]) * tileScales[i];
         float mipLevel = log2(max(1.0, camDist * tileScales[i] * 0.15 * stretch));
@@ -483,8 +515,10 @@ float3 SampleDisplacement(OceanData ocean, float2 worldXZ, float depthAtten, flo
 // Where the ocean draws the point of its grid at worldXZ, as an offset from (worldXZ, OceanPlaneY): the bands'
 // displacement, and near the shore the surf's limits (no higher than a breaking wave, no lower than the bed, nothing
 // pushed sideways further than the water is deep), the breaking face's lean and the swash's run-up. The ocean's DS, and
-// the lip (ocean_lip.fx) for the crest its sheet hangs from. shore, surf: as the DS needs them for the PS
-float3 OceanSurfaceDisplacement(OceanData ocean, float2 worldXZ, float camDist, out OceanShore shore, out SurfWave surf)
+// the lip (ocean_lip.fx) for the crest its sheet hangs from. shore, surf: as the DS needs them for the PS. calm: the
+// hulls' calm here (WakeCalmAt), for what draws the sea; the overload without it is the full sea (probes, lip, spray)
+float3 OceanSurfaceDisplacement(OceanData ocean, float2 worldXZ, float camDist, float calm, out OceanShore shore,
+                                out SurfWave surf)
 {
     // How far the shore flattens the longest waves here and the depth that sets how much each band feels of it
     // (BandShoreAtten): the PS weighs the bands' slopes and foam alike
@@ -495,7 +529,7 @@ float3 OceanSurfaceDisplacement(OceanData ocean, float2 worldXZ, float camDist, 
     // Sample FFT displacement from all bands (with distance-based mips), each as far as the shore lets it stand, the
     // surf's bands where their waves were out at sea
     float3 displacement = SampleDisplacement(ocean, worldXZ, ocean.DisplacementAtten, camDist, shore.waveAtten, shoreDepth,
-                                             shore.surfUV, ocean.TerrainPages != 0, surf);
+                                             shore.surfUV, ocean.TerrainPages != 0, calm, surf);
 
     if (ocean.ShoreWarpSRV != 0 && shoreDepth < 1e3)
     {
@@ -529,6 +563,12 @@ float3 OceanSurfaceDisplacement(OceanData ocean, float2 worldXZ, float camDist, 
         displacement.y = lerp(displacement.y, level, swashZone);
     }
     return displacement;
+}
+
+// The full sea, with no hull's calm: the underwater probe a ship floats on and swimmers read, the lip, the surf's spray
+float3 OceanSurfaceDisplacement(OceanData ocean, float2 worldXZ, float camDist, out OceanShore shore, out SurfWave surf)
+{
+    return OceanSurfaceDisplacement(ocean, worldXZ, camDist, 0.0, shore, surf);
 }
 
 // ── The breaking lip (ocean_lip.fx, .agent/knowledge/ocean_system/surf_lip_plan.md) ──

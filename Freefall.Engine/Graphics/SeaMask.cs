@@ -42,6 +42,7 @@ namespace Freefall.Graphics
             public float SeaLevel;
             public float SeaShare;          // of the terrain's cells, incl. the beaches
             public double Milliseconds;     // the flood
+            public uint[]? Reach;           // where the sea's quadtree finds sea, coarse (OceanQuadtree.BuildReach); built with it
         }
 
         private ID3D12Resource? _texture;

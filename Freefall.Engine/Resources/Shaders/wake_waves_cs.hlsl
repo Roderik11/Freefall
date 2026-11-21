@@ -13,6 +13,9 @@
 // CSFoam keeps the white water on the same grid: made where a hull goes into the water and where it leaves it (its
 // depth there changing) and where the simulated waves grow steep enough to break, carried by the water's own surface
 // velocity (∇φ) and fading. Foam ages where the water took it, so nothing is drawn as a shape round the ship.
+// Beside it the calm a hull leaves in its track (2026-11-21): made behind the stern as a moving hull leaves the water,
+// carried the same way and fading over CALM_LIFE; the ocean turns the sea's short waves down by it (ocean_surf.hlsli
+// CalmShare). The foam texture holds foam, how near a hull's waterline the cell was a step ago, and the calm.
 
 #pragma kernel CSFft
 #pragma kernel CSEvolve
@@ -20,6 +23,7 @@
 #pragma kernel CSFoam
 #pragma kernel CSSurface
 #pragma kernel CSClear
+#pragma kernel CSClear4
 
 #include "water_hulls.hlsli"
 
@@ -39,7 +43,9 @@ cbuffer PushConstants : register(b3)
     uint HullCount;
     uint SeaLevelBits;      // CSForce: the still sea's height (world y)
     uint PushBits;          // CSForce: g κ Δt: how hard a metre of hull presses φ a step
-    uint FoamSrvIdx;        // CSFoam: Texture2D<float2> foam, the hulls' depth a step ago; CSSurface: the foam now
+    uint FoamSrvIdx;        // CSFoam: Texture2D<float4> foam, nearness a step ago, calm; CSSurface: the foam now
+    uint CalmUAVIdx;        // CSSurface: RWTexture2D<float> the calm the ocean reads (published with the surface)
+    uint NoCalm;            // CSFoam: 1 = no calm is made (EngineSettings.DisableWakeCalm): white water at FOAM_LIFE everywhere
 };
 
 #define SIZE 512
@@ -49,6 +55,7 @@ cbuffer PushConstants : register(b3)
 #define GRAVITY 9.81
 #define EDGE_CELLS 32.0     // the waves fade out over this many cells at the grid's edge
 #define EDGE_KEEP 0.9       // what is left of them a step at the very edge
+#define END_SOFT 2.0        // m over which a hull's push fades out at its stern and its stem (HullDepth)
 
 // ── FFT: one row per group, radix-2 Stockham in shared memory, written transposed ──
 groupshared float2 Line[SIZE];
@@ -121,9 +128,15 @@ void CSEvolve(uint3 id : SV_DispatchThreadID)
     output[i] = float2(H2.x - P2.y, H2.y + P2.x);       // H2 + i P2
 }
 
-// How deep a hull lies under the still sea at a point (m): the lowest of its levels whose half-breadth there reaches
-// past the point's distance from its middle, under the water's height in its frame; soft over the last metre inside its
+// How deep a hull lies under the water at a point (m): the lowest of its levels whose half-breadth there reaches past
+// the point's distance from its middle, under its own waterline (y 0 in its frame); soft over the last metre inside its
 // waterline, so the push has no hard edge to ring at the grid's own scale.
+// The water is the hull's waterline, not the still sea: a ship rides the swell, and the waves it makes are the ones its
+// draft raises as it goes through the water, whatever the swell does under it. Measured against the still sea, a caravel
+// down 2 m in a trough pressed 2 m deeper, up on a crest hardly at all, and pumped a white ridge 2–3 m high round its
+// stern with every swell; its waterline swept the water as it pitched and heaved and churned white water all round it
+// (user, 2026-11-21: the wake "seems to do the opposite" of calming the sea). The point is taken at the hull's own height,
+// so its pitch and roll do not slide the footprint about either.
 //   near: 1 inside a hull's waterline, fading out 2 m outside it (the hull's own dent is no breaking wave)
 //   edge: 1 in the band along the waterline where the push ramps up (where the hull meets the water), 0 elsewhere
 float HullDepth(float2 xz, float seaLevel, out float near, out float edge)
@@ -133,25 +146,25 @@ float HullDepth(float2 xz, float seaLevel, out float near, out float edge)
     if (HullsSrvIdx == 0)
         return 0.0;
     StructuredBuffer<WaterHull> hulls = ResourceDescriptorHeap[HullsSrvIdx];
-    float3 p = float3(xz.x, seaLevel, xz.y);
     float depth = 0.0;
     for (uint i = 0; i < HullCount; i++)
     {
         float4 sphere = hulls[i].Sphere;
-        float3 d = p - sphere.xyz;
+        float2 dxz = xz - sphere.xz;
         float reach = sphere.w + 2.0;
-        if (dot(d, d) > reach * reach)
+        if (dot(dxz, dxz) > reach * reach)
             continue;
-        float4 w = float4(p, 1.0);
-        float3 l = float3(dot(hulls[i].Row0, w), dot(hulls[i].Row1, w), dot(hulls[i].Row2, w));
         float x0 = hulls[i].X0, x1 = hulls[i].X1, y0 = hulls[i].Bottom, y1 = hulls[i].Top;
-        if (l.x <= x0 || l.x >= x1 || l.y <= y0)
+        // At the height of the hull's waterline (its sphere's centre is the middle of its extent, y (y0 + y1) / 2)
+        float4 w = float4(xz.x, sphere.y - 0.5 * (y0 + y1), xz.y, 1.0);
+        float3 l = float3(dot(hulls[i].Row0, w), dot(hulls[i].Row1, w), dot(hulls[i].Row2, w));
+        if (l.x <= x0 || l.x >= x1 || y1 <= y0)
             continue;
         float fx = (l.x - x0) / (x1 - x0) * (HULL_STATIONS - 1);
         uint ix = min((uint)fx, HULL_STATIONS - 2);
         float tx = fx - ix;
         float az = abs(l.z);
-        float water = min(l.y, y1);
+        float water = clamp(0.0, y0, y1);
         // The half-breadth at the water's height, and the lowest level reaching past |z|
         float fyW = saturate((water - y0) / (y1 - y0)) * (HULL_LEVELS - 1);
         uint iyW = min((uint)fyW, HULL_LEVELS - 2);
@@ -183,7 +196,10 @@ float HullDepth(float2 xz, float seaLevel, out float near, out float edge)
             bPrev = b;
             yPrev = y;
         }
-        float soft = smoothstep(0.0, 1.0, bWater - az);
+        // Soft across the waterline, and along it at the hull's ends: a transom ends the hull square, and there the push
+        // stopped in one cell, rang at the grid's own scale into short steep waves behind the stern, and those counted as
+        // breaking (BREAK_SLOPE) all down the track: a white sheet behind every ship
+        float soft = smoothstep(0.0, 1.0, bWater - az) * smoothstep(0.0, END_SOFT, l.x - x0) * smoothstep(0.0, END_SOFT, x1 - l.x);
         depth = max(depth, max(water - bottom, 0.0) * soft);
         edge = max(edge, 4.0 * soft * (1.0 - soft));
     }
@@ -222,7 +238,8 @@ void CSForce(uint3 id : SV_DispatchThreadID)
 #define BREAK_RATE 0.8      // foam a second where they break fully (4 laid solid white sheets; 1.5 white blotches)
 #define ADVANCE 1.6         // foam a cell gets as a hull's outline comes over it (the stem, the bow widening past it),
                             // at full sweep (below)
-#define LEAVE 1.1           // and as the outline leaves it behind (the stern)
+#define LEAVE 0.6           // and as the outline leaves it behind (the stern): a short wash into the calm track behind
+                            // it (1.1 laid ~20 m of solid white behind a caravel at 9 m/s once the track had no chop)
 #define SWEEP_FROM 0.4      // how fast the outline must sweep over the water (nearness a second, ~0.8 m/s of hull at the
                             // stem) before it churns anything: a ship lying still churned as it rocked (user, 2026-11-21:
                             // "the churn should be minimal at standstill and ramp up with speed")
@@ -230,17 +247,35 @@ void CSForce(uint3 id : SV_DispatchThreadID)
 #define CARRY 0.3           // share of the simulated surface velocity that carries the foam: the hull as a pressure patch
                             // drives a stronger flow round it than a hull does, and all of it blew the foam into a sheet
 
+// ── The calm in a hull's track ──
+#define CALM_LIFE 20.0      // s for it to fade to a third: the wind rebuilds the short waves behind the ship
+#define CALM_SPREAD 1.5     // per second, toward the mean of its four neighbours: the track's edges soften and it widens
+#define CALM_FROM 0.2       // how fast the stern's outline must leave the water before it leaves calm behind (nearness a
+                            // second, ~0.4 m/s of hull): a ship lying still and rocking leaves none
+#define CALM_FULL 0.6       // and by which the calm is full (~1.2 m/s)
+#define CALM_FOAM_LIFE 0.5  // s for the white water in a full calm to fade to a third (FOAM_LIFE elsewhere)
+
 float2 LoadClamped(Texture2D<float2> t, int2 c)
 {
     return t.Load(int3(clamp(c, 0, SIZE - 1), 0));
+}
+
+float4 LoadClamped4(Texture2D<float4> t, int2 c)
+{
+    return t.Load(int3(clamp(c, 0, SIZE - 1), 0));
+}
+
+float4 LoadInside(Texture2D<float4> t, int2 c)
+{
+    return all(c >= 0) && all(c < SIZE) ? t.Load(int3(c, 0)) : 0.0;
 }
 
 [numthreads(8, 8, 1)]
 void CSFoam(uint3 id : SV_DispatchThreadID)
 {
     Texture2D<float2> state = ResourceDescriptorHeap[InSrvIdx];
-    Texture2D<float2> foamIn = ResourceDescriptorHeap[FoamSrvIdx];
-    RWTexture2D<float2> foamOut = ResourceDescriptorHeap[OutUAVIdx];
+    Texture2D<float4> foamIn = ResourceDescriptorHeap[FoamSrvIdx];
+    RWTexture2D<float4> foamOut = ResourceDescriptorHeap[OutUAVIdx];
     int2 p = int2(id.xy);
     float dt = asfloat(DtBits);
 
@@ -254,16 +289,23 @@ void CSFoam(uint3 id : SV_DispatchThreadID)
     float2 from = float2(p) + float2(ShiftX, ShiftZ) - velocity * dt / CELL;
     int2 c0 = int2(floor(from));
     float2 t = from - c0;
-    float f00 = all(c0 >= 0) && all(c0 < SIZE) ? foamIn.Load(int3(c0, 0)).x : 0.0;
-    float f10 = all(c0 + int2(1, 0) >= 0) && all(c0 + int2(1, 0) < SIZE) ? foamIn.Load(int3(c0 + int2(1, 0), 0)).x : 0.0;
-    float f01 = all(c0 + int2(0, 1) >= 0) && all(c0 + int2(0, 1) < SIZE) ? foamIn.Load(int3(c0 + int2(0, 1), 0)).x : 0.0;
-    float f11 = all(c0 + 1 >= 0) && all(c0 + 1 < SIZE) ? foamIn.Load(int3(c0 + 1, 0)).x : 0.0;
-    float foam = lerp(lerp(f00, f10, t.x), lerp(f01, f11, t.x), t.y);
+    float4 f00 = LoadInside(foamIn, c0);
+    float4 f10 = LoadInside(foamIn, c0 + int2(1, 0));
+    float4 f01 = LoadInside(foamIn, c0 + int2(0, 1));
+    float4 f11 = LoadInside(foamIn, c0 + 1);
+    float4 carried = lerp(lerp(f00, f10, t.x), lerp(f01, f11, t.x), t.y);
+    float foam = carried.x;
+    float calm = carried.z;
     // Spreading a little into its neighbours (about a cell in a quarter second), so no cell stands out of its field
-    float neighbours = 0.25 * (LoadClamped(foamIn, p + int2(ShiftX + 1, ShiftZ)).x + LoadClamped(foamIn, p + int2(ShiftX - 1, ShiftZ)).x
-                             + LoadClamped(foamIn, p + int2(ShiftX, ShiftZ + 1)).x + LoadClamped(foamIn, p + int2(ShiftX, ShiftZ - 1)).x);
-    foam = lerp(foam, neighbours, saturate(FOAM_SPREAD * dt));
-    foam *= exp(-dt / FOAM_LIFE);
+    float4 neighbours = 0.25 * (LoadClamped4(foamIn, p + int2(ShiftX + 1, ShiftZ)) + LoadClamped4(foamIn, p + int2(ShiftX - 1, ShiftZ))
+                              + LoadClamped4(foamIn, p + int2(ShiftX, ShiftZ + 1)) + LoadClamped4(foamIn, p + int2(ShiftX, ShiftZ - 1)));
+    foam = lerp(foam, neighbours.x, saturate(FOAM_SPREAD * dt));
+    // In the track the white water goes within a second (CALM_FOAM_LIFE) instead of FOAM_LIFE: what the stern churned
+    // and the track's own breaking waves turn into the smooth band behind it at once (in a storm the hull plunging in
+    // the swell churned a white sheet over the stern that lay there for seconds: "it seems to do the opposite")
+    foam *= exp(-dt / lerp(FOAM_LIFE, CALM_FOAM_LIFE, saturate(calm)));
+    calm = lerp(calm, neighbours.z, saturate(CALM_SPREAD * dt));
+    calm *= exp(-dt / CALM_LIFE);
 
     // How near a hull's waterline this water was a step ago (moved with the grid) and is now: 1 inside, falling to 0
     // 2 m outside it (and 2 m past the stem and the stern)
@@ -287,12 +329,19 @@ void CSFoam(uint3 id : SV_DispatchThreadID)
         float sweep = abs(rise) / dt;
         float churn = max(sweep - SWEEP_FROM, 0.0) * dt * saturate(sweep / SWEEP_FULL);
         foam += churn * (rise > 0.0 ? ADVANCE : LEAVE);
+        // The calm: where the outline leaves the water behind it (the stern going on), as much as the water was inside the
+        // hull's reach a step ago, by how fast it leaves. Not at the bow (it comes over the water there) nor along the
+        // sides (their outline stands still as the hull glides past), so the track starts at the stern, as wide as it
+        if (rise < 0.0)
+            calm = max(calm, before * saturate((sweep - CALM_FROM) / (CALM_FULL - CALM_FROM)));
     }
+    if (NoCalm != 0)
+        calm = 0.0;
     // Where the waves break: on crests, away from the hull's own dent (its sides are steep but nothing breaks there;
     // until 2026-11-21 its whole outline foamed and the path it swept was solid white)
     float height = state.Load(int3(p, 0)).x;
     foam += saturate((steep - BREAK_SLOPE) / BREAK_RANGE) * BREAK_RATE * dt * (1.0 - near) * step(0.0, height);
-    foamOut[p] = float2(min(foam, FOAM_MOST), near);
+    foamOut[p] = float4(min(foam, FOAM_MOST), near, saturate(calm), 0.0);
 }
 
 // ── What the water reads: height, slopes (m, m/m) and foam, fading out toward the edge ──
@@ -300,8 +349,9 @@ void CSFoam(uint3 id : SV_DispatchThreadID)
 void CSSurface(uint3 id : SV_DispatchThreadID)
 {
     Texture2D<float2> state = ResourceDescriptorHeap[InSrvIdx];
-    Texture2D<float2> foam = ResourceDescriptorHeap[FoamSrvIdx];
+    Texture2D<float4> foam = ResourceDescriptorHeap[FoamSrvIdx];
     RWTexture2D<float4> surface = ResourceDescriptorHeap[OutUAVIdx];
+    RWTexture2D<float> calmOut = ResourceDescriptorHeap[CalmUAVIdx];
     int2 p = int2(id.xy);
     int2 r = min(p + int2(1, 0), SIZE - 1), l = max(p - int2(1, 0), 0);
     int2 u = min(p + int2(0, 1), SIZE - 1), d = max(p - int2(0, 1), 0);
@@ -310,12 +360,22 @@ void CSSurface(uint3 id : SV_DispatchThreadID)
     float hz = (state.Load(int3(u, 0)).x - state.Load(int3(d, 0)).x) / (2.0 * CELL);
     float edge = (float)min(min(p.x, p.y), min(SIZE - 1 - p.x, SIZE - 1 - p.y));
     float fade = smoothstep(0.0, EDGE_CELLS, edge);
-    surface[p] = float4(h, hx, hz, foam.Load(int3(p, 0)).x) * fade;
+    float4 f = foam.Load(int3(p, 0));
+    surface[p] = float4(h, hx, hz, f.x) * fade;
+    calmOut[p] = f.z * fade;
 }
 
 [numthreads(8, 8, 1)]
 void CSClear(uint3 id : SV_DispatchThreadID)
 {
     RWTexture2D<float2> output = ResourceDescriptorHeap[OutUAVIdx];
+    output[id.xy] = 0.0;
+}
+
+// The foam textures (four channels)
+[numthreads(8, 8, 1)]
+void CSClear4(uint3 id : SV_DispatchThreadID)
+{
+    RWTexture2D<float4> output = ResourceDescriptorHeap[OutUAVIdx];
     output[id.xy] = 0.0;
 }

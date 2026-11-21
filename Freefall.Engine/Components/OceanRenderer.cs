@@ -227,10 +227,17 @@ namespace Freefall.Components
         private uint[] _appliedLengthScales = Array.Empty<uint>();
         private float _appliedDepth = float.NaN;
 
-        private Mesh _mesh = null!;
+        // The surface: the leaves of a quadtree round the camera, walked on the GPU and drawn at the head of the forward
+        // pass (Graphics.OceanQuadtree, ocean.fx). It was one 128² grid over the entity's scale until 2026-11-21
         private Material _material = null!;
+        private readonly OceanQuadtree _quadtree = new();
+
+        /// <summary>The surface's quadtree leaves drawn in a frame, read back a few frames late (each 128 triangle patches).</summary>
+        [Reflection.DontSerialize]
+        public uint Leaves => _quadtree.Leaves;
+
         // The surf's breaking lips (ocean_lip.fx): a grid of their own round the camera, drawn over the ocean with its
-        // parameters; the ocean's 128 m cells give a curl a few metres long no more than two or three segments
+        // parameters: a curl a few metres long needs cells of 4 m, and only the 128 m round the camera breaks
         private const int LipGridSize = 64;
         private Mesh _lipMesh = null!;
         private Material _lipMaterial = null!;
@@ -417,14 +424,11 @@ namespace Freefall.Components
             public float WakeSpan;
             public Vector2 WakeOrigin;   // its corner (world xz)
             public float WakeShow;       // EngineSettings.ShowShipWaves: 1 paints them over the sea
-            public float _wakePad;
+            public uint WakeCalmSRV;     // Graphics.WakeWaves.CalmSrv: the calm the hulls left in their track (0 = none). Was padding
         }
-
-        private const int GridSize = 128;
 
         protected override void Awake()
         {
-            _mesh = CreateOceanGrid(Engine.Device, GridSize);
             _material = new Material(new Effect("ocean"));
             _lipMesh = CreateOceanGrid(Engine.Device, LipGridSize);
             _lipMaterial = new Material(new Effect("ocean_lip"));
@@ -549,6 +553,7 @@ namespace Freefall.Components
                 {
                     var mask = SeaMask.Build(heights, seaLevel01, spacing, seaLevel, terrain.MaxHeight);
                     if (Volatile.Read(ref _seaMaskRequest) != request) return;
+                    mask.Reach = OceanQuadtree.BuildReach(mask);
                     Volatile.Write(ref _builtSeaMask, mask);
                     BakeShoreWarp(warp, heights, mask);
                 }
@@ -696,7 +701,7 @@ namespace Freefall.Components
             device.DeferDispose(_tileScalesBuffer);
             foreach (var b in _surfData) device.DeferDispose(b);
             device.DeferDispose(_oceanFFT);
-            device.DeferDispose(_mesh);
+            _quadtree.Dispose();
             device.DeferDispose(_lipMesh);
             if (_drawn == this)
                 _drawn = null;
@@ -958,7 +963,7 @@ namespace Freefall.Components
 
         public void Update()
         {
-            if (_mesh == null || _material == null) return;
+            if (_material == null || _oceanFFT == null) return;
             _waveTime += (float)Time.Delta * WaveSpeed;
 
             // The spectrum's parameters (the bands, the weather's wind): the initial spectrum is rebuilt only when they
@@ -995,7 +1000,7 @@ namespace Freefall.Components
 
         public void Draw()
         {
-            if (_mesh == null || _material == null || _oceanFFT == null) return;
+            if (_material == null || _oceanFFT == null) return;
             _drawn = this;
             _drawnTick = Engine.TickCount;
 
@@ -1011,6 +1016,7 @@ namespace Freefall.Components
             {
                 _seaMask.Upload(seaMask);
                 SeaCells = new SeaPlaces(seaMask, _terrain);
+                if (seaMask.Reach != null) _quadtree.UploadReach(seaMask.Reach);
             }
             if (Interlocked.Exchange(ref _builtShoreWarp, null) is { } shoreWarp)
                 _shoreWarp.Upload(shoreWarp);
@@ -1111,6 +1117,7 @@ namespace Freefall.Components
                 WakeSpan = WakeWaves.Span,
                 WakeOrigin = WakeWaves.Origin,
                 WakeShow = Engine.Settings.ShowShipWaves ? 1f : 0f,
+                WakeCalmSRV = Engine.Settings.DisableWakeCalm ? 0u : WakeWaves.CalmSrv,
             };
             _params.SetParameter("OceanData", data);
 
@@ -1128,7 +1135,10 @@ namespace Freefall.Components
                 CommandBuffer.Enqueue(RenderPass.Opaque, cmd => _lipMap.Dispatch(cmd, Engine.Device, oceanDataSrv));
             }
 
-            CommandBuffer.Enqueue(_mesh, _material, _params, Transform.TransformSlot);
+            // The surface: its quadtree walked and its leaves drawn at the head of the forward pass, before the forward
+            // batches (the lips, water bodies, glass), as it is not a batch of its own any more
+            if (Camera.Main is { } camera)
+                _quadtree.Queue(_material, data, Transform.WorldPosition, Transform.WorldScale, camera, _terrain);
             // The lips over it, with the same OceanData (its VS places the grid round the camera; the transform only
             // keeps the batch from being culled: the grid's bounds times the ocean's scale)
             if (lips)

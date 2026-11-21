@@ -68,8 +68,8 @@ struct VSOutput
 };
 
 // The sea's surface over a place: the point of the ocean's grid that is displaced to it, found by going back by its
-// sideways displacement (two steps settle it), as the underwater probe does; with the ships' waves raised on it as the
-// ocean's DS raises them (WakeAt), so a wake lies on them
+// sideways displacement (two steps settle it), as the underwater probe does; with the ships' waves raised on it and the
+// short waves calmed in a hull's track as the ocean's DS has them (WakeAt, WakeCalmAt), so a wake lies on them
 float SeaHeight(OceanData ocean, float2 xz, float camDist)
 {
     float2 p = xz;
@@ -81,7 +81,7 @@ float SeaHeight(OceanData ocean, float2 xz, float camDist)
         OceanShore shore;
         SurfWave surf;
         at = p;
-        d = OceanSurfaceDisplacement(ocean, p, camDist, shore, surf);
+        d = OceanSurfaceDisplacement(ocean, p, camDist, WakeCalmAt(ocean, p), shore, surf);
         p = xz - d.xz;
     }
     return ocean.OceanPlaneY + d.y + WakeAt(ocean, at).x;

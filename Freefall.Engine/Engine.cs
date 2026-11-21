@@ -1341,6 +1341,10 @@ namespace Freefall
         public float ShipWaveViscosity { get; set; } = 0.02f;
         [System.ComponentModel.Description("Paints the ships' simulated waves over the sea, crests red and troughs blue (full at ±0.3 m), to see the simulation through the sea's own chop.")]
         public bool ShowShipWaves { get; set; } = false;
+        [System.ComponentModel.Description("The sea keeps its full chop in a ship's track: no calm is left behind a moving hull's stern (Graphics.WakeWaves: the sea's short waves turned down there, the ships' white water fading within a second). To compare with and without.")]
+        public bool DisableWakeCalm { get; set; } = false;
+        [System.ComponentModel.Description("Draws the sea as its old fixed grid, 128 cells a side over the whole ocean (512 m cells in a 65 km sea), instead of the quadtree round the camera: to compare the detail near the eye and the cost.")]
+        public bool OceanUniformGrid { get; set; } = false;
 
          public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
     }

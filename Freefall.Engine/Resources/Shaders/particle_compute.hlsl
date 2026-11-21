@@ -357,7 +357,7 @@ bool spawn_surf(ParticleEmitter e, uint seed, inout ParticleCore p)
         if (shore.shoreDepth > 1e3 || shore.waterDepth < SURF_FOAM_END.x) continue;
 
         d = SampleDisplacement(ocean, xz, ocean.DisplacementAtten, distance(CameraPosition.xz, xz), shore.waveAtten,
-                               shore.shoreDepth, shore.surfUV, true, wave);
+                               shore.shoreDepth, shore.surfUV, true, 0.0, wave);
         breaking = SurfBreaking(wave, shore.shoreDepth) * smoothstep(SURF_FOAM_END.x, SURF_FOAM_END.y, shore.shoreDepth);
         float2 weight = wave.envelope / max(max(wave.envelope.x, wave.envelope.y), 1e-6);
         float2 rt0 = SurfRollerTrail(wave.phase.x) * weight.x;

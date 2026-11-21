@@ -47,17 +47,20 @@ namespace Freefall.Graphics
         private const int MaxStepsPerFrame = 2;
 
         private static ComputeShader? _shader;
-        private static int _kFft, _kEvolve, _kForce, _kFoam, _kSurface, _kClear;
+        private static int _kFft, _kEvolve, _kForce, _kFoam, _kSurface, _kClear, _kClear4;
         private static RenderTexture2D? _state, _a, _b;
-        // The foam and the hulls' depth a step ago, in two textures in turn (it is carried by the water: read round)
+        // The foam, how near a hull's waterline each cell was a step ago, and the calm a hull left in its track, in two
+        // textures in turn (they are carried by the water: read round)
         private static readonly RenderTexture2D?[] _foam = new RenderTexture2D?[2];
         private static int _foamCur;
         // Two surfaces in turn: the ocean's data for a frame is filled before that frame's step, so it reads the surface
         // and the origin of the step before as a pair; one surface written over with a moved grid under the old origin
-        // put every wave half a metre off for a frame whenever the grid moved a cell
+        // put every wave half a metre off for a frame whenever the grid moved a cell. The calm the ocean reads is
+        // published with them, in a pair of its own
         private static readonly RenderTexture2D?[] _surfaces = new RenderTexture2D?[2];
+        private static readonly RenderTexture2D?[] _calm = new RenderTexture2D?[2];
         private static int _surfaceNext;
-        private static readonly ResourceStates[] _states = new ResourceStates[7];
+        private static readonly ResourceStates[] _states = new ResourceStates[9];
         private static Vector2 _origin, _published;
         private static bool _cleared;
         private static float _alive;
@@ -68,6 +71,13 @@ namespace Freefall.Graphics
 
         /// <summary>World xz of <see cref="Srv"/>'s corner (it spans <see cref="Span"/>).</summary>
         public static Vector2 Origin => _published;
+
+        /// <summary>
+        /// The calm the hulls left in their track over the same grid (Texture2D&lt;float&gt; 0..1, published with
+        /// <see cref="Srv"/>), 0 while the water is still. The ocean turns its short waves down by it (ocean_surf.hlsli
+        /// CalmShare): a hull going through the sea leaves a smoother band behind it.
+        /// </summary>
+        public static uint CalmSrv { get; private set; }
 
         /// <summary>
         /// The frame's steps, before the water is drawn (DeferredRenderer, after the ripples): the grid follows the camera by
@@ -117,9 +127,10 @@ namespace Freefall.Graphics
                 _origin = origin;
                 foreach (int i in new[] { 0, 5, 6 })
                 {
+                    int kernel = i == 0 ? _kClear : _kClear4;   // the foam textures have four channels
                     ToState(list, i, ResourceStates.UnorderedAccess);
-                    s.SetPushConstant(_kClear, "OutUAV", Texture(i).UavIndex);
-                    s.Dispatch(_kClear, list, Size / 8, Size / 8);
+                    s.SetPushConstant(kernel, "OutUAV", Texture(i).UavIndex);
+                    s.Dispatch(kernel, list, Size / 8, Size / 8);
                 }
                 Uav(list);
                 _cleared = true;
@@ -158,7 +169,9 @@ namespace Freefall.Graphics
                     s.SetPushConstant(k, "SeaLevelBits", BitConverter.SingleToUInt32Bits(seaLevel));
                     s.SetPushConstant(k, "PushBits", BitConverter.SingleToUInt32Bits(9.81f * Engine.Settings.ShipWavePush * stepDt));
                 });
-                // The white water: carried by this step's water, made where it breaks and where the hulls churn it
+                // The white water: carried by this step's water, made where it breaks and where the hulls churn it; and
+                // the calm the hulls leave in their track, which turns the sea's short waves down and makes the white
+                // water there go within a second
                 int foamFrom = 5 + _foamCur, foamTo = 5 + (_foamCur ^ 1);
                 ToState(list, foamFrom, Read);
                 Run(list, _kFoam, 0, foamTo, k =>
@@ -172,6 +185,7 @@ namespace Freefall.Graphics
                     s.SetPushConstant(k, "HullsSrv", hulls);
                     s.SetPushConstant(k, "HullCount", hullCount);
                     s.SetPushConstant(k, "SeaLevelBits", BitConverter.SingleToUInt32Bits(seaLevel));
+                    s.SetPushConstant(k, "NoCalm", Engine.Settings.DisableWakeCalm ? 1u : 0u);
                 });
                 _foamCur ^= 1;
                 steps++;
@@ -180,16 +194,21 @@ namespace Freefall.Graphics
 
             // What the water reads, from the next frame's draws on, with the origin it was written for
             int surface = 3 + _surfaceNext;
+            int calm = 7 + _surfaceNext;
             _surfaceNext ^= 1;
             ToState(list, 0, Read);
             ToState(list, 5 + _foamCur, Read);
             ToState(list, surface, ResourceStates.UnorderedAccess);
+            ToState(list, calm, ResourceStates.UnorderedAccess);
             s.SetPushConstant(_kSurface, "InSrv", _state!.BindlessIndex);
             s.SetPushConstant(_kSurface, "FoamSrv", Texture(5 + _foamCur).BindlessIndex);
             s.SetPushConstant(_kSurface, "OutUAV", Texture(surface).UavIndex);
+            s.SetPushConstant(_kSurface, "CalmUAV", Texture(calm).UavIndex);
             s.Dispatch(_kSurface, list, Size / 8, Size / 8);
             ToState(list, surface, Read);
+            ToState(list, calm, Read);
             Srv = Texture(surface).BindlessIndex;
+            CalmSrv = Texture(calm).BindlessIndex;
             _published = origin;
             PixMarker.End(list);
         }
@@ -197,6 +216,7 @@ namespace Freefall.Graphics
         private static void Sleep()
         {
             Srv = 0;
+            CalmSrv = 0;
             _cleared = false;
             _alive = 0f;
         }
@@ -226,7 +246,7 @@ namespace Freefall.Graphics
 
         private static RenderTexture2D Texture(int i) => i switch
         {
-            0 => _state!, 1 => _a!, 2 => _b!, 3 or 4 => _surfaces[i - 3]!, _ => _foam[i - 5]!,
+            0 => _state!, 1 => _a!, 2 => _b!, 3 or 4 => _surfaces[i - 3]!, 5 or 6 => _foam[i - 5]!, _ => _calm[i - 7]!,
         };
 
         private static void EnsureResources()
@@ -239,14 +259,17 @@ namespace Freefall.Graphics
             _kFoam = _shader.FindKernel("CSFoam");
             _kSurface = _shader.FindKernel("CSSurface");
             _kClear = _shader.FindKernel("CSClear");
+            _kClear4 = _shader.FindKernel("CSClear4");
             var device = Engine.Device;
             _state = new RenderTexture2D(device, Size, Size, Format.R32G32_Float, randomWrite: true);   // h, φ
             _a = new RenderTexture2D(device, Size, Size, Format.R32G32_Float, randomWrite: true);
             _b = new RenderTexture2D(device, Size, Size, Format.R32G32_Float, randomWrite: true);
             for (int i = 0; i < _surfaces.Length; i++)
                 _surfaces[i] = new RenderTexture2D(device, Size, Size, Format.R16G16B16A16_Float, randomWrite: true);
-            for (int i = 0; i < _foam.Length; i++)
-                _foam[i] = new RenderTexture2D(device, Size, Size, Format.R16G16_Float, randomWrite: true);   // foam, depth
+            for (int i = 0; i < _foam.Length; i++)   // foam, nearness a step ago, calm, unused
+                _foam[i] = new RenderTexture2D(device, Size, Size, Format.R16G16B16A16_Float, randomWrite: true);
+            for (int i = 0; i < _calm.Length; i++)
+                _calm[i] = new RenderTexture2D(device, Size, Size, Format.R16_Float, randomWrite: true);
             for (int i = 0; i < _states.Length; i++) _states[i] = ResourceStates.Common;
         }
 

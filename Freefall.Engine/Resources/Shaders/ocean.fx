@@ -22,9 +22,9 @@ HullConstantOutput PatchConstantFunc(InputPatch<ControlPoint, 3> patch, uint pat
     float3 p1 = patch[1].WorldPos;
     float3 p2 = patch[2].WorldPos;
 
-    // Off screen or hidden behind the opaque scene — skip
+    // Collapsed by a stitched edge (VS_Leaf), off screen or hidden behind the opaque scene — skip
     StructuredBuffer<OceanData> oceanData = ResourceDescriptorHeap[OceanDataIdx];
-    if (CullTriangle(p0, p1, p2, oceanData[patch[0].InstanceIdx].HiZSRV))
+    if (DegeneratePatch(p0, p1, p2) || CullTriangle(p0, p1, p2, oceanData[patch[0].InstanceIdx].HiZSRV))
     {
         output.EdgeTess[0] = output.EdgeTess[1] = output.EdgeTess[2] = 0;
         output.InsideTess = 0;
@@ -76,10 +76,11 @@ DSOutput DS(HullConstantOutput patchConstants,
 {
     DSOutput output;
 
-    // Barycentric interpolation of world position
-    float3 worldPos = patch[0].WorldPos * bary.x
-                    + patch[1].WorldPos * bary.y
-                    + patch[2].WorldPos * bary.z;
+    // Barycentric interpolation of world position. Precise: two patches that share an edge hold its ends in other slots,
+    // and a multiply-add fused on one side and not the other would part them by a rounding (a crack between leaves)
+    precise float3 worldPos = patch[0].WorldPos * bary.x
+                            + patch[1].WorldPos * bary.y
+                            + patch[2].WorldPos * bary.z;
 
     uint idx = patch[0].InstanceIdx;
 
@@ -90,10 +91,11 @@ DSOutput DS(HullConstantOutput patchConstants,
     float3 camPos = ViewInverse[3].xyz;
     float camDist = length(worldPos - camPos);
 
-    // The bands' displacement and near the shore the surf's (ocean_surf.hlsli, shared with the lip)
+    // The bands' displacement and near the shore the surf's (ocean_surf.hlsli, shared with the lip), the short ones
+    // turned down in a hull's track (WakeCalmAt; the PS's bands likewise, and wake_draw.fx's SeaHeight)
     OceanShore shore;
     SurfWave surf;
-    float3 displacement = OceanSurfaceDisplacement(ocean, worldPos.xz, camDist, shore, surf);
+    float3 displacement = OceanSurfaceDisplacement(ocean, worldPos.xz, camDist, WakeCalmAt(ocean, worldPos.xz), shore, surf);
     // The ships' waves round the camera (WakeAt: Graphics.WakeWaves); wake_draw.fx's SeaHeight adds the same
     displacement.y += WakeAt(ocean, worldPos.xz).x;
     float3 displaced = worldPos + displacement;
@@ -165,7 +167,8 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
     // The shore flattens each band's waves by its length (DS, BandShoreAtten): their slopes, crests and foam shrink with
     // them. Until 2026-10-18 only the heights did, and over the shelf a nearly flat sea was shaded as the full open-sea chop
     float shoreAtten = input.UndisplacedXZ.z;
-    OceanBands bands = SampleOceanBands(ocean, worldXZ, shoreAtten, shoreDepth);
+    float calm = WakeCalmAt(ocean, worldXZ);   // a hull's track (Graphics.WakeWaves): the short waves turned down
+    OceanBands bands = SampleOceanBands(ocean, worldXZ, shoreAtten, shoreDepth, calm);
     WaterSlopes slopes = bands.slopes;
     float waveHeight = bands.waveHeight;
     SurfWave surfWave = bands.surf;
@@ -197,7 +200,12 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
     float rawNdotV = dot(N, V);
     if (!fromBelow && facing > 0.0 && rawNdotV < facing)
         N = normalize(N + (facing - rawNdotV) * V);
-    float alpha = WaterAlpha(slopes, WaterUnresolvedVariance(bands.resolvedTotal));
+    // The ripples under a pixel fill the roughness up to the wind's (Cox-Munk) less what the bands resolve; in a hull's
+    // track they are what the hull smoothed first, so the calm takes its share of them too. Without it the track's
+    // turned-down bands came back as unresolved roughness, and in a gale the smooth band shone as a white sheen
+    float unresolved = WaterUnresolvedVariance(bands.resolvedTotal);
+    unresolved = max(unresolved * (1.0 - CALM_MOST * calm), 0.003);
+    float alpha = WaterAlpha(slopes, unresolved);
 
     float NdotV = saturate(dot(N, V));
 
@@ -534,7 +542,7 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
 
     // EngineSettings.ShowShipWaves: the ships' simulated waves painted over the sea, crests red and troughs blue (full at
     // ±0.3 m), to see the simulation through the sea's own chop
-    // and their foam green (full at 1)
+    // and their foam green (full at 1), the calm a hull left in its track yellow (WakeCalmAt, at half its share)
     if (ocean.WakeShow > 0.0)
     {
         float4 wakeShown = WakeAt(ocean, worldXZ);
@@ -542,6 +550,7 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
         float lum = max(dot(color, float3(0.3, 0.6, 0.1)), 0.05) * 3.0;
         color = lerp(color, paint * lum, saturate(abs(wakeShown.x) / 0.3));
         color = lerp(color, float3(0.1, 1.0, 0.2) * lum, saturate(wakeShown.w));
+        color = lerp(color, float3(1.0, 0.85, 0.1) * lum, 0.5 * WakeCalmAt(ocean, worldXZ));
     }
 
     output.Color = float4(color, 1.0);
@@ -581,7 +590,7 @@ ShadowDSOutput DS_Shadow(HullConstantOutput patchConstants,
 
     // Without the surf's warp: the sun's shadow of the water near the coast is the open sea's
     SurfWave surf;
-    float3 displacement = SampleDisplacement(ocean, worldPos.xz, 1.0, 0.0, 1.0, 1e4, 0.5, false, surf);
+    float3 displacement = SampleDisplacement(ocean, worldPos.xz, 1.0, 0.0, 1.0, 1e4, 0.5, false, 0.0, surf);
     float3 displaced = worldPos + displacement;
 
     output.Position = mul(mul(float4(displaced, 1.0), View), Projection);
@@ -593,7 +602,7 @@ technique11 GBuffer
 {
     pass Forward
     {
-        SetVertexShader(CompileShader(vs_6_6, VS_Control()));
+        SetVertexShader(CompileShader(vs_6_6, VS_Leaf()));
         SetHullShader(CompileShader(hs_6_6, HS()));
         SetDomainShader(CompileShader(ds_6_6, DS()));
         SetPixelShader(CompileShader(ps_6_6, PS()));

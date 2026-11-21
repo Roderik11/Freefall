@@ -37,8 +37,9 @@ struct OceanBands
 };
 
 //   worldXZ: the water's undisplaced position. shoreAtten, shoreDepth: the shore's damping of the longest waves and the
-//   depth that sets each band's share of it (the DS's OceanShore)
-OceanBands SampleOceanBands(OceanData ocean, float2 worldXZ, float shoreAtten, float shoreDepth)
+//   depth that sets each band's share of it (the DS's OceanShore). calm: the hulls' calm here (WakeCalmAt): the short
+//   bands' slopes, crests and foam shrink in a hull's track as their heights do in the DS (CalmShare)
+OceanBands SampleOceanBands(OceanData ocean, float2 worldXZ, float shoreAtten, float shoreDepth, float calm)
 {
     OceanBands b = (OceanBands)0;
     Texture2DArray<float4> dispTex = ResourceDescriptorHeap[ocean.DisplacementSRV];
@@ -94,6 +95,7 @@ OceanBands SampleOceanBands(OceanData ocean, float2 worldXZ, float shoreAtten, f
         }
         else
             waveAtten = BandShoreAtten(shoreAtten, shoreDepth, scale);
+        waveAtten *= CalmShare(calm, scale);
         float2 uv = RotateUV(p, angle) * scale;
 
         // Filtered: the foam alpha is only a coverage mask, the visible detail comes from the foam texture
@@ -150,6 +152,12 @@ OceanBands SampleOceanBands(OceanData ocean, float2 worldXZ, float shoreAtten, f
         }
     }
     return b;
+}
+
+// The full sea, with no hull's calm (the lip)
+OceanBands SampleOceanBands(OceanData ocean, float2 worldXZ, float shoreAtten, float shoreDepth)
+{
+    return SampleOceanBands(ocean, worldXZ, shoreAtten, shoreDepth, 0.0);
 }
 
 // ── The surf: foam from the waves themselves (C# ShoreWarp, SurfWave) ──
