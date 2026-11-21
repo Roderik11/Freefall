@@ -12,13 +12,17 @@ namespace Freefall.Components
     /// Drives the sky, sun, fog and weather particle emitters from <see cref="EnvironmentPreset"/> assets.
     ///
     /// The weather comes in layers, each laid over the last:
-    ///   • <see cref="Climate"/>: the world's weather, which moves on by itself with <see cref="GameClock"/>
+    ///   • <see cref="Climate"/>: the world's weather, made as it goes from the game time (<see cref="GameClock"/>):
+    ///     the sky, the wind and the sea each moving on by themselves
     ///   • <see cref="Preset"/>: a weather held in its place while one is set, for a scene that keeps one look
     ///     or to look at one (or call <see cref="TransitionTo"/> from code)
     ///   • every <see cref="WeatherZone"/> the camera is in
     /// A change of <see cref="Preset"/> cross-fades from whatever is shown over <see cref="TransitionDuration"/> seconds.
     /// The blended result is pushed every frame into:
     ///   • <see cref="SkyboxRenderer"/> via <c>ApplyPreset</c> (sun, atmosphere, ground fog, clouds, stars)
+    ///   • <c>Graphics.Wind</c> (its speed, the climate's turn of its heading) and <c>Graphics.SeaState</c> (the wind the
+    ///     sea was raised by, its heading, the swell): the heading and the sea's heading are always the climate's, which
+    ///     presets do not set
     ///   • <c>Graphics.AutoExposure.PresetCompensation</c> (how bright the weather reads)
     ///   • the optional Rain / Snow / Hail / Dust <see cref="ParticleEmitter"/>s (emit rate scaled by what
     ///     falls at the camera, wind copied to the emitter, emitter parked above the camera)
@@ -100,8 +104,8 @@ namespace Freefall.Components
         private readonly EnvironmentPreset _world = new();    // this frame's weather: the climate or the held preset, zones over it
         private readonly EnvironmentPreset _current = new();  // blended output
         private EnvironmentPreset _held;                      // the Preset the last transition went to (null: the climate)
-        private EnvironmentPreset _climateFrom, _climateTo;   // for Describe
-        private float _climateBlend;
+        private readonly EnvironmentPreset _climate = new();  // the climate's weather this frame (held presets lie over it)
+        private bool _climateSampled;
         private float _elapsed;
         private float _duration;
         private bool _primed;
@@ -151,7 +155,7 @@ namespace Freefall.Components
         {
             // Disabled or nothing to show: stop driving the sky. Without this the last target kept being
             // re-applied every frame, so an unassigned preset "lingered" and SkyboxRenderer edits were overwritten.
-            if (!Enabled || (Preset == null && (Climate == null || !Climate.HasWeather)))
+            if (!Enabled || (Preset == null && Climate == null))
             {
                 Release();
                 return;
@@ -188,11 +192,11 @@ namespace Freefall.Components
         // the camera is in, from the lowest priority up
         private void MakeWorld(bool first)
         {
-            _climateFrom = _climateTo = null;
-            if (Preset != null)
-                _world.CopyFrom(Preset);
-            else if (Climate.Sample(GameClock.Hours, out _climateFrom, out _climateTo, out _climateBlend))
-                EnvironmentPreset.Lerp(_climateFrom, _climateTo, _climateBlend, _world);
+            // The climate is sampled under a held preset too: the wind's heading and the sea's are always its
+            _climateSampled = Climate != null;
+            if (_climateSampled)
+                Climate.Sample(GameClock.Hours, _climate);
+            _world.CopyFrom(Preset ?? _climate);
 
             var place = Camera.Main?.Position ?? Vector3.Zero;
             _zones.Clear();
@@ -213,14 +217,25 @@ namespace Freefall.Components
             var zones = new List<object>();
             foreach (var zone in _zones)
                 if (zone.Weight > 0f) zones.Add(new { zone = zone.Entity?.Name, preset = zone.Preset?.Name, weight = zone.Weight });
+            var s = Climate?.State ?? default;
             return new
             {
                 climate = Climate?.Name,
                 held = Preset?.Name,
-                from = _climateFrom?.Name,
-                to = _climateTo?.Name,
-                blend = _climateBlend,
-                nextChangeAt = _climateTo != null ? Climate?.SpellEnds : null,
+                // The climate's causes (Climate.Evaluate): season −1 winter … 1 summer, pressure −1 a deep low … 1 a high,
+                // what they make of the sky (0..1), the freezing level (m), the wind (m/s) and its turn (°), the sea's wind
+                // (m/s) and heading (°), the swell as a share of the authored one and its turn (°)
+                causes = _climateSampled ? new
+                {
+                    s.Season, s.Pressure, s.Overcast, s.Deep, s.Fair, s.Cumulus, s.Thunder, s.Mist, s.FreezingLevel,
+                    s.Wind, turn = s.Turn * (180f / MathF.PI), s.SeaWind, seaHeading = s.SeaHeading * (180.0 / Math.PI),
+                    s.Swell, swellTurn = s.SwellTurn * (180f / MathF.PI),
+                } : null,
+                // What is shown: the wind, the sea's wind and swell after held presets and zones
+                wind = _current.WindStrength,
+                seaWind = _current.SeaWind,
+                swell = _current.Swell,
+                sea = Graphics.SeaState.Describe(),
                 zones,
             };
         }
@@ -246,9 +261,17 @@ namespace Freefall.Components
             Graphics.AutoExposure.PresetCompensation = _current.ExposureCompensation;
 
             // Vegetation sways in the weather's wind (grass, flowers, leaves; Graphics.Wind): its speed; the direction is
-            // the generated one, which the clouds drift in too; a storm's outflow and the gusts on top (Weather)
+            // the generated one turned by the climate's weather systems, which the clouds drift in too; a storm's outflow and
+            // the gusts on top (Weather)
             Graphics.Wind.Speed = _current.WindStrength;
+            Graphics.Wind.Turn = _climateSampled ? Climate.State.Turn : 0f;
             var wind = Graphics.Wind.Local;
+
+            // The sea: its wind (trailing the climate's, or as a held preset or a zone says), along the climate's trailing
+            // heading (the wind's own without a climate), and the swell from afar
+            var generated = Graphics.Wind.GeneratedDirection;
+            double seaHeading = _climateSampled ? Climate.State.SeaHeading : Math.Atan2(generated.Y, generated.X);
+            Graphics.SeaState.Set(_current.SeaWind, seaHeading, _current.Swell, _climateSampled ? Climate.State.SwellTurn : 0f);
             var camPos = Camera.Main?.Position ?? Vector3.Zero;
 
             // Every other emitter takes the share of it that its WeatherWind asks for (flames, smoke)
@@ -345,6 +368,8 @@ namespace Freefall.Components
             Graphics.AutoExposure.PresetCompensation = 0f;
             Graphics.ParticleSystem.WeatherWind = Vector3.Zero;
             Graphics.Wind.Speed = Graphics.Wind.DefaultSpeed;
+            Graphics.Wind.Turn = 0f;
+            Graphics.SeaState.Release();
             if (_lastRain != null) ReleaseEmitter(_lastRain);
             if (_lastSnow != null) ReleaseEmitter(_lastSnow);
             if (_lastHail != null) ReleaseEmitter(_lastHail);
@@ -361,6 +386,11 @@ namespace Freefall.Components
 
         public override void Destroy()
         {
+            if (_driving)
+            {
+                Graphics.Wind.Turn = 0f;
+                Graphics.SeaState.Release();
+            }
             if (_lastRain != null) ReleaseEmitter(_lastRain);
             if (_lastSnow != null) ReleaseEmitter(_lastSnow);
             if (_lastHail != null) ReleaseEmitter(_lastHail);

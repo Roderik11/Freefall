@@ -16,8 +16,11 @@ namespace Freefall.Assets
     /// rest through the physical atmosphere (Graphics.Atmosphere): the same preset gives the noon, the sunset and the
     /// night, with nothing per time of day.
     ///
-    /// Presets are applied by <c>EnvironmentController</c>, from a <see cref="Climate"/>, held, or from the
-    /// <c>WeatherZone</c> the camera is in; it pushes the blended result into <c>SkyboxRenderer</c> and the weather emitters.
+    /// A preset is an override: the weather is the <see cref="Climate"/>'s, which makes it as it goes, and a preset takes its
+    /// place where one is held on <c>EnvironmentController</c> (a scene that keeps one look, a test) or in the
+    /// <c>WeatherZone</c> the camera is in. A climate fills one of these every frame too (its <see cref="Climate.Look"/>
+    /// for what weather does not change), so the blends and the zones work alike. EnvironmentController pushes the result
+    /// into <c>SkyboxRenderer</c>, the wind, the sea and the weather emitters.
     /// </summary>
     [CreateAsset("Environment Preset")]
     public class EnvironmentPreset : Asset
@@ -147,10 +150,24 @@ namespace Freefall.Assets
         [ValueRange(0f, 2f)]
         public float DustIntensity = 0f;
 
-        [Description("Wind speed in m/s near the ground: vegetation, the weather's particles, the sea. Its direction is " +
-                     "not set here: it wanders with the time of day (Graphics.Wind), the clouds drifting the same way")]
+        [Description("Wind speed in m/s near the ground: vegetation, the weather's particles, sails, the gusts on top. Its " +
+                     "direction is not set here: it wanders with the game time (Graphics.Wind), the clouds drifting the same way")]
         [ValueRange(0f, 50f)]
         public float WindStrength = 0f;
+
+        // ── Sea ──
+
+        [Category("Sea")]
+        [Description("The wind the sea's waves were raised by (m/s): its wind sea and whitecaps. A sea takes hours to build " +
+                     "and to die down, so it need not be WindStrength: a calm over a sea still running from a gale. The " +
+                     "climate makes it trail its wind by itself")]
+        [ValueRange(0f, 50f)]
+        public float SeaWind = 3f;
+
+        [Description("The swell from far-off weather: the height of the ocean's authored swell bands as a share of what " +
+                     "they are authored with (1 = as authored, 0 = none)")]
+        [ValueRange(0f, 2f)]
+        public float Swell = 1f;
 
         // ── Blending ──
 
@@ -202,6 +219,8 @@ namespace Freefall.Assets
             dest.DustIntensity = L(a.DustIntensity, b.DustIntensity, t);
 
             dest.WindStrength = L(a.WindStrength, b.WindStrength, t);
+            dest.SeaWind = L(a.SeaWind, b.SeaWind, t);
+            dest.Swell = L(a.Swell, b.Swell, t);
         }
     }
 }

@@ -7,9 +7,11 @@ namespace Freefall.Graphics
     /// The wind vegetation sways in, the weather's particles drift in and the clouds are carried by. Grass cards, blade
     /// clumps, flowers and trees read it from the scene constants (WindDirection, WindStrength, WindPhase, WindOffset in
     /// common.fx). Its direction is never authored (user, 2026-10-19): it wanders with the game time
-    /// (<see cref="Base.GameClock"/>, <see cref="GeneratedHeading"/>), the same for the clouds and the ground. Its speed is the weather's:
-    /// EnvironmentController sets <see cref="Speed"/> from the preset's WindStrength; without one it is a light breeze.
-    /// Settings › Wind can override it for tuning.
+    /// (<see cref="Base.GameClock"/>, <see cref="GeneratedHeading"/>), turned by the climate's weather systems
+    /// (<see cref="Turn"/>: it backs as a low comes and veers as it goes), the same for the clouds and the ground. Its
+    /// speed is the weather's: EnvironmentController sets <see cref="Speed"/> from the climate (which raises and drops it
+    /// by itself, apart from the sky) or from a preset that overrides it; without one it is a light breeze. The sea trails
+    /// it (<see cref="SeaState"/>). Settings › Wind can override it for tuning.
     /// </summary>
     public static class Wind
     {
@@ -18,6 +20,12 @@ namespace Freefall.Graphics
 
         /// <summary>The weather's wind speed (m/s).</summary>
         public static float Speed = DefaultSpeed;
+
+        /// <summary>
+        /// The climate's turn of the heading (radians), on top of <see cref="GeneratedHeading"/>: its weather systems'
+        /// veer (Assets.Climate). EnvironmentController sets it every frame, 0 without a climate.
+        /// </summary>
+        public static float Turn;
 
         /// <summary>Where the wind blows this frame (xz, unit), smooth: the clouds drift with it.</summary>
         public static Vector2 GeneratedDirection { get; private set; } = Vector2.Normalize(new Vector2(2f, 1f));
@@ -148,7 +156,7 @@ namespace Freefall.Graphics
         /// <summary>Once per frame (Engine.Tick).</summary>
         public static void Advance(float delta)
         {
-            double heading = GeneratedHeading(Base.GameClock.Hours);
+            double heading = GeneratedHeading(Base.GameClock.Hours) + Turn;
             GeneratedDirection = new Vector2((float)Math.Cos(heading), (float)Math.Sin(heading));
             double stepped = Math.Round(heading * (180.0 / Math.PI)) * (Math.PI / 180.0);
             _steppedDirection = new Vector2((float)Math.Cos(stepped), (float)Math.Sin(stepped));

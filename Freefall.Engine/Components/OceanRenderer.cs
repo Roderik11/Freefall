@@ -646,7 +646,8 @@ namespace Freefall.Components
                 bands.Add(new ShoreWarp.Band
                 {
                     Index = swell,
-                    Direction = Heading(Rad(b.WindDirection.X) - BandAngles[swell % BandAngles.Length]),
+                    Direction = Heading(Rad(b.WindDirection.X) + (coarsestWind >= 0 ? SeaState.SwellTurn : 0f)
+                                        - BandAngles[swell % BandAngles.Length]),
                     Omega = JonswapPeakOmega(b.Fetch.X, b.WindSpeed.X),
                 });
             }
@@ -655,10 +656,10 @@ namespace Freefall.Components
             // wind band's tile up to its own tile)
             if (coarsestWind >= 0)
             {
-                var dir = Wind.Direction;
+                var dir = SeaState.Direction;
                 float shortest = finerWind >= 0 ? Bands[finerWind].LengthScale / 4f : Bands[coarsestWind].LengthScale / 16f;
                 float longest = Bands[coarsestWind].LengthScale;
-                float omega = JonswapPeakOmega(WindSea.Fetch, MathF.Max(Wind.Strength, 0.5f));
+                float omega = JonswapPeakOmega(WindSea.Fetch, MathF.Max(SeaState.Strength, 0.5f));
                 omega = Math.Clamp(omega, MathF.Sqrt(2f * MathF.PI * Gravity / longest), MathF.Sqrt(2f * MathF.PI * Gravity / shortest));
                 bands.Add(new ShoreWarp.Band
                 {
@@ -734,7 +735,7 @@ namespace Freefall.Components
 
             // Deep-water wavelength of the spectrum's peak; each wind band holds from a quarter of the next finer one's
             // tile up to a quarter of its own (the coarsest: everything longer), as BuildSpectrumParams shares them out
-            float omega = JonswapPeakOmega(WindSea.Fetch, MathF.Max(Wind.Strength, 0.5f));
+            float omega = JonswapPeakOmega(WindSea.Fetch, MathF.Max(SeaState.Strength, 0.5f));
             float peak = 2f * MathF.PI * Gravity / (omega * omega);
             for (int r = windBands.Count - 1; r > 0; r--)
                 if (peak < Bands[windBands[r]].LengthScale / 4f)
@@ -806,9 +807,10 @@ namespace Freefall.Components
 
             var spectrums = new OceanFFT.SpectrumParameters[Bands.Count * 2];
 
-            // The weather's wind: never quite calm (JONSWAP divides by the wind speed)
-            float windSpeed = MathF.Max(Wind.Strength, 0.5f);
-            var dir = Wind.Direction;
+            // The wind the sea was raised by (SeaState: the weather's wind as the waves have taken it up, trailing it by
+            // hours): never quite calm (JONSWAP divides by the wind speed)
+            float windSpeed = MathF.Max(SeaState.Strength, 0.5f);
+            var dir = SeaState.Direction;
             float heading = dir.LengthSquared() > 0f ? MathF.Atan2(dir.Z, dir.X) : 0f;
             float stormScale = WindSea.WaveScaleAt(windSpeed);
 
@@ -851,12 +853,15 @@ namespace Freefall.Components
                     continue;
                 }
 
-                // With wind bands for the local sea an authored band is a swell from afar: its long waves only
+                // With wind bands for the local sea an authored band is a swell from afar: its long waves only, as high as
+                // the far-off weather makes it now (SeaState.Swell, a share of the authored height: energy × its square)
+                // and turned with it
                 bool swell = windBands.Count > 0;
+                float height = swell ? SeaState.Swell : 1f, turn = swell ? SeaState.SwellTurn : 0f;
                 spectrums[i * 2] = new OceanFFT.SpectrumParameters
                 {
-                    Scale = b.Scale.X,
-                    Angle = Rad(b.WindDirection.X),
+                    Scale = b.Scale.X * height * height,
+                    Angle = Rad(b.WindDirection.X) + turn,
                     SpreadBlend = b.SpreadBlend.X,
                     Swell = b.Swell.X,
                     Alpha = JonswapAlpha(b.Fetch.X, b.WindSpeed.X),
@@ -869,8 +874,8 @@ namespace Freefall.Components
 
                 spectrums[i * 2 + 1] = new OceanFFT.SpectrumParameters
                 {
-                    Scale = b.Scale.Y,
-                    Angle = Rad(b.WindDirection.Y),
+                    Scale = b.Scale.Y * height * height,
+                    Angle = Rad(b.WindDirection.Y) + turn,
                     SpreadBlend = b.SpreadBlend.Y,
                     Swell = b.Swell.Y,
                     Alpha = JonswapAlpha(b.Fetch.Y, b.WindSpeed.Y),
