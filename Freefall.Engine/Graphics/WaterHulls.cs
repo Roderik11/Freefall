@@ -214,6 +214,20 @@ namespace Freefall.Graphics
             return false;
         }
 
+        /// <summary>Whether any hull reaches within <paramref name="distance"/> of a point, across the water. Any thread.</summary>
+        public static bool AnyWithin(Vector3 at, float distance)
+        {
+            var all = _all;
+            for (int i = 0; i < all.Length; i++)
+            {
+                var hull = all[i];
+                if (!hull.Enabled) continue;
+                float dx = hull.Centre.X - at.X, dz = hull.Centre.Z - at.Z, r = distance + hull.Radius;
+                if (dx * dx + dz * dz < r * r) return true;
+            }
+            return false;
+        }
+
         /// <summary>The hulls the shaders test this frame (StructuredBuffer&lt;WaterHull&gt;), 0 when there are none.</summary>
         public static uint Srv
         {

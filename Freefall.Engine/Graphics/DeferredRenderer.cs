@@ -831,6 +831,8 @@ namespace Freefall.Graphics
 
             // The ripples round the camera, stepped once a tick while something stirs the water (read by the water's draws)
             WaterRipples.Step(list, camera.Position);
+            // The ships' waves round the camera, likewise (read by the sea's draws from the next frame on)
+            WakeWaves.Step(list, camera.Position);
 
             // 1. G-Buffer Pass (includes shadow rendering internally)
             using (_gbufferMarker.Auto())

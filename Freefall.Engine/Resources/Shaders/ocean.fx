@@ -94,6 +94,8 @@ DSOutput DS(HullConstantOutput patchConstants,
     OceanShore shore;
     SurfWave surf;
     float3 displacement = OceanSurfaceDisplacement(ocean, worldPos.xz, camDist, shore, surf);
+    // The ships' waves round the camera (WakeAt: Graphics.WakeWaves); wake_draw.fx's SeaHeight adds the same
+    displacement.y += WakeAt(ocean, worldPos.xz).x;
     float3 displaced = worldPos + displacement;
 
     output.UndisplacedXZ = float4(worldPos.xz, shore.waveAtten, shore.shoreDepth);
@@ -181,6 +183,9 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
     float rippleHeight, rippleFoam;
     float2 ripple = RippleSlope(ocean.RipplesSRV, ocean.RipplesOrigin, ocean.RipplesSpan, worldPos.xz, rippleHeight, rippleFoam);
     slopes.mean += ripple;
+    // The ships' waves (Graphics.WakeWaves): their slopes, and the white water they made (with the foam below)
+    float4 wake = WakeAt(ocean, worldXZ);
+    slopes.mean += wake.yz;
 
     float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));
     // In the surf the swell's slopes, steepened through the shore's warp, can face away from a low eye on water it sees
@@ -347,6 +352,11 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
     float whitecap = OceanWhitecap(bands, dist);
     float surfTrailWeb;     // how much thinning trail there is, for the web (below)
     float surfFoam = SurfWhiteWater(ocean, bands, shoreDepth, dist, surfTrailWeb);
+    // The white water the ships churned and their waves broke (WakeWaves), drawn as the surf's: lumps eroded into
+    // bubbles, and a web as it thins. Cut flat from the lace texture it read as a band of white paint (2026-11-21)
+    float wakeFoam = saturate(WakeFoamAt(ocean, worldXZ));
+    surfFoam = max(surfFoam, wakeFoam);
+    surfTrailWeb = max(surfTrailWeb, wakeFoam * (1.0 - smoothstep(0.3, 0.8, wakeFoam)) * 1.5);
 
     // The waterline: foam gathers where the water meets the sand, a rock or a pier, a ragged band that swells and pinches
     // along the coast; on a beach the swash's edge, crisp as a bore runs up and thinner as it drains. Everything below
@@ -521,6 +531,18 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
 
     // HDR output — no tonemapping/gamma here.
     // The finalize pass applies ACES + gamma to the entire Composite.
+
+    // EngineSettings.ShowShipWaves: the ships' simulated waves painted over the sea, crests red and troughs blue (full at
+    // ±0.3 m), to see the simulation through the sea's own chop
+    // and their foam green (full at 1)
+    if (ocean.WakeShow > 0.0)
+    {
+        float4 wakeShown = WakeAt(ocean, worldXZ);
+        float3 paint = wakeShown.x > 0.0 ? float3(1.0, 0.15, 0.1) : float3(0.1, 0.3, 1.0);
+        float lum = max(dot(color, float3(0.3, 0.6, 0.1)), 0.05) * 3.0;
+        color = lerp(color, paint * lum, saturate(abs(wakeShown.x) / 0.3));
+        color = lerp(color, float3(0.1, 1.0, 0.2) * lum, saturate(wakeShown.w));
+    }
 
     output.Color = float4(color, 1.0);
 

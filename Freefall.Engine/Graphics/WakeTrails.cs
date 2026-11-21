@@ -32,6 +32,50 @@ namespace Freefall.Graphics
         /// behind a stern: pale, aerated water with foam in streaks that thin out over its life.</summary>
         public bool Crest;
 
+        /// <summary>
+        /// The white water along a hull: placed anew every frame (<see cref="Place"/>) along the hull's side, its inner
+        /// edge (Across −1) on the hull and dense there, thinning outward; its foam stays where it is in the water, so the
+        /// hull slides through it. Not laid or aged.
+        /// </summary>
+        public bool Collar;
+
+        /// <summary>One point of a collar: where its middle is on the water (y: the surface's height at rest), the way
+        /// out from the hull (unit xz), its width, how much white water (0..1), metres along it in the water's own
+        /// frame (its streaks stay in the water as the hull slides through), and how high its inner edge stands over the
+        /// water (m: the bow wave climbing the stem; the collar slopes down to the water at its outer edge).</summary>
+        public struct CollarPoint
+        {
+            public Vector3 At;
+            public Vector2 Outward;
+            public float Width;
+            public float Strength;
+            public float Along;
+            public float Rise;
+        }
+
+        /// <summary>
+        /// A collar's points for this frame, from the bow aft (<see cref="Collar"/>); none takes it away. Main thread.
+        /// </summary>
+        public void Place(ReadOnlySpan<CollarPoint> points, bool sea)
+        {
+            Collar = true;
+            HasHead = Emitting = false;
+            if (Points.Length < points.Length)
+                Points = new Point[Math.Max(64, (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)points.Length))];
+            Start = 0;
+            Count = points.Length;
+            for (int i = 0; i < points.Length; i++)
+            {
+                var c = points[i];
+                Points[i] = new Point
+                {
+                    Position = c.At, Right = c.Outward, Along = c.Along, Age = 0f,
+                    Strength = Math.Clamp(c.Strength, 0f, 1f), Sea = sea, Width = MathF.Max(0.05f, c.Width),
+                    Rise = MathF.Max(0f, c.Rise),
+                };
+            }
+        }
+
         internal struct Point
         {
             public Vector3 Position;   // y: the surface's height at rest (a lake's, a river's; the sea's level)
@@ -41,6 +85,8 @@ namespace Freefall.Graphics
             public float Age;
             public float Strength;     // 0..1 how much wake there was when it was laid
             public bool Sea;           // rides the sea's waves
+            public float Width;        // a collar's own width (m); 0 = by its age
+            public float Rise;         // a collar's inner edge over the water (m)
         }
 
         internal Point[] Points = new Point[64];
@@ -54,7 +100,8 @@ namespace Freefall.Graphics
         /// Where its end is this frame: <paramref name="at"/> on the water (y: the surface's height at rest),
         /// <paramref name="forward"/> the way it goes, <paramref name="strength"/> 0..1 how much wake it leaves (a ship's
         /// speed), <paramref name="drift"/> the sideways speed its points keep as they age (m/s, world xz; a bow wave's
-        /// arm opens outward), <paramref name="sea"/> whether it rides the sea's waves. Main thread.
+        /// arm opens outward), <paramref name="sea"/> whether it rides the sea's waves. A trail that drifts has its
+        /// Across +1 on the side it drifts to (an arm's outer side, where its crest breaks). Main thread.
         /// </summary>
         public void Lay(Vector3 at, Vector3 forward, float strength, Vector2 drift, bool sea)
         {
@@ -62,6 +109,7 @@ namespace Freefall.Graphics
             float l = dir.Length();
             dir = l > 1e-4f ? dir / l : new Vector2(1f, 0f);
             var right = new Vector2(dir.Y, -dir.X);
+            if (Vector2.Dot(right, drift) < 0f) right = -right;
             if (HasHead)
                 Along += Vector2.Distance(new Vector2(Head.Position.X, Head.Position.Z), new Vector2(at.X, at.Z));
             Head = new Point
@@ -100,9 +148,10 @@ namespace Freefall.Graphics
             Count++;
         }
 
-        // Ages and drifts its points, drops those that ran out
+        // Ages and drifts its points, drops those that ran out (a collar's are placed anew every frame)
         internal void Step(float dt)
         {
+            if (Collar) return;
             int mask = Points.Length - 1;
             for (int i = 0; i < Count; i++)
             {
@@ -140,13 +189,14 @@ namespace Freefall.Graphics
         {
             if (trail == null || trail.Released) return;
             trail.Stop();
+            if (trail.Collar) trail.Count = 0;   // nothing of it stays behind
             trail.Released = true;
         }
 
         /// <summary>Every wake is gone at once (a scene load).</summary>
         public static void Clear() => _trails.Clear();
 
-        private const uint FlagFirst = 1, FlagLast = 2, FlagSea = 4, FlagCrest = 8;
+        private const uint FlagFirst = 1, FlagLast = 2, FlagSea = 4, FlagCrest = 8, FlagCollar = 16;
 
         /// <summary>One point of the list: wake_draw.fx WakePoint, 48 bytes.</summary>
         [StructLayout(LayoutKind.Sequential)]
@@ -154,7 +204,7 @@ namespace Freefall.Graphics
         {
             public Vector3 Position; public float Width;
             public Vector2 Right; public float Along; public float Age;   // Age: share of its life gone, 0..1
-            public float Strength; public uint Flags; public float Life; public float _pad;
+            public float Strength; public uint Flags; public float Life; public float Rise;
         }
 
         private static GpuPoint[] _list = new GpuPoint[1024];
@@ -198,14 +248,15 @@ namespace Freefall.Graphics
             {
                 var p = i < trail.Count ? trail.Points[(trail.Start + i) & mask] : trail.Head;
                 float age = Math.Clamp(p.Age / life, 0f, 1f);
-                uint flags = (p.Sea ? FlagSea : 0) | (trail.Crest ? FlagCrest : 0);
+                uint flags = (p.Sea ? FlagSea : 0) | (trail.Crest ? FlagCrest : 0) | (trail.Collar ? FlagCollar : 0);
                 if (i == 0) flags |= FlagFirst;
                 if (i == n - 1) flags |= FlagLast;
                 _list[_listCount++] = new GpuPoint
                 {
                     Position = p.Position,
-                    Width = trail.StartWidth + (trail.EndWidth - trail.StartWidth) * MathF.Sqrt(age),
+                    Width = p.Width > 0f ? p.Width : trail.StartWidth + (trail.EndWidth - trail.StartWidth) * MathF.Sqrt(age),
                     Right = p.Right, Along = p.Along, Age = age, Strength = p.Strength, Flags = flags, Life = life,
+                    Rise = p.Rise,
                 };
             }
         }

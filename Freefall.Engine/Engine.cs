@@ -1333,6 +1333,14 @@ namespace Freefall
          public bool DisableSeaMask { get; set; } = false;                  // the ocean draws over all ground below sea level again (A/B of SeaMask)
         public bool DisableShoreWarp { get; set; } = false;                // the ocean's bands are sampled unwarped at the coast again (A/B of ShoreWarp)
         public bool DisableSurfLip { get; set; } = false;                  // no breaking lips (ocean_lip.fx, OceanRenderer): A/B and cost
+        [System.ComponentModel.Description("Ships raise no waves in the sea round the camera (Graphics.WakeWaves, the wake simulation): to compare with and without, or to save its cost.")]
+        public bool DisableShipWaves { get; set; } = false;
+        [System.ComponentModel.Description("How hard a hull presses the sea in the ships' wave simulation (Graphics.WakeWaves): the dent it would sink under itself at rest, per metre of its depth. The wake's height goes with it.")]
+        public float ShipWavePush { get; set; } = 0.4f;
+        [System.ComponentModel.Description("Damping of the ships' waves by their wave number squared (m²/s, Graphics.WakeWaves): higher, the short waves die sooner and the wake is smoother.")]
+        public float ShipWaveViscosity { get; set; } = 0.02f;
+        [System.ComponentModel.Description("Paints the ships' simulated waves over the sea, crests red and troughs blue (full at ±0.3 m), to see the simulation through the sea's own chop.")]
+        public bool ShowShipWaves { get; set; } = false;
 
          public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
     }

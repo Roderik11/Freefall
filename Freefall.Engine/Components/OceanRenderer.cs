@@ -413,7 +413,11 @@ namespace Freefall.Components
             public float RipplesSpan;
             public uint HullsSRV;        // Graphics.WaterHulls: where hulls keep the water out (0 = none)
             public uint HullCount;
-            public Vector2 _hullPad;
+            public uint WakeSRV;         // Graphics.WakeWaves: the ships' waves round the camera (0 = still). Was padding
+            public float WakeSpan;
+            public Vector2 WakeOrigin;   // its corner (world xz)
+            public float WakeShow;       // EngineSettings.ShowShipWaves: 1 paints them over the sea
+            public float _wakePad;
         }
 
         private const int GridSize = 128;
@@ -1098,6 +1102,10 @@ namespace Freefall.Components
                 RipplesSpan = WaterRipples.Span,
                 HullsSRV = WaterHulls.Srv,
                 HullCount = WaterHulls.Count,
+                WakeSRV = WakeWaves.Srv,
+                WakeSpan = WakeWaves.Span,
+                WakeOrigin = WakeWaves.Origin,
+                WakeShow = Engine.Settings.ShowShipWaves ? 1f : 0f,
             };
             _params.SetParameter("OceanData", data);
 

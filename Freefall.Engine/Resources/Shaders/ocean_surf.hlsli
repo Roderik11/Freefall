@@ -71,10 +71,60 @@ struct OceanData
     float RipplesSpan;          // metres it spans
     uint HullsSRV;              // Graphics.WaterHulls: where hulls keep the water out (water_hulls.hlsli); 0 = none
     uint HullCount;
-    float2 _hullPad;
+    uint WakeSRV;               // Graphics.WakeWaves: the ships' waves round the camera (WakeAt); 0 = still
+    float WakeSpan;             // metres the grid spans
+    float2 WakeOrigin;          // its corner (world xz)
+    float WakeShow;             // EngineSettings.ShowShipWaves: 1 paints them over the sea (ocean.fx)
+    float _wakePad;
 };
 
 SamplerState OceanSampler : register(s0);
+
+// The ships' waves at a point of the sea (Graphics/WakeWaves.cs, wake_waves_cs.hlsl): height (m), its slopes
+// (∂h/∂x, ∂h/∂z) and the white water they made (0..1.5); 0 off the grid or while no ship is near. Not part of
+// OceanSurfaceDisplacement: a ship's buoyancy and the swimmers' readback do not feel them; the ocean's DS and PS and the
+// wakes' ribbons add them
+float4 WakeAt(OceanData ocean, float2 xz)
+{
+    if (ocean.WakeSRV == 0)
+        return 0.0;
+    float2 uv = (xz - ocean.WakeOrigin) / ocean.WakeSpan;
+    if (any(uv <= 0.0) || any(uv >= 1.0))
+        return 0.0;
+    Texture2D<float4> wake = ResourceDescriptorHeap[ocean.WakeSRV];
+    return wake.SampleLevel(OceanSampler, uv, 0);
+}
+
+// The ships' white water at a point (WakeAt's .w) through a cubic B-spline over its cells (four bilinear reads): read
+// bilinearly, each half-metre cell showed as a square as its foam rose past the white water's threshold, new bright
+// cells popping in ahead of the bow (user, 2026-11-21)
+float WakeFoamAt(OceanData ocean, float2 xz)
+{
+    if (ocean.WakeSRV == 0)
+        return 0.0;
+    float2 uv = (xz - ocean.WakeOrigin) / ocean.WakeSpan;
+    if (any(uv <= 0.0) || any(uv >= 1.0))
+        return 0.0;
+    Texture2D<float4> wake = ResourceDescriptorHeap[ocean.WakeSRV];
+    float w, h;
+    wake.GetDimensions(w, h);
+    float2 size = float2(w, h);
+    float2 p = uv * size - 0.5;
+    float2 i = floor(p);
+    float2 f = p - i;
+    float2 f2 = f * f, f3 = f2 * f;
+    float2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+    float2 w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    float2 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+    float2 w3 = f3 / 6.0;
+    float2 g0 = w0 + w1, g1 = w2 + w3;
+    float2 h0 = (i - 1.0 + w1 / g0 + 0.5) / size;
+    float2 h1 = (i + 1.0 + w3 / g1 + 0.5) / size;
+    return g0.y * (g0.x * wake.SampleLevel(OceanSampler, float2(h0.x, h0.y), 0).w
+                 + g1.x * wake.SampleLevel(OceanSampler, float2(h1.x, h0.y), 0).w)
+         + g1.y * (g0.x * wake.SampleLevel(OceanSampler, float2(h0.x, h1.y), 0).w
+                 + g1.x * wake.SampleLevel(OceanSampler, float2(h1.x, h1.y), 0).w);
+}
 
 // The sea plane is endless, but the sea is only where it can flow in from the open sea across ground below sea level
 // (C# SeaMask: flooded from the terrain's border, reaching a little up the beaches). Enclosed low ground, a lake bed
