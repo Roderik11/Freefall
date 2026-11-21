@@ -14,6 +14,19 @@ namespace Freefall.Assets
         Edge,
     }
 
+    /// <summary>What a cloth's <see cref="ClothSettings.Damping"/> holds its motion against.</summary>
+    public enum ClothDamping
+    {
+        /// <summary>The ground: it loses motion against the still air, which is what trails a cloak behind a runner.</summary>
+        Ground,
+
+        /// <summary>
+        /// Where it is held: only its swing about its held places is damped and their own motion kept. Cloth carried by
+        /// something fast (a ship's sails, at 8 m/s dragged aft against the ground's damping, harder than the wind pressed).
+        /// </summary>
+        Holder,
+    }
+
     /// <summary>
     /// How a piece of cloth moves (Components.Cloth): which of it hangs free, how stiff it is, how the air takes it.
     /// What is free is worked out from the mesh, not painted. Clothing (<see cref="ClothHold.AboveHips"/>): a vertex
@@ -62,6 +75,9 @@ namespace Freefall.Assets
         [Description("Share of its motion it loses each step: more, and it swings less and settles sooner.")]
         [ValueRange(0f, 0.5f)]
         public float Damping = 0.04f;
+
+        [Description("What Damping holds it against: Ground, the still air (a cloak or tabard trails behind a runner by it), or Holder, only its swing about where it is held (cloth carried by something fast: a ship's sails, which the ground's damping blew aft at speed).")]
+        public ClothDamping DampAgainst = ClothDamping.Ground;
 
         [Description("How strongly the air (the weather's wind near the ground, gusts and all) presses on it, per second: on its face, by how square the wind meets it, plus Streams of it whichever way it faces.")]
         [ValueRange(0f, 5f)]

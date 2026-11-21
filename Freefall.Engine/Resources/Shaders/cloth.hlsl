@@ -315,7 +315,18 @@ void CSCloth(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
             else
             {
                 x = state[s0 + STATE_A * count + p].xyz;
-                float3 motion = (x - state[s0 + STATE_PREV * count + p].xyz) * (1.0 - row.Damping);
+                // It loses a share of its motion each step: against the ground (the still air: what trails a cloak behind
+                // a runner), or with Damping negative (ClothSettings.DampAgainst Holder) only its swing about its held
+                // place, whose own motion it keeps: cloth carried by something fast. Against the ground a ship's sails at
+                // 8 m/s were dragged aft at ~100 m/s² (3 substeps at 144 fps), more than the wind's press on them
+                float3 motion = x - state[s0 + STATE_PREV * count + p].xyz;
+                if (row.Damping < 0.0)
+                {
+                    float3 carried = (state[s0 + STATE_NEXT * count + p].xyz - state[s0 + STATE_TARGET * count + p].xyz) / substeps;
+                    motion = carried + (motion - carried) * (1.0 + row.Damping);
+                }
+                else
+                    motion *= 1.0 - row.Damping;
                 float3 velocity = motion / max(dt, 1e-5);
 
                 // The air: the wind (wavering) against the cloth's own motion, pressing on its face by how square it

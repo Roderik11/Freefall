@@ -517,7 +517,8 @@ namespace Freefall.Graphics
                         Wind = cloth.Wind ?? wind,
                         Dt = frameSeconds / entry.Substeps,
                         Drag = settings.Drag,
-                        Damping = settings.Damping,
+                        // Negative: damped against its held places (cloth.hlsl), the sign carrying DampAgainst
+                        Damping = settings.DampAgainst == ClothDamping.Holder ? -MathF.Max(settings.Damping, 1e-6f) : settings.Damping,
                         Stiffness = settings.Stiffness,
                         Bending = settings.Bending,
                         Thickness = settings.Thickness,
