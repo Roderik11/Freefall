@@ -55,7 +55,8 @@ cbuffer PushConstants : register(b3)
 #define GRAVITY 9.81
 #define EDGE_CELLS 32.0     // the waves fade out over this many cells at the grid's edge
 #define EDGE_KEEP 0.9       // what is left of them a step at the very edge
-#define END_SOFT 2.0        // m over which a hull's push fades out at its stern and its stem (HullDepth)
+#define END_SOFT 2.0        // m over which a hull's push fades out at its stem (HullDepth)
+#define STERN_RUN 0.3       // and the share of its length over which it fades out toward the stern (its run)
 
 // ── FFT: one row per group, radix-2 Stockham in shared memory, written transposed ──
 groupshared float2 Line[SIZE];
@@ -196,10 +197,15 @@ float HullDepth(float2 xz, float seaLevel, out float near, out float edge)
             bPrev = b;
             yPrev = y;
         }
-        // Soft across the waterline, and along it at the hull's ends: a transom ends the hull square, and there the push
-        // stopped in one cell, rang at the grid's own scale into short steep waves behind the stern, and those counted as
-        // breaking (BREAK_SLOPE) all down the track: a white sheet behind every ship
-        float soft = smoothstep(0.0, 1.0, bWater - az) * smoothstep(0.0, END_SOFT, l.x - x0) * smoothstep(0.0, END_SOFT, x1 - l.x);
+        // Soft across the waterline, at the stem, and over the hull's run aft. A real hull's underwater body closes in over
+        // its last quarter or so, and the water closes in behind it as gradually; the slice's depth is greatest aft (the
+        // keel and the rudder) and ended at the transom. Ended within 2 m, the push was let go in less than one transverse
+        // wavelength (2π U² / g: 6.9 m at 3.3 m/s), and the dent sprang back into a pointed white hill 1.1 m high right
+        // behind the stern with a train of ±0.6 m waves after it, while the bow made almost none (a caravel at 6.6 knots,
+        // calm sea, user: "it still makes a hill in the wake"). Ended in one cell (before that), it also rang at the grid's
+        // own scale into steep waves that broke all down the track
+        float run = STERN_RUN * (x1 - x0);
+        float soft = smoothstep(0.0, 1.0, bWater - az) * smoothstep(0.0, run, l.x - x0) * smoothstep(0.0, END_SOFT, x1 - l.x);
         depth = max(depth, max(water - bottom, 0.0) * soft);
         edge = max(edge, 4.0 * soft * (1.0 - soft));
     }
