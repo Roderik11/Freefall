@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using Freefall.Base;
+using Freefall.Components;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
 using Vortice.Mathematics;
@@ -35,6 +37,12 @@ namespace Freefall.Graphics
         /// <summary>Its albedo's alpha below 0.25 is cut away (hair cards, torn cloth, a slit visor), as the skinned G-buffer does.</summary>
         public bool AlphaTest;
 
+        /// <summary>
+        /// A mesh part whose slot has no material is not drawn (as a MeshRenderer with only overrides shows only those),
+        /// rather than drawn plain grey.
+        /// </summary>
+        public bool HideBare;
+
         public IconPart(Mesh mesh, IReadOnlyList<Material?>? materials, Matrix4x4 transform)
         {
             Mesh = mesh;
@@ -43,6 +51,31 @@ namespace Freefall.Graphics
             Side = IconSide.Both;
             SideCut = 0f;
             AlphaTest = false;
+            HideBare = false;
+        }
+    }
+
+    /// <summary>
+    /// A component whose look a shader of its own makes out of its renderer's mesh (a ship's sail, filled and rolled up
+    /// by the project's Sail.fx), so that mesh drawn as it is would not show it. It gives an icon of its prefab
+    /// (<see cref="IconRenderer.PrefabParts"/>) its look as a plain mesh instead, drawn in place of its entity's renderers.
+    /// </summary>
+    public interface IIconShape
+    {
+        /// <summary>Its look as an icon shows it, in its entity's space; null to draw its entity's renderers as they are.</summary>
+        IconShape? ShapeForIcon();
+    }
+
+    /// <summary>A look for an icon: a mesh made only for it, and its materials by slot.</summary>
+    public sealed class IconShape
+    {
+        public MeshData Data;
+        public IReadOnlyList<Material?> Materials;
+
+        public IconShape(MeshData data, IReadOnlyList<Material?> materials)
+        {
+            Data = data;
+            Materials = materials;
         }
     }
 
@@ -200,6 +233,87 @@ namespace Freefall.Graphics
                 x.Z, up.Z, z.Z, 0,
                 0, 0, 0, 1);
         }
+
+        /// <summary>
+        /// The parts a prefab's copy draws (<paramref name="root"/> and everything under it, in the root's space): each
+        /// enabled MeshRenderer and SkinnedMeshRenderer with its materials by slot (a slot with none not drawn, as in the
+        /// scene), and in place of an entity's renderers the look an <see cref="IIconShape"/> component on it gives.
+        /// Materials whose effect is no surface (vfx, particles, trails, water, decals) are left out. Returns the meshes
+        /// made for the icon alone, which the caller disposes after drawing.
+        /// </summary>
+        public static List<Mesh> PrefabParts(Entity root, List<IconPart> parts)
+        {
+            var owned = new List<Mesh>();
+            var toRoot = Matrix4x4.Invert(root.Transform.WorldMatrix, out var inverse) ? inverse : Matrix4x4.Identity;
+            Walk(root);
+            return owned;
+
+            void Walk(Entity entity)
+            {
+                var world = entity.Transform.WorldMatrix * toRoot;
+                bool shaped = false;
+                foreach (var component in entity.Components)
+                {
+                    if (component is not IIconShape shaper || !component.Enabled) continue;
+                    var shape = shaper.ShapeForIcon();
+                    if (shape?.Data?.Positions == null || shape.Data.Positions.Length == 0) continue;
+                    var mesh = new Mesh(Engine.Device, shape.Data);
+                    owned.Add(mesh);
+                    parts.Add(Part(mesh, shape.Materials, world));
+                    shaped = true;
+                }
+                if (!shaped)
+                {
+                    if (entity.GetComponent<MeshRenderer>() is { Enabled: true, Mesh: { } mesh } flat)
+                        parts.Add(Part(mesh, Slots(mesh, flat.GetMaterial), world));
+                    if (entity.GetComponent<SkinnedMeshRenderer>() is { Enabled: true, Mesh: { } skinnedMesh } skinned)
+                        parts.Add(Part(skinnedMesh, Slots(skinnedMesh, slot => slot < skinned.Materials.Count ? skinned.Materials[slot] : null), world));
+                }
+                for (int i = 0; i < entity.Transform.Count; i++)
+                    if (entity.Transform.GetChild(i)?.Entity is { } child)
+                        Walk(child);
+            }
+
+            static IReadOnlyList<Material?> Slots(Mesh mesh, Func<int, Material?> material)
+            {
+                int count = 0;
+                foreach (var meshPart in mesh.MeshParts)
+                    count = Math.Max(count, meshPart.MaterialSlot + 1);
+                var slots = new Material?[count];
+                for (int slot = 0; slot < count; slot++)
+                {
+                    var m = material(slot);
+                    slots[slot] = m != null && Surface(m) ? m : null;
+                }
+                return slots;
+            }
+
+            static IconPart Part(Mesh mesh, IReadOnlyList<Material?> materials, Matrix4x4 world)
+            {
+                bool cut = false;
+                foreach (var m in materials)
+                {
+                    var name = m?.Effect?.Name;
+                    if (name != null && (name.Contains("skinned", StringComparison.OrdinalIgnoreCase)
+                                      || name.Contains("foliage", StringComparison.OrdinalIgnoreCase)))
+                        cut = true;
+                }
+                return new IconPart(mesh, materials, world) { HideBare = true, AlphaTest = cut };
+            }
+
+            // A surface the G-buffer draws, which icon.fx can stand in for; not light, smoke or water
+            static bool Surface(Material material)
+            {
+                var name = material.Effect?.Name;
+                if (string.IsNullOrEmpty(name)) return true;
+                foreach (var not in NotSurfaces)
+                    if (name.Contains(not, StringComparison.OrdinalIgnoreCase)) return false;
+                return true;
+            }
+        }
+
+        private static readonly string[] NotSurfaces =
+            { "vfx", "particle", "trail", "water", "ocean", "decal", "wake", "ghost", "gizmo", "transparent", "hologrid" };
 
         /// <summary>Eigenvalues and eigenvectors (columns) of a symmetric 3x3 matrix, by Jacobi rotations.</summary>
         private static (double[] values, double[,] vectors) Eigen3(double[,] input)
@@ -371,6 +485,7 @@ namespace Freefall.Graphics
                     Material? material = null;
                     if (part.Materials != null && meshPart.MaterialSlot >= 0 && meshPart.MaterialSlot < part.Materials.Count)
                         material = part.Materials[meshPart.MaterialSlot];
+                    if (material == null && part.HideBare) continue;
                     int materialId = material != null && material.MaterialID >= 0 ? material.MaterialID : _material.MaterialID;
 
                     _material.Apply(_cmd, device);

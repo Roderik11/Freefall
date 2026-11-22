@@ -5,6 +5,7 @@ using System.Linq;
 using System.Numerics;
 using System.Text.Json;
 using Freefall.Assets;
+using Freefall.Base;
 using Freefall.Graphics;
 
 namespace Freefall.Editor.Commands
@@ -21,8 +22,10 @@ namespace Freefall.Editor.Commands
     ///        the side nearest "frontHint" to the camera: a vambrace on a bent arm),
     ///        "up": "near" (the end nearer the grip on top: a staff), "front": "near" (the side nearer the grip to the
     ///        camera: a curved shield), "yaw", "pitch", "roll" (degrees, after orient), "margin" (0.04),
-    ///        "exposure" (1), "interior" (1: how dark insides go), "supersample" (4)}
-    /// Answers the path, the size and the share of the picture covered.
+    ///        "exposure" (1), "interior" (1: how dark insides go), "supersample" (4),
+    ///        "prefab": guid (its copy's renderers as parts, in its root's space, beside any "parts": a ship from its
+    ///        prefab; IconRenderer.PrefabParts, an IIconShape component giving its own look)}
+    /// Answers the path, the size, the share of the picture covered and what was drawn (mesh, effects by slot).
     /// </summary>
     [CommandRoute("POST", "/api/icon/render")]
     public class RenderIconCommand : EditorCommand
@@ -33,9 +36,23 @@ namespace Freefall.Editor.Commands
                 return CommandResult.BadRequest("Body required: {\"width\", \"height\", \"out\", \"parts\": [...]}");
             using var doc = context.ParseBody();
             var root = doc.RootElement;
+            Entity? copy = null;
+            List<Mesh>? owned = null;
             try
             {
-                var parts = IconRequest.Parts(root);
+                var parts = root.TryGetProperty("parts", out _) ? IconRequest.Parts(root) : new List<IconPart>();
+                // A prefab: a copy of it made for the drawing, its parts in its root's space, taken away again
+                if (root.TryGetProperty("prefab", out var pf) && pf.GetString() is { Length: > 0 } prefabGuid)
+                {
+                    var prefab = Engine.Assets.LoadByGuid<Prefab>(prefabGuid) ?? throw new InvalidOperationException($"No prefab {prefabGuid}");
+                    copy = prefab.Instantiate() ?? throw new InvalidOperationException($"Prefab {prefab.Name} made nothing");
+                    copy.Transform.Position = Vector3.Zero;
+                    copy.Transform.Rotation = Quaternion.Identity;
+                    copy.Transform.Scale = Vector3.One;
+                    owned = IconRenderer.PrefabParts(copy, parts);
+                }
+                if (parts.Count == 0)
+                    return CommandResult.BadRequest("Nothing to draw: give 'parts' or a 'prefab' with renderers");
                 int width = root.TryGetProperty("width", out var w) ? w.GetInt32() : 128;
                 int height = root.TryGetProperty("height", out var h) ? h.GetInt32() : 128;
                 string? output = root.TryGetProperty("out", out var o) ? o.GetString() : null;
@@ -50,11 +67,23 @@ namespace Freefall.Editor.Commands
                 int covered = 0;
                 for (int i = 3; i < pixels.Length; i += 4) if (pixels[i] > 0) covered++;
                 TextureReadback.SavePng(output, pixels, width, height);
-                return CommandResult.Json(new { path = output, width, height, coverage = Math.Round((double)covered / (width * height), 4) });
+                // What was drawn, by mesh and effect: to see what a prefab put in
+                var drawn = parts.Select(p => new
+                {
+                    mesh = p.Mesh?.Name,
+                    effects = p.Materials?.Select(m => m?.Effect?.Name).ToArray(),
+                }).ToList();
+                return CommandResult.Json(new { path = output, width, height, coverage = Math.Round((double)covered / (width * height), 4), parts = drawn });
             }
             catch (Exception ex)
             {
                 return CommandResult.BadRequest(ex.GetBaseException().Message);
+            }
+            finally
+            {
+                if (owned != null)
+                    foreach (var mesh in owned) Engine.Device.DeferDispose(mesh);
+                copy?.Destroy();
             }
         }
     }
