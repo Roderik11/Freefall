@@ -46,6 +46,9 @@ namespace Freefall.Graphics
         private readonly GraphicsBuffer[] _readback = new GraphicsBuffer[FrameCount];
         private readonly Vector2[][] _asked = new Vector2[FrameCount][];
         private readonly int[] _askedCount = new int[FrameCount];
+        // What came back and the places asked for this frame, held here: at Water.SeaProbes (1024) they are too big for the stack
+        private readonly Vector4[] _got = new Vector4[Water.SeaProbes + 1];
+        private readonly Vector2[] _watched = new Vector2[Water.SeaProbes];
         private DirectionalLight? _sun;
 
         /// <summary>
@@ -90,9 +93,9 @@ namespace Freefall.Graphics
             {
                 var results = _readback[slot].ReadPtr<Vector4>();
                 int n = _askedCount[slot];
-                Span<Vector4> got = stackalloc Vector4[Water.SeaProbes + 1];
+                var got = _got.AsSpan(0, n);
                 for (int i = 0; i < n; i++) got[i] = results[i];
-                Water.TakeMeasured(_asked[slot].AsSpan(0, n), got.Slice(0, n));
+                Water.TakeMeasured(_asked[slot].AsSpan(0, n), got);
                 _askedCount[slot] = 0;
             }
 
@@ -112,7 +115,7 @@ namespace Freefall.Graphics
             Engine.Muffled = MathF.Abs(muffled - (CameraUnder ? 1f : 0f)) < 0.01f ? (CameraUnder ? 1f : 0f) : muffled;
 
             // The places to measure the sea at: the camera's (when it is at sea), then the swimmers'
-            Span<Vector2> watched = stackalloc Vector2[Water.SeaProbes];
+            var watched = _watched;
             int watchedCount = Water.TakeWatched(watched);
             bool seaEye = near && surface.Kind == WaterKind.Sea;
             int probes = 0;
