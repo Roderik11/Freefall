@@ -70,3 +70,5 @@ ThirdParty/DLSS/win-x64/
 
 # The licences a published game's ThirdPartyNotices.txt quotes (Publishing/ThirdPartyNotices.cs)
 !ThirdParty/Licenses/*.txt
+# Local secrets written by `elevenlabs onboard`
+/.env.local
