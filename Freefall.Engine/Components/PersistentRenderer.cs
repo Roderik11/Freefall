@@ -374,8 +374,9 @@ namespace Freefall.Components
                                            "(the sky captures and the shelter map). Those are drawn once and kept while " +
                                            "the camera stays put, so something that moves leaves its darkness where it " +
                                            "was: off for what moves (a ship's hull, rig and sails). Its sun shadows are " +
-                                           "not affected; what lies inside it gets the open sky. Characters (the skinned " +
-                                           "effect) are never in them.")]
+                                           "not affected; what lies inside it gets the open sky. Under a WeatherFrame its " +
+                                           "shelter from rain and snow comes from a cover map of its own, drawn as it goes " +
+                                           "out of them. Characters (the skinned effect) are never in them.")]
         public bool InSkyCaptures
         {
             get => _inSkyCaptures;
@@ -384,6 +385,8 @@ namespace Freefall.Components
                 if (_inSkyCaptures == value) return;
                 _inSkyCaptures = value;
                 Invalidate();
+                // A WeatherFrame over it draws its own cover map once all of it is out (WeatherFrames)
+                if (Transform != null) WeatherFrames.SkyCapturesChanged(Transform.TransformSlot);
             }
         }
         private bool _inSkyCaptures = true;

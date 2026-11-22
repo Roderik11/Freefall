@@ -22,6 +22,9 @@ namespace Freefall.Graphics
         private const int MaskWords = DecalBuffer.MaxVisible / 32;      // DECAL_MASK_WORDS
         private const int ImportanceBins = 64;                          // decal_cull.hlsl IMPORTANCE_BINS
 
+        /// <summary>Hulls wetted by the water are shaded so within this of the camera (m, from their outside).</summary>
+        private const float HullsWetWithin = 400f;
+
         /// <summary>The view and its weather. Must match DecalFrame in decals.hlsli (240 bytes).</summary>
         [StructLayout(LayoutKind.Sequential, Pack = 4)]
         private struct Frame
@@ -122,7 +125,9 @@ namespace Freefall.Graphics
             int slots = registry != null && registry.Active ? registry.SlotCount : 0;
             // Puddles outlast the wet ground (they drain 4× slower) and still need the shelter
             bool weather = Weather.SurfaceWetness > 0.001f || Weather.SnowCover > 0.001f || Weather.PuddleFill > 0.001f;
-            if ((slots == 0 && !weather) || !Supported)
+            // Ships' hulls near the camera: wet where the water has reached up their sides (WaterHull.Wet)
+            bool hulls = WaterHulls.Count > 0 && WaterHulls.AnyWithin(camera.Position, HullsWetWithin);
+            if ((slots == 0 && !weather && !hulls) || !Supported)
                 return false;
             if (renderer.Albedo.UavIndex == 0)
                 return false;   // targets made without unordered access
@@ -196,6 +201,13 @@ namespace Freefall.Graphics
             apply.SetPushConstant("DataUAV", renderer.Data.UavIndex);
             apply.SetPushConstant("LinearDepthUAV", renderer.DepthGBuffer.UavIndex);
             apply.SetPushConstant("HeightUAV", renderer.HeightBuffer.UavIndex);
+            apply.SetPushConstant("HullsSrv", hulls ? WaterHulls.Srv : 0u);
+            apply.SetPushConstant("HullCount", hulls ? WaterHulls.Count : 0u);
+            apply.SetPushConstant("HullWetSrv", hulls ? WaterHulls.WetSrv : 0u);
+            // Meshes whose weather rides with them (WeatherFrame): their slots' frames, and the frames' own cover maps
+            apply.SetPushConstant("WeatherFrames", WeatherFrames.Srv);
+            apply.SetPushConstant("WeatherFrameMask", WeatherFrames.Mask);
+            apply.SetPushConstant("WeatherFrameCovers", WeatherFrames.CoversSrv);
             _masks.Transition(list, ResourceStates.UnorderedAccess);
             if (slots > 0)
             {

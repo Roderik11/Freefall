@@ -42,7 +42,10 @@ namespace Freefall.Components
         /// <summary>Metres every cascade's depth range reaches toward the sun past its slice of the view, so casters
         /// above a small room (ceiling, roof) are drawn however thin the adaptive splits make the cascade.</summary>
         private const float MinCasterReach = 300f;
-        
+
+        /// <summary>Ships' hulls are lit from below by the sun off the sea within this of the camera (m, from their outside).</summary>
+        private const float HullsLitWithin = 400f;
+
         // Shadow Cascades — arrays sized to max capacity, the count in use chosen per frame (CascadeCount)
         private readonly Vector4[] cascades = new Vector4[MaxCascades];
         private readonly Matrix4x4[] cascadeProjectionMatrices = new Matrix4x4[MaxCascades];
@@ -374,7 +377,12 @@ namespace Freefall.Components
             lightCS.SetPushConstant("SSDMTex", Engine.Settings.EnableSSDM ? (renderer.ScreenSpaceDisplacement?.OutputSrvIndex ?? 0u) : 0u);
             lightCS.SetPushConstant("GITex", 0u); // GI composed in separate CSComposeGI pass
             lightCS.SetPushConstant("SkyVisTex", renderer.SkyVisibilitySrv);  // 0: looked up in the shader
-            
+            // Ships' hulls near the camera: lit from below by the sun off the sea (light_directional_cs HullWaterLight)
+            bool hulls = WaterHulls.Count > 0 && WaterHulls.AnyWithin(camera.Position, HullsLitWithin);
+            lightCS.SetPushConstant("HullsSrv", hulls ? WaterHulls.Srv : 0u);
+            lightCS.SetPushConstant("HullCount", hulls ? WaterHulls.Count : 0u);
+            lightCS.SetPushConstant("HullSeaSrv", hulls ? WaterHulls.SeaSrv : 0u);
+
             // Bind cbuffers on compute root (Material.Apply committed them on graphics root)
             foreach (var cb in Material.ConstantBuffers)
             {

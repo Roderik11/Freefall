@@ -230,6 +230,12 @@ struct MeshPartLod
 // ShadowSkipBits (the sky captures, the shelter map), which are drawn once and kept: something that moves (a ship)
 // would leave its darkness where it was drawn
 #define NO_SKY_CAPTURE_BIT 0x20000000u
+// In ShadowSkipBits: keep only what has one of the other bits instead of leaving it out (DrawBucket.ShadowOnlyBits; bit 0,
+// a mesh part's, never a skip bit)
+#define SHADOW_ONLY_BITS 0x1u
+// In ShadowSkipBits: leave out what is drawn with bones too (DrawBucket.ShadowNoBones; bit 1): a sail's cloth or roll,
+// which a ship's own cover map, drawn once, must not keep in whatever shape it had then
+#define SHADOW_NO_BONES 0x2u
 #define SUBBATCH_PART_MASK (~(LOD_MANAGED_BIT | NO_POINT_SHADOW_BIT | NO_SKY_CAPTURE_BIT))
 #define INVALID_PART    0xFFFFFFFFu
 
@@ -1660,11 +1666,21 @@ void CSVisibilityCascades(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
     
-    // Left out of this chain (the sky captures and the shelter map leave out what moves: NO_SKY_CAPTURE_BIT)
+    // Left out of this chain (the sky captures and the shelter map leave out what moves: NO_SKY_CAPTURE_BIT). With
+    // SHADOW_ONLY_BITS set the other way round: only what has one of the bits is in (a ship's own cover map draws only
+    // what moves, not the quay it lies at)
     if (ShadowSkipBits != 0)
     {
         StructuredBuffer<uint> skipIds = ResourceDescriptorHeap[SubbatchIdsIdx];
-        if ((skipIds[instanceIdx] & ShadowSkipBits) != 0)
+        bool has = (skipIds[instanceIdx] & (ShadowSkipBits & ~(SHADOW_ONLY_BITS | SHADOW_NO_BONES))) != 0;
+        bool leftOut = (ShadowSkipBits & SHADOW_ONLY_BITS) != 0 ? !has : has;
+        // ... and with SHADOW_NO_BONES what is drawn with bones (a sail's cloth, a character): it changes its shape
+        if (!leftOut && (ShadowSkipBits & SHADOW_NO_BONES) != 0)
+        {
+            StructuredBuffer<InstanceDescriptor> boned = ResourceDescriptorHeap[DescriptorBufferIdx];
+            leftOut = boned[instanceIdx].BoneBufferIdx != 0;
+        }
+        if (leftOut)
         {
             combinedVis[instanceIdx] = 0;
             cascadeMasks[instanceIdx] = 0;

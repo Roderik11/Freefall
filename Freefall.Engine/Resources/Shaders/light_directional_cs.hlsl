@@ -20,10 +20,16 @@ cbuffer PushConstants : register(b3)
     uint SSDMTexIdx;
     uint GITexIdx;
     uint SkyVisTexIdx;      // sky_visibility_cs.hlsl's result (0 = look it up here)
+    uint HullsSrvIdx;       // ships' hulls near the camera (Graphics/WaterHulls.cs, water_hulls.hlsli), 0 = none
+    uint HullCount;
+    uint HullSeaSrvIdx;     // StructuredBuffer<float>: where the sea stands along each (HULL_STATIONS a hull), then how
+                            // far the water has run along each (WaterHull.Travel)
 };
 
 #include "common.fx"
 #include "sky_common.fx"
+#include "water_hulls.hlsli"
+#include "caustics.hlsli"
 
 // Light params from ObjectConstants (Slot 2, b1)
 cbuffer ObjectConstants : register(b1)
@@ -121,6 +127,57 @@ float ContactShadow(float3 worldPos, float3 lightDir, float2 screenPos, float li
     }
     
     return 1.0;
+}
+
+// The light the sea throws up onto a ship's hull, as a share of what the sun's mirror image in it gives (0..): on the
+// hull's outside (within a hand of its shape's half-breadth at that height, not its deck or the inside of its bulwarks),
+// over the sea along it (WaterHull.Sea), up to the top of its shape (WaterHull.Top, 3 m over its waterline at most). The
+// waves focus it into a moving net of lines (caustics.hlsli, its mean 1 here), sharp just over the water and blurring
+// higher up as the rays from each wave spread, stretched along the hull (a wall takes the net slanting in), the net
+// moving with the water as it runs along the hull (WaterHull.Travel), and a little weaker up the side
+// Over the physical (a flat sea's Fresnel): at 1 it added about a per cent of the sun on a sunlit side and was not seen;
+// a rough sea throws more of the light sideways, and its play is what tells the eye the hull is on the water
+#define HULL_WATER_LIGHT_GAIN 8.0
+float HullWaterLight(float3 p)
+{
+    if (HullsSrvIdx == 0 || HullSeaSrvIdx == 0 || HullCount == 0u)
+        return 0.0;
+    StructuredBuffer<WaterHull> hulls = ResourceDescriptorHeap[HullsSrvIdx];
+    StructuredBuffer<float> sea = ResourceDescriptorHeap[HullSeaSrvIdx];
+    float light = 0.0;
+    for (uint i = 0; i < HullCount; i++)
+    {
+        float4 sphere = hulls[i].Sphere;
+        float3 d = p - sphere.xyz;
+        float r = sphere.w + 1.0;
+        if (dot(d, d) > r * r)
+            continue;
+        float4 w = float4(p, 1.0);
+        float3 l = float3(dot(hulls[i].Row0, w), dot(hulls[i].Row1, w), dot(hulls[i].Row2, w));
+        float x0 = hulls[i].X0, x1 = hulls[i].X1, y0 = hulls[i].Bottom, y1 = hulls[i].Top;
+        if (l.x <= x0 || l.x >= x1 || l.y <= y0 || l.y >= y1)
+            continue;
+        float fx = (l.x - x0) / (x1 - x0) * (HULL_STATIONS - 1);
+        float fy = saturate((l.y - y0) / (y1 - y0)) * (HULL_LEVELS - 1);
+        uint ix = min((uint)fx, HULL_STATIONS - 2), iy = min((uint)fy, HULL_LEVELS - 2);
+        float tx = fx - ix, ty = fy - iy;
+        uint at = iy * HULL_STATIONS + ix;
+        float b = lerp(lerp(hulls[i].Breadth[at], hulls[i].Breadth[at + 1], tx),
+                       lerp(hulls[i].Breadth[at + HULL_STATIONS], hulls[i].Breadth[at + HULL_STATIONS + 1], tx), ty);
+        float az = abs(l.z);
+        if (b <= 0.05 || az < b - 0.25 || az > b + 0.35)
+            continue;
+        float over = l.y - lerp(sea[i * HULL_STATIONS + ix], sea[i * HULL_STATIONS + ix + 1], tx);
+        if (over <= 0.0)
+            continue;
+        float travel = sea[HullCount * HULL_STATIONS + i];
+        float net = Caustics(float2((l.x + travel) / 1.0, over / 0.3 + l.x * 0.1), Time) / CAUSTICS_MEAN;
+        float sharp = exp(-over / 0.9);
+        float here = lerp(1.0, net, sharp) * smoothstep(0.0, 0.1, over) * lerp(1.0, 0.4, saturate(over / 3.0))
+                     * (1.0 - smoothstep(y1 - 0.3, y1, l.y));
+        light = max(light, here);
+    }
+    return light;
 }
 
 [numthreads(8, 8, 1)]
@@ -402,6 +459,22 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     // hundreds of metres wide and holds the ground round it too, and × the clouds' beam: a cloud's shadow is kilometres
     // wide and holds the surroundings as well (folded into the shadow, it raised the wrap under a cloud)
     lighting += diffuse * LightColor * LightIntensity * NdotL * (1.0 - localShadow) * cloudBeam * 0.12 * ao * skyVisibility * terrainShadow;
+
+    // The sun's light thrown up off the sea onto a ship's hull (HullWaterLight): it comes from the sun's mirror image
+    // under the surface, as much of it as the water reflects at the sun's height (Fresnel: a few per cent at noon, a
+    // third at sunset), so it lights what faces the water and the sun's side, the hull's underside where it curves in
+    // most. The hull's own shadow does not stop it (it comes from the water out from it), a cloud's or the terrain's does
+    if (HullCount > 0u && L.y > 0.0 && vegetation < 1.0)
+    {
+        float fromWater = HullWaterLight(worldPos.xyz + CamPos);
+        if (fromWater > 0.0)
+        {
+            float3 mirrored = float3(L.x, -L.y, L.z);
+            float reflectance = 0.02 + 0.98 * pow(1.0 - L.y, 5.0);
+            lighting += diffuse * LightColor * LightIntensity * 3.14159 * saturate(dot(normal, mirrored)) * reflectance
+                        * fromWater * cloudBeam * terrainShadow * terrainOpen * ao * (1.0 - vegetation) * HULL_WATER_LIGHT_GAIN;
+        }
+    }
 
     // The light a cloud throws on forward round the sun (cloudForward): it comes from the cloud's bright region round the
     // sun's place, tens of degrees across, so it shades by the surface's turn toward the sun and casts soft, wide shadows:

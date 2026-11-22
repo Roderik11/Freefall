@@ -27,6 +27,14 @@ cbuffer PushConstants : register(b3)
     uint DataUAVIdx;            // RGBA8
     uint LinearDepthUAVIdx;     // R32F: the linear depth minus the height bias
     uint HeightUAVIdx;          // RG16F: the screen-space displacement vector
+    uint HullsSrvIdx;           // StructuredBuffer<WaterHull>: the ships' hulls near the camera (WaterHulls.Srv), 0 = none
+    uint HullCount;
+    uint HullWetSrvIdx;         // StructuredBuffer<float>: how high the water has wetted each and has just been, 4 ×
+                                // HULL_STATIONS a hull (WaterHulls.WetSrv)
+    uint WeatherFramesIdx;      // StructuredBuffer<uint4>: (transform slot + 1, frame slot, frame index, 0), open-addressed
+                                // (Graphics/WeatherFrames.cs), 0 = none
+    uint WeatherFrameMask;      // its length − 1
+    uint WeatherFrameCoversIdx; // StructuredBuffer<float4>: each frame's own cover map, 2 rows (WeatherFrames.CoversSrv)
 };
 
 #include "common.fx"
@@ -34,6 +42,190 @@ cbuffer PushConstants : register(b3)
 #include "decals.hlsli"
 #include "decal_settings.hlsli"
 #include "weather_cover.hlsli"
+#include "water_hulls.hlsli"
+
+// ── The space the weather's patterns are laid in: the world's, or a moving thing's (Components/WeatherFrame.cs) ──
+
+// Origin and unit axes in the world: a place's pattern coordinates are its offsets along them. The world's own by
+// default (origin 0, the world's axes), so a surface outside any frame gets exactly what it got before
+struct WeatherSpace
+{
+    float3 Origin;
+    float3 X, Y, Z;
+    uint Root;          // the frame's index in WeatherFrameCoversIdx; WEATHER_WORLD for the world or none
+};
+#define WEATHER_WORLD 0xFFFFFFFFu
+
+WeatherSpace WorldWeatherSpace()
+{
+    WeatherSpace w;
+    w.Origin = 0;
+    w.X = float3(1, 0, 0);
+    w.Y = float3(0, 1, 0);
+    w.Z = float3(0, 0, 1);
+    w.Root = WEATHER_WORLD;
+    return w;
+}
+
+// The space for a surface of a transform slot: its frame's rigid part (its scale taken out, so a scaled frame does not
+// stretch the snow) where the slot follows one, else the world's
+WeatherSpace WeatherSpaceOf(uint slot)
+{
+    WeatherSpace w = WorldWeatherSpace();
+    if (WeatherFramesIdx == 0)
+        return w;
+    StructuredBuffer<uint4> table = ResourceDescriptorHeap[WeatherFramesIdx];
+    uint key = slot + 1u;
+    uint at = (slot * 2654435761u) & WeatherFrameMask;     // WeatherFrames.Hash
+    [loop] for (uint probe = 0; probe < 32u; probe++)        // at most half full: a probe or two
+    {
+        uint4 e = table[at];
+        if (e.x == 0u)
+            return w;
+        if (e.x == key)
+        {
+            float4x4 m = DecalMatrix(TransformsIdx, e.y);    // row vectors: rows 0-2 the axes, row 3 the origin
+            w.Origin = m[3].xyz;
+            w.X = normalize(m[0].xyz);
+            w.Y = normalize(m[1].xyz);
+            w.Z = normalize(m[2].xyz);
+            w.Root = e.z;
+            return w;
+        }
+        at = (at + 1u) & WeatherFrameMask;
+    }
+    return w;
+}
+
+// A world place's pattern coordinates in a weather space
+float3 WeatherPlace(WeatherSpace w, float3 world)
+{
+    float3 d = world - w.Origin;
+    return float3(dot(d, w.X), dot(d, w.Y), dot(d, w.Z));
+}
+
+// How much of the fall reaches a world place on a frame by the frame's own cover map (WeatherFrames, ShelterMap
+// RenderFrameCover: its meshes drawn straight down its own up, in its frame), 0..1; 1 while it has none (still in the sky
+// captures: the world's map holds it). Read as a level of the world's map is, in the frame's coordinates: its own castles
+// and decks over a place on it, whatever its heel or wherever it has sailed. `s` lends the lookups its sampler state only
+float FrameOpenness(WeatherShelter s, SamplerState linearClamp, WeatherSpace w, float3 world, float bias)
+{
+    if (w.Root == WEATHER_WORLD || WeatherFrameCoversIdx == 0)
+        return 1.0;
+    StructuredBuffer<float4> covers = ResourceDescriptorHeap[WeatherFrameCoversIdx];
+    float4 square = covers[w.Root * 2u], heights = covers[w.Root * 2u + 1u];
+    if (heights.z < 0.5)
+        return 1.0;
+    ShelterLevel l;
+    l.Left = square.x;
+    l.Top = square.y;
+    l.Size = square.z;
+    l.Map = asuint(square.w);
+    WeatherShelter own = s;
+    own.MinY = heights.x;
+    own.RangeY = heights.y;
+    float3 p = WeatherPlace(w, world);
+    return ShelterLevelOpenness(own, l, linearClamp, p.xz, p.y + bias, bias);
+}
+
+// ── Ships' hulls wet where the water has reached up their sides (WaterHull.Wet, kept by the ships) ──
+
+// The cells the drops on a hull's running film stand in (metres; one drop in some of them)
+#define HULL_DROP_CELL 0.04
+
+float HullHash(float n)
+{
+    return frac(sin(n * 127.1) * 43758.5453);
+}
+
+float HullNoise(float x)
+{
+    float i = floor(x), t = frac(x);
+    return lerp(HullHash(i), HullHash(i + 1.0), t * t * (3.0 - 2.0 * t));
+}
+
+// How wet a place on a hull's outside is (x, 0..1): under the line the water has wetted it to on that side, at that
+// station (in the hull's frame), its top ragged along the hull and run down in streaks where it is drying; and how much
+// of a running film is on it (y, 0..1): under the line the water has just been to (WaterHull.Fresh), and in thin
+// rivulets over that line, the water the top left still running down to it; and where a drop of it stands (z, 0..1), on
+// the film and at each rivulet's running head, with its roughness (w). Only on the outside of its planking (within a hand
+// of the shape's half-breadth there), not on its deck or inside its bulwarks
+float4 HullWetness(float3 p)
+{
+    if (HullsSrvIdx == 0 || HullWetSrvIdx == 0)
+        return 0.0;
+    StructuredBuffer<WaterHull> hulls = ResourceDescriptorHeap[HullsSrvIdx];
+    StructuredBuffer<float> lines = ResourceDescriptorHeap[HullWetSrvIdx];
+    float wet = 0.0, film = 0.0, drop = 0.0, dropRough = 0.1;
+    for (uint i = 0; i < HullCount; i++)
+    {
+        float4 sphere = hulls[i].Sphere;
+        float3 d = p - sphere.xyz;
+        float r = sphere.w + 1.0;
+        if (dot(d, d) > r * r)
+            continue;
+        float4 w = float4(p, 1.0);
+        float3 l = float3(dot(hulls[i].Row0, w), dot(hulls[i].Row1, w), dot(hulls[i].Row2, w));
+        float x0 = hulls[i].X0, x1 = hulls[i].X1, y0 = hulls[i].Bottom, y1 = hulls[i].Top;
+        if (l.x <= x0 || l.x >= x1 || l.y <= y0 || y1 <= y0)
+            continue;
+        float fx = (l.x - x0) / (x1 - x0) * (HULL_STATIONS - 1);
+        float fy = saturate((l.y - y0) / (y1 - y0)) * (HULL_LEVELS - 1);
+        uint ix = min((uint)fx, HULL_STATIONS - 2), iy = min((uint)fy, HULL_LEVELS - 2);
+        float tx = fx - ix, ty = fy - iy;
+        uint at = iy * HULL_STATIONS + ix;
+        float b = lerp(lerp(hulls[i].Breadth[at], hulls[i].Breadth[at + 1], tx),
+                       lerp(hulls[i].Breadth[at + HULL_STATIONS], hulls[i].Breadth[at + HULL_STATIONS + 1], tx), ty);
+        float az = abs(l.z);
+        if (b <= 0.05 || az < b - 0.25 || az > b + 0.35)
+            continue;
+        uint side = l.z >= 0.0 ? 0u : 1u;   // port (+z) first
+        uint row = i * 4u * HULL_STATIONS + side * HULL_STATIONS;           // the wet lines, then the fresh ones
+        float top = lerp(lines[row + ix], lines[row + ix + 1], tx);
+        uint freshRow = row + 2u * HULL_STATIONS;
+        float fresh = lerp(lines[freshRow + ix], lines[freshRow + ix + 1], tx);
+        // The running film under the line the water has just been to, and rivulets over it: thin lanes along the hull,
+        // each running up to its own length over the film's edge (the water the top left, draining down to it), and
+        // never over the wet line
+        float lane = HullNoise(l.x * 22.0 + i * 5.3 + side * 9.1);
+        float rivulet = smoothstep(0.8, 0.93, lane) * (1.0 - smoothstep(fresh, fresh + 0.2 + 0.8 * HullNoise(l.x * 3.1 + i + side * 2.0), l.y));
+        // Beads running down each rivulet, at a lane's own pace and phase
+        float bead = frac(l.y * 1.6 + Time * (0.6 + 0.5 * HullNoise(l.x * 22.0 + 17.0)) + 3.0 * HullNoise(l.x * 22.0 + 40.0));
+        float head = rivulet * (1.0 - smoothstep(0.04, 0.1, bead));
+        rivulet *= 0.45 + 0.55 * smoothstep(0.0, 0.12, bead) * (1.0 - smoothstep(0.12, 0.45, bead));
+        float under = 1.0 - smoothstep(fresh - 0.06, fresh + 0.02, l.y);
+        float below = 1.0 - smoothstep(top - 0.05, top + 0.05, l.y);
+        film = max(film, max(under, 0.8 * rivulet) * below);
+        // Drops standing on the film, in the hull's frame so they ride with it: in some of the 4 cm cells a bead half a
+        // centimetre to a centimetre across, in clumps (one even band of them read as a dotted pattern), more of them
+        // near the film's top where the water is leaving; each with a gloss of its own, so some shine less
+        float2 cell = l.xy / HULL_DROP_CELL;
+        float2 c = floor(cell);
+        float n = c.x * 0.137 + c.y * 3.71 + i * 1.3 + side * 0.7;
+        float2 centre = 0.2 + 0.6 * float2(HullHash(n + 0.31), HullHash(n + 0.57));
+        float2 dd = frac(cell) - centre;
+        float size = 0.015 + 0.045 * HullHash(n + 0.83);
+        float clump = HullNoise(l.x * 2.7 + i * 3.1 + side * 1.7) * HullNoise(l.y * 4.3 + l.x * 0.9 + 5.0 + side);
+        float edge = saturate((l.y - fresh + 0.3) / 0.3);
+        float spot = HullHash(n) < (0.02 + 0.6 * clump * clump) * (0.5 + 0.5 * edge)
+                         ? 1.0 - smoothstep(size * 0.5, size, dot(dd, dd)) : 0.0;
+        float here = max(spot * under, head) * below;
+        if (here > drop)
+        {
+            drop = here;
+            dropRough = spot * under >= head ? 0.06 + 0.2 * HullHash(n + 0.71) : 0.08;
+        }
+        // Ragged along the hull, and drying in streaks under the line: some run down further than others
+        float ragged = (HullNoise(l.x * 1.3 + i * 7.1 + side * 3.3) - 0.5) * 0.14;
+        float streak = HullNoise(l.x * 7.0 + i * 3.7 + side * 11.0);
+        top += ragged;
+        // Soaked at the water, drying towards the top of what the waves and spray reached: up there only damp. Wet evenly
+        // up to the line, a storm's spray soaked the whole side to its wale and the water's edge did not show
+        float damp = lerp(1.0, 0.4, saturate(l.y / max(top, 0.3)));
+        wet = max(wet, damp * (1.0 - smoothstep(top - 0.08 - 0.3 * streak * streak, top + 0.02, l.y)));
+    }
+    return float4(max(wet, film), film, drop, dropRough);
+}
 
 SamplerState Sampler : register(s0);           // anisotropic wrap
 SamplerState LinearClamp : register(s2);
@@ -459,10 +651,12 @@ float3 NoiseGrad(float2 p, uint seed)
 // crystal here (round, 1 in 25 cells of 6 mm, only while a pixel is smaller than a cell, so they cannot turn to noise
 // far off) with its facet half-way between the light `toLight` and the eye `toEye`: a crystal flashes when it lines up
 // so, and only ever brightens. Each with its own random tilt drew dark specks, most of them facing away from the sun.
-// The caller makes it glossy
-float3 SnowSurfaceNormal(float3 world, float3 n, float footprint, float3 toLight, float3 toEye, out float glint)
+// The caller makes it glossy. Laid in `space` (WeatherSpaceOf): the world's, or a moving thing's, so on a ship the
+// drifts and crystals ride with it; its tilts turned back into the world by the space's axes
+float3 SnowSurfaceNormal(WeatherSpace space, float3 world, float3 n, float footprint, float3 toLight, float3 toEye,
+                         out float glint)
 {
-    float2 xz = world.xz;
+    float2 xz = WeatherPlace(space, world).xz;
     float2 slope = 0;
     float3 drift = NoiseGrad(xz / 7.0, 301u);
     slope += drift.yz * (1.0 / 7.0);
@@ -484,8 +678,9 @@ float3 SnowSurfaceNormal(float3 world, float3 n, float footprint, float3 toLight
     float3 grain = NoiseGrad(xz / 0.035, 305u);
     slope += grain.yz * (0.003 / 0.035) * (1.0 - smoothstep(0.003, 0.009, footprint));
 
-    // The height field's normal on the large-scale surface (gentle slopes: the tilt added in the ground's plane)
-    float3 sn = normalize(n - float3(slope.x, 0.0, slope.y));
+    // The height field's normal on the large-scale surface (gentle slopes: the tilt added in the ground's plane, the
+    // space's x and z: the world's, or the moving thing's as it heels and pitches)
+    float3 sn = normalize(n - (space.X * slope.x + space.Z * slope.y));
 
     // Glints
     glint = 0.0;
@@ -515,7 +710,10 @@ float3 SnowSurfaceNormal(float3 world, float3 n, float footprint, float3 toLight
 // near trees stayed green and far ones white. A far tree's cross-mesh card brings its own exposure in the vegetation
 // flag (common.fx FarTreeExposure): the map holds no top for vertical cards, so they came out white where it had none
 // and in green stripes where a card's edge had left one (user, 2026-10-23: "the snow on crossmeshes looks bad")
-float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float vegetationFlag)
+// space: a place on something that moves under a WeatherFrame is sheltered by its own cover map too (FrameOpenness), so a
+// ship's castles keep the fall off its decks wherever it sails; the world's map, which leaves it out under way, still
+// gives what is over it where it stands now (a bridge)
+float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float vegetationFlag, WeatherSpace space)
 {
     WeatherShelter s;
     s.Levels = f.Shelter;
@@ -537,7 +735,8 @@ float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, f
         for (uint k = 0; k < SHELTER_LEVELS; k++)
             s.Levels[k].Size = 0.0;
     }
-    return crown * WeatherOpenness(s, LinearClamp, rel + CamPos + geo * 0.35 + float3(0, 0.05, 0), 0.1);
+    float3 p = rel + CamPos + geo * 0.35;
+    return crown * WeatherOpenness(s, LinearClamp, p + float3(0, 0.05, 0), 0.1) * FrameOpenness(s, LinearClamp, space, p, 0.15);
 }
 
 // The terrain's smooth normal at a place (world xz) from its heights (terrain_pages.hlsli): its own normal before its
@@ -559,10 +758,15 @@ float3 TerrainNormal(DecalFrame f, float2 xz)
 // triangle of the CDLOD mesh (on a low-poly rock too, 2026-10-24): deep snow was
 // shaded in facets, steep triangles stayed bare edge to edge, and the normal bent halfway up lit the slopes that the
 // shadow map darkens, so the terrain's shadow showed as long smears on the snow (user, 2026-10-23)
-void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float open, float normalVariance, inout Surface s)
+// hull: how wet a ship's hull is here from the water that reached up its side (x), how much of a running film is on it
+// (y) and where its drops stand (z) with their gloss (w; HullWetness), wet as the rain makes it, in the open or not.
+// space: what the snow's pattern is laid in (WeatherSpaceOf): the world, or a moving thing it rides with
+void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float open, float normalVariance, float4 hull,
+                  WeatherSpace space, inout Surface s)
 {
+    float hullWet = hull.x;
     // Emissive pixels (lamp glass, windows) hold their light in the albedo: left as they are
-    if (s.Albedo.a > 0.01 || (open <= 0.0 && s.Print <= 0.0))
+    if (s.Albedo.a > 0.01 || (open <= 0.0 && s.Print <= 0.0 && hullWet <= 0.0))
         return;
     float3 world = rel + CamPos;
 
@@ -594,7 +798,8 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
         // a crown had one value
         bool plant = surfaceClass == 2u;
         float lift = plant ? 1.0 : relief;
-        float drift = plant ? SnowNoise((world.xz + world.y * float2(0.7, -0.5)) * 0.8) : SnowNoise(world.xz * 0.35);
+        float drift = plant ? SnowNoise((world.xz + world.y * float2(0.7, -0.5)) * 0.8)
+                            : SnowNoise(WeatherPlace(space, world).xz * 0.35);
         float t = 1.0 - cover;
         snow = smoothstep(t - 0.06, t + 0.06, up * (0.1 + 0.5 * lift + 0.4 * drift + 0.2 * hollow)) * saturate(up * 3.0);
     }
@@ -614,6 +819,7 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
 
     float facing = geo.y >= 0.0 ? lerp(0.35, 1.0, geo.y) : saturate(0.35 + geo.y);
     float wet = saturate(f.Wetness) * open * facing * (surfaceClass == 3u ? 0.5 : 1.0) * (1.0 - snow);
+    wet = max(wet, hullWet);
     if (wet > 0.0)
     {
         float rough = s.Data.r, metal = s.Data.g;
@@ -632,6 +838,39 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
         float film2 = film * film;
         film = sqrt(sqrt(saturate(film2 * film2 + min(2.0 * normalVariance, 0.18))));
         s.Data.r = lerp(rough, min(rough, film), wet);
+
+        // A hull the sea has wetted: its colour deeper as well as darker (the water filling the wood's pores takes the
+        // grey of its dry surface off: darkened alone it reads as painted darker), and under the water still running
+        // off it a film, glossy and smooth over the planks' grain (filtered as above, so it does not sparkle from afar)
+        if (hullWet > 0.0)
+        {
+            float lum = dot(s.Albedo.rgb, float3(0.3, 0.59, 0.11));
+            s.Albedo.rgb = max(lerp(lum.xxx, s.Albedo.rgb, 1.0 + 0.2 * hullWet * porosity), 0.0);
+            if (hull.y > 0.0)
+            {
+                float sheen = sqrt(sqrt(saturate(0.07 * 0.07 * 0.07 * 0.07 + min(2.0 * normalVariance, 0.18))));
+                s.Data.r = lerp(s.Data.r, min(s.Data.r, sheen), hull.y);
+                s.Normal.xyz = normalize(lerp(s.Normal.xyz, geo, 0.6 * hull.y));
+                s.Albedo.rgb *= lerp(1.0, 0.88, hull.y * porosity);
+            }
+            // Its drops catch the light: a bead holds every normal round the hull's, so the one halfway between the
+            // light and the eye shines (as the snow's crystals do, SnowSurfaceNormal). A drop smaller than a pixel would
+            // flicker from pixel to pixel as the ship moves: they fade out from a centimetre a pixel
+            float drop = hull.z * (1.0 - smoothstep(0.4, 1.0, footprint / HULL_DROP_CELL));
+            if (drop > 0.0)
+            {
+                float3 toLight = float3(0, 1, 0);
+                if (AtmosphereIdx != 0)
+                {
+                    AtmosphereParams A = LoadAtmosphere();
+                    toLight = A.SunDirection.y > 0.0 ? A.SunDirection : A.MoonDirection;
+                }
+                float3 H = normalize(toLight - normalize(rel));
+                drop *= smoothstep(0.05, 0.3, dot(H, geo));
+                s.Normal.xyz = normalize(lerp(s.Normal.xyz, H, drop));
+                s.Data.r = lerp(s.Data.r, hull.w, drop);
+            }
+        }
 
         // Water standing in the low spots of soaked flat ground, the joints first, rising as the rain's puddles fill:
         // flat (the surface's own normal, not the stones'), a mirror. Where a pixel spans more than the joints the
@@ -670,7 +909,7 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
             AtmosphereParams A = LoadAtmosphere();
             toLight = A.SunDirection.y > 0.0 ? A.SunDirection : A.MoonDirection;
         }
-        float3 snowN = SnowSurfaceNormal(world, geo, footprint, toLight, -normalize(rel), glint);
+        float3 snowN = SnowSurfaceNormal(space, world, geo, footprint, toLight, -normalize(rel), glint);
         s.Normal.xyz = normalize(lerp(N, snowN, buried));
         s.Data.r = lerp(s.Data.r, 0.15, glint * buried * (1.0 - pressed));
         s.Displacement *= 1.0 - buried;
@@ -734,7 +973,7 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
     }
     GroupMemoryBarrierWithGroupSync();
 
-    if (g_TileAny == 0u && f.WeatherOn == 0u)
+    if (g_TileAny == 0u && f.WeatherOn == 0u && HullCount == 0u)
         return;
     int2 px = int2(gid.xy * DECAL_TILE + gtid.xy);
     bool onScreen = all(float2(px) < ViewportSize);
@@ -761,7 +1000,8 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
         geo = -geo;
 
     Texture2D<uint> ids = ResourceDescriptorHeap[EntityIdTexIdx];
-    uint surfaceClass = ids.Load(int3(px, 0)) >> 30;
+    uint entityId = ids.Load(int3(px, 0));
+    uint surfaceClass = entityId >> 30;
 
     RWTexture2D<float4> albedoUav = ResourceDescriptorHeap[AlbedoUAVIdx];
     RWTexture2D<float4> dataUav = ResourceDescriptorHeap[DataUAVIdx];
@@ -779,8 +1019,14 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
     s.PrintTilt = 0.0;
     Surface before = s;
 
+    // A mesh that follows a frame (a ship, a cart): the weather's pattern on it and its cover ride with it. Its transform
+    // slot from EntityId (part in bits 0-7, slot in 8-29), looked up only while there is weather
+    WeatherSpace space = WorldWeatherSpace();
+    if (surfaceClass == 0u && f.WeatherOn != 0u && WeatherFramesIdx != 0)
+        space = WeatherSpaceOf((entityId & 0x3FFFFFFFu) >> 8);
+
     // The weather reaches puddles and surfaces alike: a puddle under a stall's roof stays dry, no rings under an eave
-    float open = f.WeatherOn != 0u ? SurfaceOpenness(f, rel, geo, surfaceClass, s.Data.a) : 1.0;
+    float open = f.WeatherOn != 0u ? SurfaceOpenness(f, rel, geo, surfaceClass, s.Data.a, space) : 1.0;
     if (g_TileAny != 0u)
     {
         for (uint w2 = 0; w2 < words; w2++)
@@ -795,8 +1041,10 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
             }
         }
     }
+    // A ship's hull wet where the water has reached up its side (meshes only: the hulls are)
+    float4 hull = HullCount > 0u && surfaceClass == 0u ? HullWetness(rel + CamPos) : 0.0;
     // (also where footprints lie in dry weather: what they do there is the ground's to say)
-    if (f.WeatherOn != 0u || s.Print > 0.0)
+    if (f.WeatherOn != 0u || s.Print > 0.0 || hull.x > 0.0)
     {
         // (vegetation: its own dome normal, gbuffer_foliage.fx / gbuffer_crossmesh.fx: the depth's normal of a far tree's
         // vertical cards pointed sideways, and the snow stopped a few hundred metres out, far trees stood green)
@@ -816,7 +1064,7 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
             // points down. The G-buffer's normal cannot say so: two-sided cards, and the dome normal faces up on both
             open *= smoothstep(-0.5, -0.15, geo.y);
         }
-        ApplyWeather(f, rel, largeN, surfaceClass, open, NormalVariance(gtid.xy, before.Normal.xyz), s);
+        ApplyWeather(f, rel, largeN, surfaceClass, open, NormalVariance(gtid.xy, before.Normal.xyz), hull, space, s);
     }
 
     if (any(s.Albedo != before.Albedo))

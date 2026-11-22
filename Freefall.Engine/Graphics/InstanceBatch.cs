@@ -1472,7 +1472,8 @@ namespace Freefall.Graphics
         /// <param name="receiversUav">The receiver tiles to test casters against (ShadowReceivers; 0 = none); null = the sun's this frame.</param>
         /// <param name="casterStats">Counts each batch's casters into its row of these receivers (EngineSettings.ShadowCasterStats; the sun's only).</param>
         /// <param name="skipBits">Instances whose staged subbatch ID has any of these bits are in none of the views: the sky
-        /// captures and the shelter map pass DrawBucket.NoSkyCaptureBit (what moves); 0 = none left out (the sun).</param>
+        /// captures and the shelter map pass DrawBucket.NoSkyCaptureBit (what moves); 0 = none left out (the sun). With
+        /// DrawBucket.ShadowOnlyBits added, only the instances that have the other bits are in (a ship's own cover map).</param>
         public static void CullShadowAll(ID3D12GraphicsCommandList list, IReadOnlyList<InstanceBatch> batches,
             uint cascadeBufferSrv, ulong cascadeBufferGpuAddress, uint shadowHiZSrv, GPUCuller? culler, int cascadeCount,
             float minCasterClip = 0f, uint? receiversUav = null, ShadowReceivers? casterStats = null, uint skipBits = 0)

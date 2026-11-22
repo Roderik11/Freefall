@@ -149,8 +149,20 @@ namespace Freefall.Graphics
         /// Bit 29 of a staged subbatch ID: the instance is left out of the sky captures and the shelter map, which are drawn
         /// once and kept while the camera stays in a cell: something that moves would leave its darkness, or its shelter
         /// from the rain, where it was (cull_instances.hlsl NO_SKY_CAPTURE_BIT, InstanceBatch.CullShadowAll skipBits).
+        /// Under a WeatherFrame what moves has a cover map of its own, drawn from these alone (<see cref="ShadowOnlyBits"/>).
         /// </summary>
         public const uint NoSkyCaptureBit = 0x20000000u;
+        /// <summary>
+        /// In a cull's skipBits (<see cref="InstanceBatch.CullShadowAll"/>): keep only the instances that have one of the other
+        /// bits instead of leaving them out (cull_instances.hlsl SHADOW_ONLY_BITS): a ship's own cover map draws only what
+        /// moves, <see cref="NoSkyCaptureBit"/> | this. Bit 0, a mesh part's, never a skip bit.
+        /// </summary>
+        public const uint ShadowOnlyBits = 0x1u;
+        /// <summary>
+        /// In a cull's skipBits: leave out what is drawn with bones too (cull_instances.hlsl SHADOW_NO_BONES): a sail's cloth
+        /// or roll, which a ship's own cover map, drawn once, must not keep in the shape it had then. Bit 1, a mesh part's.
+        /// </summary>
+        public const uint ShadowNoBones = 0x2u;
 
         public void Add(Mesh mesh, int partIndex, Material material, MaterialBlock block, int transformSlot, uint boneBufferIdx = 0, bool lodManaged = false, bool noPointShadow = false, bool noSkyCapture = false)
         {

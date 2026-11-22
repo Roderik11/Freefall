@@ -46,9 +46,31 @@ namespace Freefall.Graphics
         /// </summary>
         public readonly float[] Sea = new float[Stations];
 
+        /// <summary>
+        /// How high the water has wetted its sides at each station (m, in the hull's frame: 0 at its waterline), port's
+        /// stations first, then starboard's: game code keeps it, raised by the waves and spray it meets and drying down.
+        /// The decal pass shades its planking under it wet (decals_cs.hlsl HullWetness); under the water it is wet anyway.
+        /// </summary>
+        public readonly float[] Wet = new float[2 * Stations];
+
+        /// <summary>
+        /// How high the water has just been on its sides at each station (m, as <see cref="Wet"/>, port's first): what it
+        /// left there is still running off, a glossy film streaked with rivulets; game code keeps it, falling within
+        /// seconds. Under <see cref="Wet"/>'s line and over this one the hull is only damp.
+        /// </summary>
+        public readonly float[] Fresh = new float[2 * Stations];
+
+        /// <summary>
+        /// How far the water has run along the hull from bow to stern (m, wrapped): the way it has made along its own
+        /// length, summed as it is placed. The light the sea throws up onto it (light_directional_cs.hlsl HullWaterLight)
+        /// moves with the water, so it streams aft under way.
+        /// </summary>
+        public float Travel { get; private set; }
+
         internal Matrix4x4 WorldToLocal = Matrix4x4.Identity;
         internal Vector3 Centre;
         internal float Radius;
+        private bool _placed;
 
         /// <summary>Where the hull is now: its frame in the world. Main thread, before the water is drawn (a ship's system).</summary>
         public void Place(Matrix4x4 localToWorld)
@@ -56,7 +78,14 @@ namespace Freefall.Graphics
             if (!Matrix4x4.Invert(localToWorld, out var inverse)) return;
             WorldToLocal = inverse;
             var mid = new Vector3((X0 + X1) * 0.5f, (Bottom + Top) * 0.5f, 0f);
-            Centre = Vector3.Transform(mid, localToWorld);
+            var centre = Vector3.Transform(mid, localToWorld);
+            // The way made along its length since it was last placed; a jump (put somewhere else) is not sailed
+            var along = new Vector3(localToWorld.M11, localToWorld.M12, localToWorld.M13);
+            float moved = Vector3.DistanceSquared(centre, Centre);
+            if (_placed && moved < 20f * 20f && along.LengthSquared() > 1e-8f)
+                Travel = (Travel + Vector3.Dot(centre - Centre, Vector3.Normalize(along))) % 10000f;
+            _placed = true;
+            Centre = centre;
             float half = MathF.Max(X1 - X0, Top - Bottom) * 0.5f;
             float wide = 0f;
             foreach (var b in Breadth) wide = MathF.Max(wide, b);
@@ -182,8 +211,9 @@ namespace Freefall.Graphics
         private static readonly object _lock = new();
         private static readonly GraphicsBuffer?[] _buffers = new GraphicsBuffer?[FrameCount];
         private static readonly GraphicsBuffer?[] _seaBuffers = new GraphicsBuffer?[FrameCount];
+        private static readonly GraphicsBuffer?[] _wetBuffers = new GraphicsBuffer?[FrameCount];
         private static int _uploadedTick = -1;
-        private static uint _srv, _count, _seaSrv;
+        private static uint _srv, _count, _seaSrv, _wetSrv;
         private static readonly List<(float Distance, WaterHull Hull)> _nearest = new();
 
         /// <summary>Where the camera was when the water was last drawn: the hulls nearest it are uploaded.</summary>
@@ -259,7 +289,8 @@ namespace Freefall.Graphics
 
         /// <summary>
         /// Where the sea stands along each hull of <see cref="Srv"/>, in the same order (StructuredBuffer&lt;float&gt;,
-        /// <see cref="WaterHull.Stations"/> a hull: <see cref="WaterHull.Sea"/>), 0 when there are no hulls.
+        /// <see cref="WaterHull.Stations"/> a hull: <see cref="WaterHull.Sea"/>), then each one's
+        /// <see cref="WaterHull.Travel"/> (at <see cref="Count"/> × Stations + its index); 0 when there are no hulls.
         /// </summary>
         public static uint SeaSrv
         {
@@ -267,6 +298,20 @@ namespace Freefall.Graphics
             {
                 Upload();
                 return _seaSrv;
+            }
+        }
+
+        /// <summary>
+        /// How high the water has wetted each hull of <see cref="Srv"/>, in the same order (StructuredBuffer&lt;float&gt;,
+        /// 4 × <see cref="WaterHull.Stations"/> a hull: <see cref="WaterHull.Wet"/>, then <see cref="WaterHull.Fresh"/>),
+        /// 0 when there are no hulls.
+        /// </summary>
+        public static uint WetSrv
+        {
+            get
+            {
+                Upload();
+                return _wetSrv;
             }
         }
 
@@ -278,6 +323,7 @@ namespace Freefall.Graphics
             _srv = 0;
             _count = 0;
             _seaSrv = 0;
+            _wetSrv = 0;
             var all = _all;
             if (all.Length == 0 || Engine.Device == null) return;
 
@@ -295,8 +341,10 @@ namespace Freefall.Graphics
             int slot = Engine.FrameIndex % FrameCount;   // a buffer per frame in flight, as the ocean's own data
             var buffer = _buffers[slot] ??= GraphicsBuffer.CreateUpload<Gpu>(MaxDrawn, mapped: true);
             var write = buffer.WritePtr<Gpu>();
-            var seaBuffer = _seaBuffers[slot] ??= GraphicsBuffer.CreateUpload<float>(MaxDrawn * WaterHull.Stations, mapped: true);
+            var seaBuffer = _seaBuffers[slot] ??= GraphicsBuffer.CreateUpload<float>(MaxDrawn * (WaterHull.Stations + 1), mapped: true);
             var sea = seaBuffer.WritePtr<float>();
+            var wetBuffer = _wetBuffers[slot] ??= GraphicsBuffer.CreateUpload<float>(MaxDrawn * 4 * WaterHull.Stations, mapped: true);
+            var wet = wetBuffer.WritePtr<float>();
             for (int i = 0; i < n; i++)
             {
                 var hull = _nearest[i].Hull;
@@ -315,10 +363,17 @@ namespace Freefall.Graphics
                     for (int k = 0; k < hull.Breadth.Length; k++) b[k] = hull.Breadth[k];
                 for (int k = 0; k < WaterHull.Stations; k++)
                     sea[i * WaterHull.Stations + k] = hull.Sea[k];
+                sea[n * WaterHull.Stations + i] = hull.Travel;
+                for (int k = 0; k < 2 * WaterHull.Stations; k++)
+                {
+                    wet[i * 4 * WaterHull.Stations + k] = hull.Wet[k];
+                    wet[i * 4 * WaterHull.Stations + 2 * WaterHull.Stations + k] = hull.Fresh[k];
+                }
             }
             _srv = buffer.SrvIndex;
             _count = (uint)n;
             _seaSrv = seaBuffer.SrvIndex;
+            _wetSrv = wetBuffer.SrvIndex;
         }
     }
 }

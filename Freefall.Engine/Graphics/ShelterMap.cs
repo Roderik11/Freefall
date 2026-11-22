@@ -148,6 +148,7 @@ namespace Freefall.Graphics
             heights = float.IsNaN(_minY) ? null : new[] { _minY, _maxY },
             pending = _pending,
             levelsDrawn = _levelsDrawn,
+            frameCoversDrawn = _framesDrawn,
         };
 
         private static void EnsureResources()
@@ -181,6 +182,14 @@ namespace Freefall.Graphics
             var all = CommandBuffer.GetAllBatches(RenderPass.Opaque);
             if (culler == null || all == null)
                 return false;
+
+            // A WeatherFrame's own cover first, and then no level this frame: the reduce's square and heights are its
+            // constant buffer's, one per frame, so a second reduce in the frame would read the last one's
+            if (RenderFrameCover(list, all, culler))
+            {
+                _renderedTick = Engine.TickCount;
+                return true;
+            }
 
             var eye = EyeFor(camera);
             var terrain = Atmosphere.TerrainCover;
@@ -247,11 +256,11 @@ namespace Freefall.Graphics
                 ResourceStates.UnorderedAccess);
             _mapReadable[level] = false;
 
-            Draw(list, _solid, cullBuffer, culler);
-            Reduce(list, map, merge: false, left, bottom + size, size, terrain);
+            Draw(list, _solid, cullBuffer, culler, DrawResolution, DrawBucket.NoSkyCaptureBit);
+            Reduce(list, map, merge: false, left, bottom + size, size, _minY, _maxY, Resolution, terrain);
             list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(map.Native)));
-            Draw(list, _vegetation, cullBuffer, culler);
-            Reduce(list, map, merge: true, left, bottom + size, size, terrain);
+            Draw(list, _vegetation, cullBuffer, culler, DrawResolution, DrawBucket.NoSkyCaptureBit);
+            Reduce(list, map, merge: true, left, bottom + size, size, _minY, _maxY, Resolution, terrain);
 
             // Read by the decal pass (compute)
             list.ResourceBarrierTransition(map.Native, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
@@ -264,6 +273,74 @@ namespace Freefall.Graphics
             }
             PixMarker.End(list);
             _levelsDrawn++;
+            return true;
+        }
+
+        /// <summary>A WeatherFrame's own cover map: texels a side (25 cm on a 60 m ship), drawn at twice that.</summary>
+        public const int FrameResolution = 256;
+        private const float FramePad = 1f;              // m round the frame's meshes
+        private static readonly GraphicsBuffer?[] _frameCullBuffers = new GraphicsBuffer?[FrameCount];
+        private static readonly List<InstanceBatch> _frameSolid = new();
+        private static int _framesDrawn;
+
+        // The next WeatherFrame's own cover (WeatherFrames.NextCover), at most one a frame: its meshes straight down its
+        // own up, in its own frame (rigid: the space the decal pass reads it in), from the meshes out of the sky captures
+        // alone, so neither the quay it lay at nor anything else over it is in it (the world's levels hold those, where they
+        // stand). The solid meshes only (a ship has no foliage), and nothing drawn with bones: the sails, set or furled, would
+        // stay in the shape they had as it was drawn (a set sail kept the snow off nearly all of a cog's deck)
+        private static bool RenderFrameCover(ID3D12GraphicsCommandList list, IReadOnlyList<InstanceBatch> all, GPUCuller culler)
+        {
+            var root = WeatherFrames.NextCover();
+            if (root == null) return false;
+            if (!WeatherFrames.Placement(root, out var rigid, out var min, out var max) || !Matrix4x4.Invert(rigid, out var toFrame))
+            {
+                WeatherFrames.CoverSkipped(root);
+                return false;
+            }
+            EnsureResources();
+
+            float size = MathF.Max(max.X - min.X, max.Z - min.Z) + 2f * FramePad;
+            float left = (min.X + max.X - size) * 0.5f, bottom = (min.Z + max.Z - size) * 0.5f;
+            float minY = min.Y - FramePad, maxY = max.Y + FramePad;
+            // World to the frame, then looking down its own up: the view's x its x, its y its z, its depth the height from
+            // the top down
+            var view = toFrame * Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, -Vector3.UnitY, Vector3.UnitZ);
+            var vp = view * Matrix4x4.CreateOrthographicOffCenterLeftHanded(left, left + size, bottom, bottom + size, -maxY, -minY);
+
+            _frameSolid.Clear();
+            foreach (var batch in all)
+            {
+                if (!batch.Material.HasPass(RenderPass.Shadow)) continue;
+                string? effect = batch.Key.Effect?.Name;
+                if (effect == "gbuffer_skinned" || effect == "gbuffer_foliage" || effect == "gbuffer_crossmesh") continue;
+                _frameSolid.Add(batch);
+            }
+
+            int slot = Engine.FrameIndex % FrameCount;
+            var cullBuffer = _frameCullBuffers[slot] ??= GraphicsBuffer.CreateUpload<GPUCuller.CascadeData>(1, mapped: true);
+            unsafe
+            {
+                var data = new GPUCuller.CascadeData();
+                data.SetPlanes(new Frustum(vp).GetPlanesAsVector4());
+                data.VP = vp;
+                data.PrevVP = vp;
+                *cullBuffer.WritePtr<GPUCuller.CascadeData>() = data;
+            }
+
+            using var _ = _marker.Auto();
+            PixMarker.Begin(list, "Frame cover map");
+            var map = root.Map ??= new RenderTexture2D(Engine.Device, FrameResolution, FrameResolution, Format.R32_UInt, false, true);
+            list.ResourceBarrierTransition(map.Native, root.MapReadable ? ResourceStates.NonPixelShaderResource : ResourceStates.Common,
+                ResourceStates.UnorderedAccess);
+            root.MapReadable = false;
+            Draw(list, _frameSolid, cullBuffer, culler, 2 * FrameResolution,
+                DrawBucket.NoSkyCaptureBit | DrawBucket.ShadowOnlyBits | DrawBucket.ShadowNoBones);
+            Reduce(list, map, merge: false, left, bottom + size, size, minY, maxY, FrameResolution, default);
+            list.ResourceBarrierTransition(map.Native, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            root.MapReadable = true;
+            WeatherFrames.CoverDrawn(root, left, bottom + size, size, minY, maxY);
+            PixMarker.End(list);
+            _framesDrawn++;
             return true;
         }
 
@@ -307,20 +384,22 @@ namespace Freefall.Graphics
             _copyMaxY = _maxY;
         }
 
-        private static void Draw(ID3D12GraphicsCommandList list, List<InstanceBatch> batches, GraphicsBuffer cullBuffer, GPUCuller culler)
+        // The batches drawn straight down into the depth's first `resolution`² texels. skipBits: the world's levels leave out
+        // what moves (MeshRenderer.InSkyCaptures off, as the sky captures: its shelter from the rain would stay where it
+        // was drawn); a WeatherFrame's own map draws only that (DrawBucket.ShadowOnlyBits), not the quay it lay at
+        private static void Draw(ID3D12GraphicsCommandList list, List<InstanceBatch> batches, GraphicsBuffer cullBuffer, GPUCuller culler,
+            int resolution, uint skipBits)
         {
             var dsv = _depth!.SliceDsvHandles[0];
-            list.RSSetViewport(new Viewport(0, 0, DrawResolution, DrawResolution));
-            list.RSSetScissorRect(new RectI(0, 0, DrawResolution, DrawResolution));
+            list.RSSetViewport(new Viewport(0, 0, resolution, resolution));
+            list.RSSetScissorRect(new RectI(0, 0, resolution, resolution));
             list.ClearDepthStencilView(dsv, ClearFlags.Depth, 1.0f, 0);
             if (batches.Count > 0)
             {
                 PixMarker.Begin(list, "Culling");
-                // What moves (MeshRenderer.InSkyCaptures off: a ship) is left out, as from the sky captures: its shelter
-                // from the rain would stay where it was drawn
                 InstanceBatch.CullShadowAll(list, batches, cullBuffer.SrvIndex, cullBuffer.Native.GPUVirtualAddress,
-                    shadowHiZSrv: 0, culler, cascadeCount: 1, minCasterClip: -MinCasterTexels * 2f / DrawResolution, receiversUav: 0,
-                    skipBits: DrawBucket.NoSkyCaptureBit);
+                    shadowHiZSrv: 0, culler, cascadeCount: 1, minCasterClip: -MinCasterTexels * 2f / resolution, receiversUav: 0,
+                    skipBits: skipBits);
                 PixMarker.End(list);
 
                 // A single-slice DSV: the vertex shader routes the view to array index 0
@@ -346,7 +425,7 @@ namespace Freefall.Graphics
         }
 
         private static void Reduce(ID3D12GraphicsCommandList list, RenderTexture2D map, bool merge, float left, float top, float size,
-            (uint Pages, float MaxHeight, Vector3 Origin, Vector2 Size) terrain)
+            float minY, float maxY, int resolution, (uint Pages, float MaxHeight, Vector3 Origin, Vector2 Size) terrain)
         {
             var cs = _reduce!;
             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
@@ -354,7 +433,7 @@ namespace Freefall.Graphics
             cs.SetPushConstant("Depth", _depth!.BindlessIndex);
             cs.SetPushConstant("OutputUAV", map.UavIndex);
             cs.SetPushConstant("Merge", merge ? 1u : 0u);
-            cs.SetPushConstant("Resolution", (uint)Resolution);
+            cs.SetPushConstant("Resolution", (uint)resolution);
             cs.SetPushConstant("TerrainPages", terrain.Pages);
             cs.SetParam("TerrainMaxHeight", terrain.MaxHeight);
             cs.SetParam("TerrainOriginX", terrain.Origin.X);
@@ -365,11 +444,11 @@ namespace Freefall.Graphics
             cs.SetParam("Left", left);
             cs.SetParam("Top", top);
             cs.SetParam("Size", size);
-            cs.SetParam("MinY", _minY);
-            cs.SetParam("MaxY", _maxY);
+            cs.SetParam("MinY", minY);
+            cs.SetParam("MaxY", maxY);
             cs.SetParam("MinAboveGround", MinAboveGround);
             cs.SetParam("CrownLeak", CrownLeak);
-            cs.Dispatch(_kReduce, list, (uint)(Resolution + 7) / 8, (uint)(Resolution + 7) / 8);
+            cs.Dispatch(_kReduce, list, (uint)(resolution + 7) / 8, (uint)(resolution + 7) / 8);
             list.ResourceBarrierTransition(_depth.Native, ResourceStates.NonPixelShaderResource, ResourceStates.DepthWrite);
         }
     }
