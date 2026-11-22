@@ -193,6 +193,18 @@ namespace Freefall.Components
         [ValueRange(0f, 1f)]
         public float FollowEmitter = 0f;
 
+        [Description("Share of the emitter's own velocity its particles are born with, after which drag, gravity and the wind have them: the smoke a ship's gun or a galloping torch throws starts with them and falls behind as the air slows it. FollowEmitter already carries its share, so this adds only to the rest (1 − FollowEmitter). The velocity is measured from the emitter's movement, or told (Velocity) by what moves it")]
+        [ValueRange(0f, 1f)]
+        public float InheritVelocity = 0f;
+
+        /// <summary>
+        /// The emitter's velocity (world, m/s) as whatever moves it knows it, used for <see cref="InheritVelocity"/> in
+        /// place of the one measured from its movement: a copy made this frame that bursts at once has moved nowhere yet
+        /// (a ship gun's muzzle look). Null: measured.
+        /// </summary>
+        [Freefall.Reflection.DontSerialize, System.ComponentModel.Browsable(false)]
+        public Vector3? Velocity;
+
         // ── Collision ──
 
         [Category("Collision")]

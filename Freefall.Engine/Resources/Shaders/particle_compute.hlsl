@@ -561,7 +561,8 @@ void spawn(ParticleEmitter e, uint seed, uint ringPos, out ParticleCore p, out P
 
     p.Position = e.Position + local_to_world(e, localPos);
     p.Age = 0.0;
-    p.Velocity = local_to_world(e, localDir) * speed;
+    // Its own way and speed, and what it is given of the emitter's motion (InheritVelocity): then the drag takes it
+    p.Velocity = local_to_world(e, localDir) * speed + e.Inherit;
     p.Lifetime = max(0.01, e.Lifetime * rand_range(1.0 - e.LifetimeRandomness, 1.0 + e.LifetimeRandomness, seed + 3u));
 
     // One random scale factor for start and end size so the size curve keeps its shape

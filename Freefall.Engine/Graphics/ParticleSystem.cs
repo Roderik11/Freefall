@@ -79,6 +79,7 @@ namespace Freefall.Graphics
             public Vector3 LeanWind;       public float PivotY;
             public float ForwardScatter;   public float MultipleScattering; public float PyroFire;          public float PyroTemperature;
             public uint MotionTextureIdx;  public float MotionStrength;     public uint Jets;               public float JetSpreadCos;
+            public Vector3 Inherit;        public float InheritPad;
         }
 
         /// <summary>Everything the system keeps per emitter. The component itself only holds authored data.</summary>
@@ -216,8 +217,8 @@ namespace Freefall.Graphics
 
         protected internal override void Initialize()
         {
-            if (Unsafe.SizeOf<EmitterRow>() != 384)
-                throw new InvalidOperationException("EmitterRow must match struct ParticleEmitter in particle_common.hlsli (384 bytes)");
+            if (Unsafe.SizeOf<EmitterRow>() != 400)
+                throw new InvalidOperationException("EmitterRow must match struct ParticleEmitter in particle_common.hlsli (400 bytes)");
 
             ComponentCache<ParticleEmitter>.Added += OnAdded;
             ComponentCache<ParticleEmitter>.Removed += OnRemoved;
@@ -503,6 +504,11 @@ namespace Freefall.Graphics
             entry.RowSerial = _gatherSerial;
             float speed = MathF.Abs(entry.Velocity.X) + MathF.Abs(entry.Velocity.Y) + MathF.Abs(entry.Velocity.Z);
 
+            // What the particles born now get of the emitter's own velocity (InheritVelocity): the told one, else the
+            // measured; only the share FollowEmitter does not already carry them by
+            float inheritShare = Math.Clamp(e.InheritVelocity, 0f, 1f) * (1f - follow);
+            var inherit = inheritShare > 0f ? (e.Velocity ?? entry.Velocity) * inheritShare : Vector3.Zero;
+
             // The wind a sprite leans in. One carried along leans back from the way it goes, but not at
             // once and not rigidly: the lean is a damped spring, a little late when the carrier sets off
             // and swinging past when it stops or turns, and it gives way less and less the faster the
@@ -532,7 +538,8 @@ namespace Freefall.Graphics
             float drift = drag > 0f ? (MathF.Abs(wind.X) + MathF.Abs(wind.Y) + MathF.Abs(wind.Z)) : 0f;
             // Turbulence pushes one way for a while at most: drag caps the speed it builds up
             drift += drag > 0f ? MathF.Min(turbulence / drag, 0.5f * turbulence * life) : 0.5f * turbulence * life;
-            float topSpeed = MathF.Max(MathF.Abs(speedMin), MathF.Abs(speedMax));
+            float topSpeed = MathF.Max(MathF.Abs(speedMin), MathF.Abs(speedMax))
+                           + MathF.Abs(inherit.X) + MathF.Abs(inherit.Y) + MathF.Abs(inherit.Z);
             float shape = e.Shape switch
             {
                 EmissionShape.Point => 0f,
@@ -637,6 +644,7 @@ namespace Freefall.Graphics
                 MultipleScattering = Math.Clamp(e.MultipleScattering, 0f, 1f),
                 PyroFire = MathF.Max(0f, e.PyroFire),
                 PyroTemperature = Math.Clamp(e.PyroTemperature, 1000f, 15000f),
+                Inherit = inherit,
             };
 
             if (capacity > 0)

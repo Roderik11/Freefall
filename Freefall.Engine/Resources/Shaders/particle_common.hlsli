@@ -26,7 +26,7 @@ struct ParticleVisual      // 16 bytes — per-particle variation, everything el
 
 // One row per emitter, rewritten by the CPU every frame (ParticleSystem.EmitterRow in C#).
 // Laid out in 16-byte rows so no vector straddles a boundary and the C# struct maps 1:1.
-struct ParticleEmitter     // 384 bytes
+struct ParticleEmitter     // 400 bytes
 {
     float3 Position;       float  ParticleRadius;      // largest half-extent of one particle quad
     float3 EmitDirection;  float  SpreadCos;           // emitter-local, normalized / cos(spread half-angle)
@@ -53,6 +53,7 @@ struct ParticleEmitter     // 384 bytes
     float3 LeanWind;       float  PivotY;              // the wind a sprite leans in: Wind less the emitter's own motion it follows / quad offset in its sizes
     float  ForwardScatter; float  MultipleScattering;  float PyroFire;           float PyroTemperature; // lit: Henyey-Greenstein g of the light (ParticleLight) / its even share (ParticlePhase) / pyro: the fire's nits and kelvin at its brightest
     uint   MotionTextureIdx; float MotionStrength;     uint  Jets;               float JetSpreadCos; // the flipbook's motion atlas (0 = none) / its full-scale motion in shares of a frame / a burst in jets: their count (bits 0-15, 0 = none) and slowest share x 255 (bits 16-23) / cos of the spread round a jet
+    float3 Inherit;        float  InheritPad;          // world m/s a particle born now starts with on top of its own (InheritVelocity × the emitter's velocity)
 };
 
 // ParticleEmitter.RenderMode
