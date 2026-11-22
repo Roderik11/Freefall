@@ -4,9 +4,15 @@
 //   CSSimulate  one group per pool chunk: respawn / integrate / collide every particle, then append
 //               the live ones of visible emitters to the draw list of their render mode
 // There is no dead list: each emitter's slots form a ring and the CPU says which slots respawn.
+//
+// Mesh emitters (PARTICLE_MODE_MESH) run the same two a phase earlier (Phase 1), at the head of the opaque pass, over their
+// own chunks only: they are drawn into the G-buffer and the sun's cascades, which come before the transparent pass. Their
+// particles go to a list per emitter (MeshList) with arguments per emitter row (MeshArgs); CSMeshShadow, in the shadow pass,
+// lists each live one once per cascade it falls in.
 
 #pragma kernel CSCull
 #pragma kernel CSSimulate
+#pragma kernel CSMeshShadow
 
 #include "particle_common.hlsli"
 #include "ocean_surf.hlsli"
@@ -67,6 +73,22 @@ cbuffer PushConstants : register(b3)
     uint NormalTexIdx;           // 12  world-space normal GBuffer (0 = none)
     float SimTime;               // 13  seconds, moves the turbulence field
     uint OceanDataIdx;           // 14  StructuredBuffer<OceanData>, the ocean drawn this frame (shape Surf), 0 = none
+    uint Phase;                  // 15  0 = the sprite emitters (transparent pass), 1 = the mesh emitters (opaque pass)
+    uint MeshArgsUAVIdx;         // 16  RWStructuredBuffer<uint>, PARTICLE_MESH_ARGS per emitter row (mesh emitters')
+    uint MeshListUAVIdx;         // 17  RWStructuredBuffer<uint>: the camera's mesh lists (Phase 1) / the cascades' (CSMeshShadow)
+    uint ChunkOffset;            // 18  the chunk the dispatch's first group takes
+    uint CascadesIdx;            // 19  StructuredBuffer<ParticleCascade>: the sun's cascades this frame (CSMeshShadow)
+    uint CascadeCount;           // 20
+    uint ParticleCoreIdx;        // 21  StructuredBuffer<ParticleCore>: the pool as the opaque pass left it (CSMeshShadow)
+};
+
+// common.fx CascadeData (GPUCuller.CascadeData, 240 bytes): only the planes are read
+struct ParticleCascade
+{
+    float4 Planes[6];
+    row_major float4x4 VP;
+    row_major float4x4 PrevVP;
+    float4 SplitDistances;
 };
 
 #define COLL_NONE    0
@@ -637,9 +659,10 @@ bool UnderCover(float3 p)
 
 // ────────────── Simulation ──────────────
 
-// Integrate one live particle. Returns false when it died this step.
-bool integrate(ParticleEmitter e, inout ParticleCore p)
+// Integrate one live particle. Returns false when it died this step. bounced: it bounced off what it met this step
+bool integrate(ParticleEmitter e, inout ParticleCore p, out bool bounced)
 {
+    bounced = false;
     p.Age += DeltaTime;
     if (p.Age >= p.Lifetime) return false;
 
@@ -736,6 +759,7 @@ bool integrate(ParticleEmitter e, inout ParticleCore p)
         float vn = dot(p.Velocity, hitNormal);
         if (vn < 0.0)
             p.Velocity = (p.Velocity - hitNormal * vn * 2.0) * e.Bounciness;
+        bounced = true;
     }
 
     p.Position = newPos;
@@ -751,7 +775,7 @@ void CSCull(uint3 dtid : SV_DispatchThreadID)
     uint idx = dtid.x;
 
     // First thread starts this view's draw lists: DrawInstanced(6 verts per quad, 0 instances)
-    if (idx == 0)
+    if (idx == 0 && Phase == 0)
     {
         RWStructuredBuffer<uint> DrawArgs = ResourceDescriptorHeap[DrawArgsUAVIdx];
         for (uint mode = 0; mode < PARTICLE_MODE_COUNT; mode++)
@@ -768,6 +792,21 @@ void CSCull(uint3 dtid : SV_DispatchThreadID)
     StructuredBuffer<ParticleEmitter> Emitters = ResourceDescriptorHeap[EmittersIdx];
     ParticleEmitter e = Emitters[idx];
 
+    // A mesh emitter starts its own two lists, the camera's and the cascades': DrawInstanced(its parts' indices, 0 instances)
+    if (Phase == 1 && e.RenderMode == PARTICLE_MODE_MESH)
+    {
+        RWStructuredBuffer<uint> MeshArgs = ResourceDescriptorHeap[MeshArgsUAVIdx];
+        uint at = idx * PARTICLE_MESH_ARGS;
+        [unroll]
+        for (uint k = 0; k < PARTICLE_MESH_ARGS; k += 4)
+        {
+            MeshArgs[at + k + 0] = e.MeshVertices;
+            MeshArgs[at + k + 1] = 0;
+            MeshArgs[at + k + 2] = 0;
+            MeshArgs[at + k + 3] = 0;
+        }
+    }
+
     bool visible = IsVisible(e.BoundsCenter, e.BoundsRadius)
         && !IsOccluded(e.BoundsCenter, e.BoundsRadius);
 
@@ -779,16 +818,21 @@ void CSCull(uint3 dtid : SV_DispatchThreadID)
 // Dispatch: one group per pool chunk, up to the highest chunk in use.
 
 [numthreads(PARTICLE_CHUNK_SIZE, 1, 1)]
-void CSSimulate(uint3 gid : SV_GroupID, uint3 dtid : SV_DispatchThreadID)
+void CSSimulate(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 {
     StructuredBuffer<uint> ChunkMap = ResourceDescriptorHeap[ChunkMapIdx];
-    uint emitterIdx = ChunkMap[gid.x];
+    uint chunk = gid.x + ChunkOffset;
+    uint emitterIdx = ChunkMap[chunk];
     if (emitterIdx >= EmitterCount) return; // free chunk
 
     StructuredBuffer<ParticleEmitter> Emitters = ResourceDescriptorHeap[EmittersIdx];
     ParticleEmitter e = Emitters[emitterIdx];
 
-    uint slot = dtid.x;
+    // Mesh emitters' chunks in their own phase (the opaque pass), the sprites' in theirs
+    bool mesh = e.RenderMode == PARTICLE_MODE_MESH;
+    if (mesh != (Phase == 1)) return;
+
+    uint slot = chunk * PARTICLE_CHUNK_SIZE + gtid.x;
     uint local = slot - e.FirstSlot;
     if (local >= e.Capacity) return;
 
@@ -831,9 +875,21 @@ void CSSimulate(uint3 gid : SV_GroupID, uint3 dtid : SV_DispatchThreadID)
         }
         else if (alive)
         {
-            alive = integrate(e, p);
+            bool bounced;
+            alive = integrate(e, p, bounced);
             if (!alive) p.Age = p.Lifetime;
             Particles[slot] = p;
+
+            // A mesh that bounces keeps Bounciness of its tumble, its angle where it is (Rotation + RotationSpeed x Age):
+            // a piece come down on the ground stops turning within a few bounces instead of spinning where it lies
+            if (bounced && alive && mesh)
+            {
+                RWStructuredBuffer<ParticleVisual> Visuals = ResourceDescriptorHeap[ParticleVisualUAVIdx];
+                ParticleVisual v = Visuals[slot];
+                v.Rotation += v.RotationSpeed * (1.0 - e.Bounciness) * p.Age;
+                v.RotationSpeed *= e.Bounciness;
+                Visuals[slot] = v;
+            }
         }
     }
 
@@ -842,10 +898,63 @@ void CSSimulate(uint3 gid : SV_GroupID, uint3 dtid : SV_DispatchThreadID)
     RWStructuredBuffer<uint> Visibility = ResourceDescriptorHeap[VisibilityUAVIdx];
     if (Visibility[emitterIdx] == 0 || !IsVisible(p.Position, e.ParticleRadius)) return;
 
-    RWStructuredBuffer<uint> DrawArgs = ResourceDescriptorHeap[DrawArgsUAVIdx];
     uint index;
+    if (mesh)
+    {
+        // A mesh: on its emitter's own list, counted in its own arguments (one draw per emitter and part)
+        RWStructuredBuffer<uint> MeshArgs = ResourceDescriptorHeap[MeshArgsUAVIdx];
+        InterlockedAdd(MeshArgs[emitterIdx * PARTICLE_MESH_ARGS + 1], 1, index);
+        RWStructuredBuffer<uint> MeshList = ResourceDescriptorHeap[MeshListUAVIdx];
+        MeshList[e.MeshList + index] = slot;
+        return;
+    }
+
+    RWStructuredBuffer<uint> DrawArgs = ResourceDescriptorHeap[DrawArgsUAVIdx];
     InterlockedAdd(DrawArgs[e.RenderMode * 4 + 1], 1, index);
 
     RWStructuredBuffer<uint> DrawList = ResourceDescriptorHeap[DrawListUAVIdx];
     DrawList[e.RenderMode * PoolSlots + index] = slot;
+}
+
+// ────────────── CSMeshShadow ──────────────
+// In the sun's shadow pass: every live particle of a mesh emitter, once for each cascade its sphere falls in, on its
+// emitter's cascade list (gbuffer.fx VS_ParticlesShadow reads the entries: cascade << 29 | pool slot). Not only those the
+// camera sees: a piece flying over the eye shadows what it sees. Dispatch: one group per chunk over the mesh emitters'
+// chunks (ChunkOffset onward).
+
+[numthreads(PARTICLE_CHUNK_SIZE, 1, 1)]
+void CSMeshShadow(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    StructuredBuffer<uint> ChunkMap = ResourceDescriptorHeap[ChunkMapIdx];
+    uint chunk = gid.x + ChunkOffset;
+    uint emitterIdx = ChunkMap[chunk];
+    if (emitterIdx >= EmitterCount) return;
+
+    StructuredBuffer<ParticleEmitter> Emitters = ResourceDescriptorHeap[EmittersIdx];
+    ParticleEmitter e = Emitters[emitterIdx];
+    if (e.RenderMode != PARTICLE_MODE_MESH) return;
+
+    uint slot = chunk * PARTICLE_CHUNK_SIZE + gtid.x;
+    if (slot - e.FirstSlot >= e.Capacity) return;
+
+    StructuredBuffer<ParticleCore> Particles = ResourceDescriptorHeap[ParticleCoreIdx];
+    ParticleCore p = Particles[slot];
+    if (!(p.Age < p.Lifetime)) return;
+
+    StructuredBuffer<ParticleCascade> cascades = ResourceDescriptorHeap[CascadesIdx];
+    RWStructuredBuffer<uint> MeshArgs = ResourceDescriptorHeap[MeshArgsUAVIdx];
+    RWStructuredBuffer<uint> MeshList = ResourceDescriptorHeap[MeshListUAVIdx];
+    uint count = min(CascadeCount, PARTICLE_MESH_CASCADES);
+    for (uint c = 0; c < count; c++)
+    {
+        ParticleCascade cascade = cascades[c];
+        bool inside = true;
+        [unroll]
+        for (uint i = 0; i < 6; i++)
+            inside = inside && dot(cascade.Planes[i].xyz, p.Position) + cascade.Planes[i].w <= e.ParticleRadius;
+        if (!inside) continue;
+        uint index;
+        InterlockedAdd(MeshArgs[emitterIdx * PARTICLE_MESH_ARGS + 5], 1, index);
+        MeshList[e.MeshList * PARTICLE_MESH_CASCADES + index] = (c << 29) | slot;
+    }
 }

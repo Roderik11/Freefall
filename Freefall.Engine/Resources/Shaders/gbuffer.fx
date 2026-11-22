@@ -12,19 +12,19 @@ cbuffer PushConstants : register(b3)
     uint MeshRegistryIdx;           // 6: StructuredBuffer<MeshPartEntry>
     uint MaterialsIdx;              // 7: Index to materials buffer
     uint GlobalTransformBufferIdx;  // 8: Index to global TransformBuffer
-    // Slots 9-15: Reserved
-    uint _reserved9;
-    uint _reserved10;
-    uint _reserved11;
-    uint _reserved12;
-    uint _reserved13;
-    uint _reserved14;
-    uint _reserved15;
+    // Slots 9-15: the passes Particles and Shadow_Particles only (mesh particles, particle_mesh.hlsli)
+    uint ParticleCoreIdx;           // 9: StructuredBuffer<ParticleCore>, the particle pool
+    uint ParticleVisualIdx;         // 10: StructuredBuffer<ParticleVisual>
+    uint ParticleEmittersIdx;       // 11: StructuredBuffer<ParticleEmitter>, the emitter rows
+    uint ParticleChunkMapIdx;       // 12: StructuredBuffer<uint>, pool chunk -> emitter row
+    uint ParticleMaterialId;        // 13: the material the emitter draws with
+    uint _reserved14;               // 14: Material.Apply writes the materials buffer here
+    uint ParticlePartVertices;      // 15: the part's own index count (the draw's may be longer)
     // Slot 16: Debug
     uint DebugMode;             // 16: Debug visualization mode
     uint IndexedDraw;           // 17: 1 = an indexed draw, the vertex index is SV_VertexID (common.fx MeshVertexIndex)
-    uint _reserved18;
-    uint _reserved19;
+    uint ParticleDeltaTime;     // 18: float, the step since last frame (a mesh particle's motion vectors)
+    uint ParticlePartPick;      // 19: MeshVariants: this part's number + 1 (bits 0-15) and the parts (16-31); 0 = whole meshes
     // Slots 20-21: Shadow pass
     uint ExpansionBufferIdx;    // 20: SRV: expansion buffer (cascadeIdx<<30 | instanceIdx)
     uint CascadeBufferSRVIdx;   // 21: SRV: StructuredBuffer<CascadeData>
@@ -373,6 +373,9 @@ PSOutput PS(VSOutput input)
     return output;
 }
 
+// Mesh particles: VS_Particles, VS_ParticlesShadow
+#include "particle_mesh.hlsli"
+
 technique11 GBuffer
 {
     pass Opaque
@@ -380,7 +383,7 @@ technique11 GBuffer
         SetVertexShader(CompileShader(vs_6_6, VS()));
         SetPixelShader(CompileShader(ps_6_6, PS()));
     }
-    
+
     pass Shadow
     {
         SetVertexShader(CompileShader(vs_6_6, VS_Shadow()));
@@ -390,6 +393,20 @@ technique11 GBuffer
     pass LocalShadow
     {
         SetVertexShader(CompileShader(vs_6_6, VS_LocalShadow()));
+        SetPixelShader(CompileShader(ps_6_6, PS_Shadow()));
+    }
+
+    // Mesh particles (ParticleSystem, ParticleEmitter RenderMode Mesh): drawn by name only, with the G-buffer's state and
+    // the cascades'. Not "Opaque_…": every pass of type Opaque gets each batched draw of the material
+    pass Particles
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS_Particles()));
+        SetPixelShader(CompileShader(ps_6_6, PS()));
+    }
+
+    pass Shadow_Particles
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS_ParticlesShadow()));
         SetPixelShader(CompileShader(ps_6_6, PS_Shadow()));
     }
 }

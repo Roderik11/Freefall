@@ -11,7 +11,9 @@ namespace Freefall.Components
     public enum ParticleRenderMode
     {
         Forward,      // Renders to Composite after composition — gets fog automatically
-        Transparent   // Renders to GBuffer in transparent pass
+        Transparent,  // Renders to GBuffer in transparent pass
+        Mesh          // Each particle an opaque Mesh in the G-buffer and the sun's shadows (debris: planks, stones, shards),
+                      // tumbling: lit, shadowed and given decals as the material's meshes are (gbuffer.fx pass Particles)
     }
 
     /// <summary>Where particles are spawned, relative to the emitter transform.</summary>
@@ -368,6 +370,25 @@ namespace Freefall.Components
         [Category("Rendering")]
         [Description("Which render pass to use")]
         public ParticleRenderMode RenderMode = ParticleRenderMode.Forward;
+
+        [Description("Render Mode Mesh: the mesh each particle is (its first LOD's parts), turned about its centre. Start and End " +
+                     "Size scale it (1 = as modelled); RotationRange is how fast it tumbles (rad/s), about an axis of its own " +
+                     "from a random turn; FadeIn grows it in. Colour, texture and the lighting fields are not used: the material lights it")]
+        public Mesh? Mesh;
+
+        [Description("Render Mode Mesh: the material its parts draw with, one of the default (gbuffer) effect's, whose pass " +
+                     "Particles draws them; none or another effect's draws the default material")]
+        public Material? MeshMaterial;
+
+        [Description("Render Mode Mesh: share of its life at the end over which a particle shrinks away (an opaque mesh cannot " +
+                     "fade). 0 = it is gone at once")]
+        [ValueRange(0f, 1f)]
+        public float MeshShrink = 0.15f;
+
+        [Description("Render Mode Mesh: each particle is one of the mesh's parts, picked at random and turned about that part's " +
+                     "own centre, so one emitter throws several kinds of piece (a mesh of a few splinters side by side). Off: " +
+                     "every particle is the whole mesh")]
+        public bool MeshVariants = false;
 
         [Category("Rendering")]
         [Description("Quad orientation")]

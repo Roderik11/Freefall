@@ -31,7 +31,10 @@ namespace Freefall.Graphics
         private const int MinPoolChunks = 64;
         private const int MaxPoolChunks = 16384;    // 4.2M particles
         private const int MaxEmitterChunks = 4096;  // 1M particles
-        private const int RenderModeCount = 2;      // = PARTICLE_MODE_COUNT
+        private const int RenderModeCount = 2;      // = PARTICLE_MODE_COUNT (the sprite modes)
+        private const int MeshMode = 2;             // = PARTICLE_MODE_MESH
+        private const int MeshCascades = 8;         // = PARTICLE_MESH_CASCADES: room per particle in a cascade list
+        private const int MeshArgsPerRow = 8;       // = PARTICLE_MESH_ARGS: the camera's DrawInstanced, then the cascades'
         private const int CoreStride = 32;          // ParticleCore
         private const int VisualStride = 16;        // ParticleVisual
         private const uint FlagReset = 1;           // = PARTICLE_FLAG_RESET
@@ -80,6 +83,8 @@ namespace Freefall.Graphics
             public float ForwardScatter;   public float MultipleScattering; public float PyroFire;          public float PyroTemperature;
             public uint MotionTextureIdx;  public float MotionStrength;     public uint Jets;               public float JetSpreadCos;
             public Vector3 Inherit;        public uint Places;              // its places this frame (BurstAt): first row in bits 0-23, count in 24-31
+            public Vector3 MeshCenter;     public uint MeshList;            // Mesh mode: the mesh's centre / its run of the mesh lists
+            public uint MeshVertices;      public float ShrinkRate;         public uint MeshPad0;           public uint MeshPad1;
         }
 
         /// <summary>A burst's place this frame (ParticleEmitter.BurstAt). Must match struct BurstPlace in particle_common.hlsli.</summary>
@@ -133,6 +138,21 @@ namespace Freefall.Graphics
             public double PlaceUntil = -1.0, OwnUntil = -1.0;
             public float PlaceSpeed;     // the fastest velocity given at those places (|x|+|y|+|z|): they drift that far
             public List<ParticleEmitter.Place> SparePlaces = [];
+
+            // Mesh mode (RenderMode Mesh), as of its last row: the mesh's parts it draws (its first LOD's), each part's
+            // registry id and indices, the most of them, its centre and radius about it; what it draws with
+            public bool IsMesh;
+            public Mesh? DrawnMesh;
+            public int[] PartIds = [];
+            public int[] PartIndices = [];
+            public uint MeshVertices;
+            public Vector3 MeshCenter;
+            public float MeshRadius;
+            public float PartRadius;     // the largest part's radius about its own centre (MeshVariants)
+            public bool Variants;        // MeshVariants: each particle one of the parts
+            public Material? DrawMaterial;
+            public Material? WarnedMaterial;
+            public int Row;              // its row (= the emitter's SystemIndex) in the frame's mesh draws
         }
 
         // The lean spring of a followed flame: about 1.6 swings a second, a third of critical damping,
@@ -147,6 +167,13 @@ namespace Freefall.Graphics
         private int _placeCount;
         private double _clock;            // seconds of particle time (Time.Delta summed): when places' particles have died
         private readonly int[] _modeCount = new int[RenderModeCount];
+
+        // Mesh emitters this frame: the awake ones drawn (their particles are simulated and listed in the opaque pass), the
+        // mesh lists' length (every mesh emitter's capacity), the chunks their phase dispatches over
+        private readonly List<Entry> _meshDraws = [];
+        private int _meshSlots;
+        private int _meshChunkStart, _meshChunkEnd;
+        private int _uploadedMeshChunkStart, _uploadedMeshChunkEnd, _uploadedMeshDraws;
         private bool _anyDepthCollision;
         private bool _anyVolumetric;     // some Lit emitter is Volumetric: the near fog volume takes its particles
 
@@ -169,6 +196,12 @@ namespace Freefall.Graphics
         private GraphicsBuffer? _drawList;     // _poolSlots entries per render mode
         private GraphicsBuffer? _drawArgs;     // 4 uints per render mode
         private GraphicsBuffer? _visibility;   // one uint per emitter row
+        private GraphicsBuffer? _meshArgs;     // MeshArgsPerRow uints per emitter row (mesh emitters' draws)
+        private GraphicsBuffer? _meshList;     // the camera's mesh lists: pool slots, every mesh emitter's run
+        private GraphicsBuffer? _meshShadow;   // the cascades' (cascade << 29 | slot), MeshCascades per slot of a run
+        private int _meshListSlots;
+        private bool _meshReady;               // the mesh phase ran in this view: its cascade lists may be drawn
+        private int _meshSimulatedTick = -1;
         private GraphicsBuffer?[] _frameConstants = new GraphicsBuffer?[CommandBuffer.FrameCount];
         private int _poolSlots;
 
@@ -189,7 +222,7 @@ namespace Freefall.Graphics
         private int _copySlots;
 
         private ComputeShader? _compute;
-        private int _kCull, _kSimulate;
+        private int _kCull, _kSimulate, _kMeshShadow;
         private Effect? _drawEffect;
         private Material? _drawMaterial;
         private ID3D12DescriptorHeap[]? _heaps;
@@ -237,8 +270,8 @@ namespace Freefall.Graphics
 
         protected internal override void Initialize()
         {
-            if (Unsafe.SizeOf<EmitterRow>() != 400)
-                throw new InvalidOperationException("EmitterRow must match struct ParticleEmitter in particle_common.hlsli (400 bytes)");
+            if (Unsafe.SizeOf<EmitterRow>() != 432)
+                throw new InvalidOperationException("EmitterRow must match struct ParticleEmitter in particle_common.hlsli (432 bytes)");
 
             ComponentCache<ParticleEmitter>.Added += OnAdded;
             ComponentCache<ParticleEmitter>.Removed += OnRemoved;
@@ -414,14 +447,97 @@ namespace Freefall.Graphics
             float dt = (float)Time.Delta;
             _clock += dt;
             _placeCount = 0;
+            _meshDraws.Clear();
+            _meshSlots = 0;
+            _meshChunkStart = int.MaxValue;
+            _meshChunkEnd = 0;
             for (int i = 0; i < count; i++)
             {
                 var entry = _entries[i];
-                if (!entry.Asleep || entry.Emitter.BurstOwed)
+                bool awake = !entry.Asleep || entry.Emitter.BurstOwed;
+                if (awake)
                     BuildRow(entry, i, ref _rows[i], dt);
+
+                // A mesh emitter's run of the mesh lists, asleep or not (its standing row names it); the awake ones are
+                // simulated and drawn in the opaque pass (RenderMeshes)
+                if (entry.IsMesh)
+                {
+                    _rows[i].MeshList = (uint)_meshSlots;
+                    _meshSlots += entry.ChunkCount * ChunkSize;
+                    if (awake && entry.ChunkCount > 0)
+                    {
+                        _meshChunkStart = Math.Min(_meshChunkStart, entry.FirstChunk);
+                        _meshChunkEnd = Math.Max(_meshChunkEnd, entry.FirstChunk + entry.ChunkCount);
+                        if (entry.PartIds.Length > 0 && entry.DrawMaterial != null)
+                        {
+                            entry.Row = i;
+                            _meshDraws.Add(entry);
+                            entry.DrawMaterial.Touch();     // its textures on the GPU while it draws (Material.OnDemand)
+                        }
+                    }
+                }
             }
+            if (_meshChunkEnd == 0) _meshChunkStart = 0;
 
             _rowCount = count;
+        }
+
+        /// <summary>
+        /// A mesh emitter's mesh and material, looked at again when they change: its first LOD's parts with their registry
+        /// ids and indices, its centre and radius, and the material (one with the pass Particles, else the default).
+        /// </summary>
+        private static void SyncMesh(Entry entry, ParticleEmitter e)
+        {
+            var mesh = e.Mesh;
+            if (mesh != entry.DrawnMesh || (mesh != null && entry.PartIds.Length == 0))
+            {
+                entry.DrawnMesh = mesh;
+                entry.PartIds = [];
+                entry.PartIndices = [];
+                entry.MeshVertices = 0;
+                entry.PartRadius = 0f;
+                if (mesh != null && mesh.MeshParts.Count > 0)
+                {
+                    int[] parts;
+                    if (mesh.LODs.Count > 0 && mesh.LODs[0].MeshPartIndices is { Length: > 0 } lod0) parts = lod0;
+                    else
+                    {
+                        parts = new int[mesh.MeshParts.Count];
+                        for (int p = 0; p < parts.Length; p++) parts[p] = p;
+                    }
+                    if (mesh.GetMeshPartId(parts[0]) < 0) mesh.RegisterMeshParts();
+                    var ids = new List<int>(parts.Length);
+                    var indices = new List<int>(parts.Length);
+                    foreach (int p in parts)
+                    {
+                        if (p < 0 || p >= mesh.MeshParts.Count || !mesh.MeshParts[p].Enabled) continue;
+                        int id = mesh.GetMeshPartId(p);
+                        if (id < 0) continue;
+                        ids.Add(id);
+                        indices.Add(mesh.MeshParts[p].NumIndices);
+                        entry.MeshVertices = Math.Max(entry.MeshVertices, (uint)mesh.MeshParts[p].NumIndices);
+                        entry.PartRadius = Math.Max(entry.PartRadius, mesh.MeshParts[p].BoundingSphere.W);
+                    }
+                    entry.PartIds = [.. ids];
+                    entry.PartIndices = [.. indices];
+                    var sphere = mesh.LocalBoundingSphere;
+                    entry.MeshCenter = new Vector3(sphere.X, sphere.Y, sphere.Z);
+                    entry.MeshRadius = sphere.W;
+                }
+            }
+
+            var material = e.MeshMaterial;
+            if (material == null || !material.HasPass("Particles"))
+            {
+                if (material != null && entry.WarnedMaterial != material)
+                {
+                    entry.WarnedMaterial = material;
+                    Debug.LogWarning("ParticleSystem", $"'{e.Entity?.Name}': material '{material.Name}' has no pass Particles " +
+                        "(not the default gbuffer effect): its mesh particles draw with the default material");
+                }
+                material = Freefall.Assets.InternalAssets.DefaultMaterial;
+            }
+            entry.DrawMaterial = material;
         }
 
         /// <summary>
@@ -448,6 +564,12 @@ namespace Freefall.Graphics
                 row.Flags = 0;
                 return;
             }
+
+            // Mesh mode: simulated and drawn in the opaque pass, its mesh's parts and material looked at when they change
+            bool mesh = e.RenderMode == ParticleRenderMode.Mesh;
+            entry.IsMesh = mesh;
+            if (mesh) SyncMesh(entry, e);
+            entry.Variants = mesh && e.MeshVariants && entry.PartIds.Length > 1;
 
             // Pool space follows the authored rate. Shrinking waits for a factor of two so a rate that
             // is being animated does not restart the emitter every frame.
@@ -502,9 +624,11 @@ namespace Freefall.Graphics
             float stretch = MathF.Max(0f, e.StretchFactor);
             float speedMin = MathF.Min(e.SpeedRange.X, e.SpeedRange.Y);
             float speedMax = MathF.Max(e.SpeedRange.X, e.SpeedRange.Y);
-            bool depthCollision = e.CollisionMode == ParticleCollisionMode.Depth;
+            // A mesh is simulated before the depth is drawn, and would meet its own surface in it: no depth collision
+            var collision = mesh && e.CollisionMode == ParticleCollisionMode.Depth ? ParticleCollisionMode.None : e.CollisionMode;
+            bool depthCollision = collision == ParticleCollisionMode.Depth;
             _anyDepthCollision |= depthCollision;
-            _anyVolumetric |= e.Volumetric && e.Lit;
+            _anyVolumetric |= e.Volumetric && e.Lit && !mesh;
 
             // A moving emitter. Its velocity, smoothed over about a tenth of a second (a hand's jitter
             // is not a wind), and how far its live particles are carried along this frame: from where
@@ -611,7 +735,9 @@ namespace Freefall.Graphics
             float size = MathF.Max(e.StartSize, e.EndSize) * (1f + sizeRandom);
             float particleRadius = 0.5f * size * (1f + aspect);
             float windLean = MathF.Max(0f, e.WindLean);
-            if (e.BillboardMode == ParticleBillboardMode.VelocityStretched)
+            if (mesh)   // turned about its centre (a variant about its part's): the sphere round it, scaled
+                particleRadius = size * (entry.Variants ? entry.PartRadius : entry.MeshRadius);
+            else if (e.BillboardMode == ParticleBillboardMode.VelocityStretched)
                 particleRadius += 0.5f * stretch * (topSpeed + gravity * life + drift);
             else
             {
@@ -623,8 +749,8 @@ namespace Freefall.Graphics
             // What the emitter leaves behind as it moves: particles that do not follow it trail back along its way
             drift += speed * (1f - follow);
 
-            int mode = e.RenderMode == ParticleRenderMode.Transparent ? 1 : 0;
-            _modeCount[mode]++;
+            int mode = mesh ? MeshMode : e.RenderMode == ParticleRenderMode.Transparent ? 1 : 0;
+            if (!mesh) _modeCount[mode]++;
 
             row = new EmitterRow
             {
@@ -650,7 +776,7 @@ namespace Freefall.Graphics
                 Shape = (uint)e.Shape,
                 DirectionMode = (uint)e.DirectionMode,
                 EmitFromShell = e.EmitFromShell ? 1u : 0u,
-                CollisionMode = (uint)e.CollisionMode,
+                CollisionMode = (uint)collision,
                 CollisionResponse = (uint)e.CollisionResponse,
                 PlaneHeight = e.PlaneHeight,
                 CollisionThickness = MathF.Max(0.01f, e.CollisionThickness),
@@ -682,16 +808,17 @@ namespace Freefall.Graphics
                 BoundsRadius = e.Shape is EmissionShape.Surf or EmissionShape.Ground ? 1e6f
                     : shape + topSpeed * life + 0.25f * gravity * life * life + drift * life + particleRadius,
                 RenderMode = (uint)mode,
+                // A mesh takes only what moves it: how it looks is its material's
                 Flags = (entry.Reset ? FlagReset : 0u)
-                    | (e.FlipbookRandomStart ? FlagFlipbookRandom : 0u)
-                    | (e.FlipbookBlend ? FlagFlipbookBlend : 0u)
-                    | (e.Lit ? FlagLit : 0u)
-                    | (e.SurfMist ? FlagSurfMist : 0u)
-                    | (e.Volumetric && e.Lit ? FlagVolume : 0u)
                     | (e.WrapInBox && e.Shape == EmissionShape.Box ? FlagWrap : 0u)
                     | (e.StopUnderCover ? FlagCover : 0u)
-                    | (e.Water && e.Lit ? FlagWater : 0u)
-                    | (e.Pyro ? FlagPyro | FlagLit : 0u),
+                    | (mesh ? 0u : (e.FlipbookRandomStart ? FlagFlipbookRandom : 0u)
+                        | (e.FlipbookBlend ? FlagFlipbookBlend : 0u)
+                        | (e.Lit ? FlagLit : 0u)
+                        | (e.SurfMist ? FlagSurfMist : 0u)
+                        | (e.Volumetric && e.Lit ? FlagVolume : 0u)
+                        | (e.Water && e.Lit ? FlagWater : 0u)
+                        | (e.Pyro ? FlagPyro | FlagLit : 0u)),
                 Intensity = MathF.Max(0f, e.Intensity),
                 FadeInRate = e.FadeIn > 0f ? 1f / MathF.Min(e.FadeIn, 1f) : 0f,
                 Turbulence = turbulence,
@@ -708,6 +835,9 @@ namespace Freefall.Graphics
                 PyroTemperature = Math.Clamp(e.PyroTemperature, 1000f, 15000f),
                 Inherit = inherit,
                 Places = places,
+                MeshCenter = entry.MeshCenter,
+                MeshVertices = mesh ? entry.MeshVertices : 0u,
+                ShrinkRate = mesh && e.MeshShrink > 0f ? 1f / MathF.Min(e.MeshShrink, 1f) : 0f,
             };
 
             // Places whose particles may still live: the bounds take in their box (and its own place while what it let go
@@ -775,8 +905,14 @@ namespace Freefall.Graphics
             _uploadedSerial = _gatherSerial;
             _uploadedRows = _rowCount;
             _uploadedHighWater = _highWater;
+            _uploadedMeshDraws = _meshDraws.Count;
+            _uploadedMeshChunkStart = _meshChunkStart;
+            _uploadedMeshChunkEnd = Math.Min(_meshChunkEnd, _highWater);
             return _prepared = _highWater > 0;
         }
+
+        /// <summary>Mesh emitters were gathered this tick: RenderMeshes and RenderMeshShadows have work.</summary>
+        internal bool HasMeshes => _prepared && _uploadedMeshDraws > 0 && _uploadedMeshChunkEnd > _uploadedMeshChunkStart;
 
         private void EnsureResources()
         {
@@ -787,6 +923,7 @@ namespace Freefall.Graphics
                 _compute = new ComputeShader("particle_compute.hlsl");
                 _kCull = _compute.FindKernel("CSCull");
                 _kSimulate = _compute.FindKernel("CSSimulate");
+                _kMeshShadow = _compute.FindKernel("CSMeshShadow");
 
                 _drawEffect = new Effect("particle_draw");
                 _drawMaterial = new Material(_drawEffect);
@@ -837,12 +974,30 @@ namespace Freefall.Graphics
                 device.DeferDispose(_visibility);
                 _visibility = GraphicsBuffer.CreateStructured<uint>(Math.Max(64, _rowCount * 2), uav: true);
             }
+
+            // Mesh emitters: arguments per row, and the lists for their runs (made when the first one draws)
+            if (_meshDraws.Count > 0)
+            {
+                if (_meshArgs == null || _meshArgs.ElementCount < _rowCount * MeshArgsPerRow)
+                {
+                    device.DeferDispose(_meshArgs);
+                    _meshArgs = GraphicsBuffer.CreateStructured<uint>(Math.Max(64, _rowCount * 2) * MeshArgsPerRow, uav: true);
+                }
+                if (_meshList == null || _meshListSlots < _meshSlots)
+                {
+                    device.DeferDispose(_meshList);
+                    device.DeferDispose(_meshShadow);
+                    _meshListSlots = Math.Max(_meshSlots, 4 * ChunkSize);
+                    _meshList = GraphicsBuffer.CreateStructured<uint>(_meshListSlots, srv: true, uav: true);
+                    _meshShadow = GraphicsBuffer.CreateStructured<uint>(_meshListSlots * MeshCascades, srv: true, uav: true);
+                }
+            }
         }
 
         /// <summary>Transparent pass: cull + simulate for this view, then its Transparent-mode particles.</summary>
         internal void RenderTransparent(ID3D12GraphicsCommandList cmd)
         {
-            _drawReady = Compute(cmd);
+            _drawReady = Compute(cmd, mesh: false);
             if (_drawReady) DrawSorted(cmd, 1);
         }
 
@@ -886,16 +1041,21 @@ namespace Freefall.Graphics
             cmd.RSSetScissorRect(OrderIndependentTransparency.FullScissor);
         }
 
-        private bool Compute(ID3D12GraphicsCommandList cmd)
+        // mesh: the mesh emitters' phase, at the head of the opaque pass (their chunks only, listed per emitter for the
+        // G-buffer and the cascades); else the sprites', in the transparent pass (with depth collision)
+        private bool Compute(ID3D12GraphicsCommandList cmd, bool mesh)
         {
             var renderer = DeferredRenderer.Current;
             if (renderer == null || renderer.FrustumConstantsAddress == 0) return false;
+            if (mesh && (_meshArgs == null || _meshList == null)) return false;
 
             var device = Engine.Device;
 
-            // Only the first view of a tick advances the simulation; later ones just build their lists
-            bool simulate = _simulatedTick != Engine.TickCount;
-            _simulatedTick = Engine.TickCount;
+            // Only the first view of a tick advances the simulation; later ones just build their lists. Each phase on its
+            // own: they simulate chunks of their own
+            bool simulate = (mesh ? _meshSimulatedTick : _simulatedTick) != Engine.TickCount;
+            if (mesh) _meshSimulatedTick = Engine.TickCount;
+            else _simulatedTick = Engine.TickCount;
 
             cmd.SetDescriptorHeaps(1, _heaps!);
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
@@ -904,19 +1064,30 @@ namespace Freefall.Graphics
 
             _core!.Transition(cmd, ResourceStates.UnorderedAccess);
             _visual!.Transition(cmd, ResourceStates.UnorderedAccess);
-            _drawList!.Transition(cmd, ResourceStates.UnorderedAccess);
-            _drawArgs!.Transition(cmd, ResourceStates.UnorderedAccess);
             _visibility!.Transition(cmd, ResourceStates.UnorderedAccess);
+            if (mesh)
+            {
+                _meshArgs!.Transition(cmd, ResourceStates.UnorderedAccess);
+                _meshList!.Transition(cmd, ResourceStates.UnorderedAccess);
+            }
+            else
+            {
+                _drawList!.Transition(cmd, ResourceStates.UnorderedAccess);
+                _drawArgs!.Transition(cmd, ResourceStates.UnorderedAccess);
+            }
 
             // Depth collision reads this frame's depth and normals. The pass runs inside the G-buffer
             // fill, where both are still bound as render targets: make them readable for the dispatch.
+            // Not for the meshes: they are simulated before the depth is drawn.
             var camera = Camera.Main;
-            bool depth = simulate && _anyDepthCollision && camera != null
+            bool depth = !mesh && simulate && _anyDepthCollision && camera != null
                 && renderer.DepthGBuffer != null && renderer.Normals != null;
             var frameConstants = _frameConstants[Engine.FrameIndex % _frameConstants.Length]!;
             if (simulate)
             {
-                // What covers the weather from the sky (StopUnderCover): the meshes seen from above, the terrain's surface
+                // What covers the weather from the sky (StopUnderCover): the meshes seen from above, the terrain's surface.
+                // Both phases write it, the sprites' last (what both dispatches read): the meshes read none of the
+                // collision's view, only the places and the cover
                 var shelter = SkyCapture.Shelter;
                 var terrain = Atmosphere.TerrainCover;
                 unsafe
@@ -950,8 +1121,8 @@ namespace Freefall.Graphics
             cs.SetPushConstant("ParticleCoreUAV", _core.UavIndex);
             cs.SetPushConstant("ParticleVisualUAV", _visual.UavIndex);
             cs.SetPushConstant("VisibilityUAV", _visibility.UavIndex);
-            cs.SetPushConstant("DrawListUAV", _drawList.UavIndex);
-            cs.SetPushConstant("DrawArgsUAV", _drawArgs.UavIndex);
+            cs.SetPushConstant("DrawListUAV", _drawList!.UavIndex);
+            cs.SetPushConstant("DrawArgsUAV", _drawArgs!.UavIndex);
             cs.SetPushConstant("EmitterCount", (uint)_uploadedRows);
             cs.SetPushConstant("PoolSlots", (uint)_poolSlots);
             cs.SetPushConstant("SimulateFlag", simulate ? 1u : 0u);
@@ -961,12 +1132,17 @@ namespace Freefall.Graphics
             cs.SetPushConstant("NormalTex", depth ? renderer.Normals!.BindlessIndex : 0u);
             // The ocean drawn this frame, for the Surf shape's spray and mist (its waves decide where they are born)
             cs.SetPushConstant("OceanData", Freefall.Components.OceanRenderer.DrawnThisTick?.SurfDataSrv ?? 0u);
+            cs.SetPushConstant("Phase", mesh ? 1u : 0u);
+            cs.SetPushConstant("MeshArgsUAV", mesh ? _meshArgs!.UavIndex : 0u);
+            cs.SetPushConstant("MeshListUAV", mesh ? _meshList!.UavIndex : 0u);
+            cs.SetPushConstant("ChunkOffset", mesh ? (uint)_uploadedMeshChunkStart : 0u);
 
             cs.Dispatch(_kCull, cmd, ((uint)_uploadedRows + 63) / 64);
             _visibility.UAVBarrier(cmd);
-            _drawArgs.UAVBarrier(cmd);
+            if (mesh) _meshArgs!.UAVBarrier(cmd);
+            else _drawArgs!.UAVBarrier(cmd);
 
-            cs.Dispatch(_kSimulate, cmd, (uint)_uploadedHighWater);
+            cs.Dispatch(_kSimulate, cmd, mesh ? (uint)(_uploadedMeshChunkEnd - _uploadedMeshChunkStart) : (uint)_uploadedHighWater);
 
             if (depth)
             {
@@ -977,11 +1153,124 @@ namespace Freefall.Graphics
             // Hand everything to the draws (these transitions also order them after the dispatch)
             _core.Transition(cmd, ResourceStates.NonPixelShaderResource);
             _visual.Transition(cmd, ResourceStates.NonPixelShaderResource);
-            _drawList.Transition(cmd, ResourceStates.NonPixelShaderResource);
-            _drawArgs.Transition(cmd, ResourceStates.IndirectArgument);
-
-            if (simulate) _simulatedSerial = _uploadedSerial;
+            if (mesh)
+            {
+                _meshList!.Transition(cmd, ResourceStates.NonPixelShaderResource);
+                _meshArgs!.Transition(cmd, ResourceStates.IndirectArgument);
+            }
+            else
+            {
+                _drawList!.Transition(cmd, ResourceStates.NonPixelShaderResource);
+                _drawArgs!.Transition(cmd, ResourceStates.IndirectArgument);
+                if (simulate) _simulatedSerial = _uploadedSerial;
+            }
             return true;
+        }
+
+        /// <summary>
+        /// Opaque pass, before its batches: the mesh emitters' phase (their particles simulated and listed for this view),
+        /// then each one's parts drawn into the G-buffer through its material's pass Particles (gbuffer.fx,
+        /// particle_mesh.hlsli), the same pixel shader as the material's meshes.
+        /// </summary>
+        internal void RenderMeshes(ID3D12GraphicsCommandList cmd)
+        {
+            _meshReady = false;
+            if (!HasMeshes || !Compute(cmd, mesh: true)) return;
+            _meshReady = true;
+
+            var device = Engine.Device;
+            PixMarker.Begin(cmd, "Mesh particles");
+            uint delta = BitConverter.SingleToUInt32Bits((float)Time.Delta);
+            for (int i = 0; i < _uploadedMeshDraws; i++)
+            {
+                var entry = _meshDraws[i];
+                var material = entry.DrawMaterial!;
+                material.SetPass("Particles");
+                material.Apply(cmd, device);
+                material.SetPass(RenderPass.Opaque);
+                BindMeshDraw(cmd, entry.Row, 1u);
+                cmd.SetGraphicsRoot32BitConstant(0, _meshList!.SrvIndex, 5);                 // the camera's lists
+                cmd.SetGraphicsRoot32BitConstant(0, (uint)material.MaterialID, 13);          // ParticleMaterialId
+                cmd.SetGraphicsRoot32BitConstant(0, delta, 18);                              // ParticleDeltaTime
+                DrawParts(cmd, entry, 0);
+            }
+            PixMarker.End(cmd);
+        }
+
+        /// <summary>
+        /// The sun's shadow pass, after its batches (the cascades' full-array depth bound): every live particle of the mesh
+        /// emitters listed once per cascade it falls in (CSMeshShadow), then drawn through the pass Shadow_Particles.
+        /// </summary>
+        internal void RenderMeshShadows(ID3D12GraphicsCommandList cmd)
+        {
+            if (!_meshReady || _meshShadow == null) return;
+            uint cascades = DirectionalLight.CurrentCascadeSrvIndex;
+            int cascadeCount = Math.Min(DirectionalLight.CascadeCount, MeshCascades);
+            if (cascades == 0 || cascadeCount <= 0) return;
+            var device = Engine.Device;
+            PixMarker.Begin(cmd, "Mesh particles");
+
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            _meshArgs!.Transition(cmd, ResourceStates.UnorderedAccess);
+            _meshShadow.Transition(cmd, ResourceStates.UnorderedAccess);
+            var cs = _compute!;
+            cs.SetPushConstant("Emitters", _emitters!.SrvIndex);
+            cs.SetPushConstant("ChunkMap", _chunkMap!.SrvIndex);
+            cs.SetPushConstant("EmitterCount", (uint)_uploadedRows);
+            cs.SetPushConstant("MeshArgsUAV", _meshArgs.UavIndex);
+            cs.SetPushConstant("MeshListUAV", _meshShadow.UavIndex);
+            cs.SetPushConstant("ChunkOffset", (uint)_uploadedMeshChunkStart);
+            cs.SetPushConstant("Cascades", cascades);
+            cs.SetPushConstant("CascadeCount", (uint)cascadeCount);
+            cs.SetPushConstant("ParticleCore", _core!.SrvIndex);
+            cs.Dispatch(_kMeshShadow, cmd, (uint)(_uploadedMeshChunkEnd - _uploadedMeshChunkStart));
+            _meshShadow.Transition(cmd, ResourceStates.NonPixelShaderResource);
+            _meshArgs.Transition(cmd, ResourceStates.IndirectArgument);
+
+            for (int i = 0; i < _uploadedMeshDraws; i++)
+            {
+                var entry = _meshDraws[i];
+                var material = entry.DrawMaterial!;
+                material.SetPass("Shadow_Particles");
+                material.Apply(cmd, device);
+                material.SetPass(RenderPass.Opaque);
+                BindMeshDraw(cmd, entry.Row, MeshCascades);
+                cmd.SetGraphicsRoot32BitConstant(0, _meshShadow.SrvIndex, 20);               // ExpansionBufferIdx
+                cmd.SetGraphicsRoot32BitConstant(0, cascades, 21);                           // CascadeBufferSRVIdx
+                DrawParts(cmd, entry, 4);
+            }
+            PixMarker.End(cmd);
+        }
+
+        // gbuffer.fx's push constants a mesh particle draw takes in both passes (particle_mesh.hlsli). runScale: where its run
+        // starts in the list per slot of the run (the cascades' lists hold MeshCascades entries a slot)
+        private void BindMeshDraw(ID3D12GraphicsCommandList cmd, int row, uint runScale)
+        {
+            cmd.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cmd.SetGraphicsRoot32BitConstant(0, _rows[row].MeshList * runScale, 3);         // InstanceBaseOffset: its run
+            cmd.SetGraphicsRoot32BitConstant(0, MeshRegistry.SrvIndex, 6);
+            cmd.SetGraphicsRoot32BitConstant(0, Material.MaterialsBufferIndex, 7);
+            cmd.SetGraphicsRoot32BitConstant(0, _core!.SrvIndex, 9);
+            cmd.SetGraphicsRoot32BitConstant(0, _visual!.SrvIndex, 10);
+            cmd.SetGraphicsRoot32BitConstant(0, _emitters!.SrvIndex, 11);
+            cmd.SetGraphicsRoot32BitConstant(0, _chunkMap!.SrvIndex, 12);
+            cmd.SetGraphicsRoot32BitConstant(0, 0u, 17);                                     // IndexedDraw: pulled
+        }
+
+        // Each part of the emitter's mesh, all from the instance count its list was given (args: 0 the camera's, 4 the cascades')
+        private void DrawParts(ID3D12GraphicsCommandList cmd, Entry entry, int args)
+        {
+            var device = Engine.Device;
+            int parts = entry.PartIds.Length;
+            for (int p = 0; p < parts; p++)
+            {
+                cmd.SetGraphicsRoot32BitConstant(0, (uint)entry.PartIds[p], 2);              // MeshPartId
+                cmd.SetGraphicsRoot32BitConstant(0, (uint)entry.PartIndices[p], 15);         // ParticlePartVertices
+                // ParticlePartPick (MeshVariants): this part draws the particles that picked it, of all of them
+                cmd.SetGraphicsRoot32BitConstant(0, entry.Variants ? (uint)(p + 1) | ((uint)parts << 16) : 0u, 19);
+                cmd.ExecuteIndirect(device.DrawInstancedSignature, 1, _meshArgs!.Native,
+                    (ulong)((entry.Row * MeshArgsPerRow + args) * sizeof(uint)), null, 0);
+            }
         }
 
         private void CopyGrownPool(ID3D12GraphicsCommandList cmd)
@@ -1054,6 +1343,8 @@ namespace Freefall.Graphics
         private Action<ID3D12GraphicsCommandList>? _forward;
         private Action<ID3D12GraphicsCommandList>? _oitMoments;
         private Action<ID3D12GraphicsCommandList>? _oit;
+        private Action<ID3D12GraphicsCommandList>? _meshes;
+        private Action<ID3D12GraphicsCommandList>? _meshShadows;
 
         protected internal override void Initialize()
         {
@@ -1063,12 +1354,20 @@ namespace Freefall.Graphics
             _forward = _particles.RenderForward;
             _oitMoments = _particles.RenderOITMoments;
             _oit = _particles.RenderOIT;
+            _meshes = _particles.RenderMeshes;
+            _meshShadows = _particles.RenderMeshShadows;
         }
 
         public override void Update()
         {
             if (_particles == null || !_particles.PrepareFrame()) return;
 
+            // Mesh emitters: simulated and drawn at the head of the opaque pass, then into the sun's cascades
+            if (_particles.HasMeshes)
+            {
+                CommandBuffer.Enqueue(RenderPass.Opaque, _meshes!);
+                CommandBuffer.Enqueue(RenderPass.Shadow, _meshShadows!);
+            }
             CommandBuffer.Enqueue(RenderPass.Transparent, _transparent!);
             CommandBuffer.EnqueueLate(RenderPass.Forward, _forward!);
             // Without order (EngineSettings.Transparency): this view's split is known before the draw systems run
