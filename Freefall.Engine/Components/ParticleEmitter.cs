@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 using Description = System.ComponentModel.DescriptionAttribute;
 using Category = System.ComponentModel.CategoryAttribute;
@@ -421,11 +422,58 @@ namespace Freefall.Components
             if (count > 0) System.Threading.Interlocked.Add(ref _burst, count);
         }
 
+        /// <summary>A burst at a place of its own (<see cref="BurstAt"/>), waiting for the gather.</summary>
+        internal struct Place
+        {
+            public Vector3 Position;
+            public Quaternion Rotation;
+            public Vector3 Velocity;
+            public int Count;
+        }
+
+        private readonly object _placesLock = new();
+        private List<Place> _places = new();
+        private int _placesOwed;
+
+        /// <summary>
+        /// Let go of <paramref name="count"/> particles at once, at the next gather, from a place of their own: the shape,
+        /// <see cref="EmitDirection"/> and the jets as if the emitter stood at <paramref name="position"/> turned by
+        /// <paramref name="rotation"/>, born with <see cref="InheritVelocity"/> of <paramref name="velocity"/> (world m/s:
+        /// what threw them, a ship under way). Any number of places a frame, any thread; the emitter itself stays where it
+        /// is. One emitter serves every place it is asked for: every gun's smoke in a sea battle from one emitter, its pool
+        /// room (<see cref="BurstRoom"/>) the cap (the oldest particles give way). Its bounds grow over the places whose
+        /// particles may still live. Keep <see cref="FollowEmitter"/> at 0 on an emitter used this way: its live particles
+        /// would move with the emitter, wherever they were let go.
+        /// </summary>
+        public void BurstAt(Vector3 position, Quaternion rotation, int count, Vector3 velocity = default)
+        {
+            if (count <= 0) return;
+            lock (_placesLock)
+            {
+                _places.Add(new Place { Position = position, Rotation = rotation, Velocity = velocity, Count = count });
+                _placesOwed = _places.Count;
+            }
+        }
+
         /// <summary>A burst waits for the gather (it wakes an emitter asleep).</summary>
-        internal bool BurstOwed => System.Threading.Volatile.Read(ref _burst) > 0;
+        internal bool BurstOwed => System.Threading.Volatile.Read(ref _burst) > 0 || System.Threading.Volatile.Read(ref _placesOwed) > 0;
 
         /// <summary>The bursts owed since the last gather, taken.</summary>
         internal int TakeBurst() => System.Threading.Interlocked.Exchange(ref _burst, 0);
+
+        /// <summary>The places owed since the last gather, swapped for <paramref name="spare"/> (emptied): no copy, nothing allocated.</summary>
+        internal List<Place>? TakePlaces(List<Place> spare)
+        {
+            if (System.Threading.Volatile.Read(ref _placesOwed) == 0) return null;
+            spare.Clear();
+            lock (_placesLock)
+            {
+                var taken = _places;
+                _places = spare;
+                _placesOwed = 0;
+                return taken;
+            }
+        }
 
         // A disabled emitter whose particles are gone sleeps in the system: it has to hear of it
         protected override void OnEnabledChanged() => Systems.Get<Graphics.ParticleSystem>()?.EnabledChanged(this);

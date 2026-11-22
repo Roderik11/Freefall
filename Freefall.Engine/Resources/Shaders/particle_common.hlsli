@@ -53,7 +53,16 @@ struct ParticleEmitter     // 400 bytes
     float3 LeanWind;       float  PivotY;              // the wind a sprite leans in: Wind less the emitter's own motion it follows / quad offset in its sizes
     float  ForwardScatter; float  MultipleScattering;  float PyroFire;           float PyroTemperature; // lit: Henyey-Greenstein g of the light (ParticleLight) / its even share (ParticlePhase) / pyro: the fire's nits and kelvin at its brightest
     uint   MotionTextureIdx; float MotionStrength;     uint  Jets;               float JetSpreadCos; // the flipbook's motion atlas (0 = none) / its full-scale motion in shares of a frame / a burst in jets: their count (bits 0-15, 0 = none) and slowest share x 255 (bits 16-23) / cos of the spread round a jet
-    float3 Inherit;        float  InheritPad;          // world m/s a particle born now starts with on top of its own (InheritVelocity × the emitter's velocity)
+    float3 Inherit;        uint   Places;              // world m/s a particle born now starts with on top of its own (InheritVelocity × the emitter's velocity) / its bursts' places this frame (BurstAt): first in bits 0-23, count in 24-31, 0 = none
+};
+
+// A burst let go at a place of its own this frame (ParticleEmitter.BurstAt; ParticleSystem.PlaceRow): the emission's slots
+// [Begin, End) are born as if the emitter stood there, turned by Rotation, with Velocity (already × InheritVelocity) added
+struct BurstPlace          // 48 bytes
+{
+    float3 Position;       uint   Begin;
+    float4 Rotation;       // quaternion xyzw
+    float3 Velocity;       uint   End;
 };
 
 // ParticleEmitter.RenderMode

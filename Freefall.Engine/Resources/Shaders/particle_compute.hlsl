@@ -43,7 +43,7 @@ cbuffer ParticleFrame : register(b1)
     uint TerrainPagesIdx;                   // the terrain's baked heights (sky_visibility.hlsli TerrainCover); 0 = none
     float TerrainMaxHeight;
     float3 TerrainOrigin;
-    float _framePad0;
+    uint BurstPlacesIdx;                    // StructuredBuffer<BurstPlace>: this frame's places (BurstAt), read only for an emitter with Places
     float2 TerrainSize;
     float2 _framePad1;
 };
@@ -263,6 +263,35 @@ float3 curl_noise(float3 x)
 float3 local_to_world(ParticleEmitter e, float3 v)
 {
     return e.AxisX * v.x + e.AxisY * v.y + e.AxisZ * v.z;
+}
+
+// A burst place's turn (quaternion xyzw, as System.Numerics' Vector3.Transform) of an emitter-local vector
+float3 place_to_world(float4 q, float3 v)
+{
+    float3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+// The place (BurstAt) a slot of the frame's emission is born at, if it is one of a place's
+bool find_place(ParticleEmitter e, uint ringPos, out BurstPlace place)
+{
+    place = (BurstPlace)0;
+    uint count = e.Places >> 24;
+    [branch]
+    if (count == 0u || BurstPlacesIdx == 0u) return false;
+    StructuredBuffer<BurstPlace> Places = ResourceDescriptorHeap[BurstPlacesIdx];
+    uint first = e.Places & 0xFFFFFFu;
+    [loop]
+    for (uint k = 0u; k < count; k++)
+    {
+        BurstPlace candidate = Places[first + k];
+        if (ringPos >= candidate.Begin && ringPos < candidate.End)
+        {
+            place = candidate;
+            return true;
+        }
+    }
+    return false;
 }
 
 // Sample a spawn offset (emitter-local) and shape-derived direction hint.
@@ -502,8 +531,9 @@ bool spawn_ground(ParticleEmitter e, uint seed, inout ParticleCore p)
     return true;
 }
 
-// ringPos: the slot's place in the frame's emission (Jets picks a jet by it)
-void spawn(ParticleEmitter e, uint seed, uint ringPos, out ParticleCore p, out ParticleVisual v)
+// ringPos: the slot's place in the frame's emission (Jets picks a jet by it); atPlace: born at a burst's place of its own
+// (BurstAt), as if the emitter stood there turned by its rotation, with its velocity
+void spawn(ParticleEmitter e, uint seed, uint ringPos, bool atPlace, BurstPlace place, out ParticleCore p, out ParticleVisual v)
 {
     [branch]
     if (e.Shape == SHAPE_SURF || e.Shape == SHAPE_GROUND)
@@ -527,7 +557,11 @@ void spawn(ParticleEmitter e, uint seed, uint ringPos, out ParticleCore p, out P
     uint jets = e.Jets & 0xFFFFu;
     uint pick = seed;
     if (jets > 0u)
-        pick = pcg_hash(e.RandomSeed ^ ((ringPos % jets) * 0x9E3779B9u + 0x68E31DA4u));
+    {
+        // A place's jets are its own: counted from its first slot, hashed with where it starts in the emission
+        uint jetPos = atPlace ? ringPos - place.Begin : ringPos;
+        pick = pcg_hash(e.RandomSeed ^ ((jetPos % jets) * 0x9E3779B9u + 0x68E31DA4u) ^ (atPlace ? (place.Begin + 1u) * 0x85EBCA6Bu : 0u));
+    }
 
     float3 localPos, shapeDir;
     sample_shape(e, pick + 100u, localPos, shapeDir);
@@ -559,10 +593,19 @@ void spawn(ParticleEmitter e, uint seed, uint ringPos, out ParticleCore p, out P
         speed *= rand_range(((e.Jets >> 16) & 0xFFu) / 255.0, 1.0, seed + 4u);
     }
 
-    p.Position = e.Position + local_to_world(e, localPos);
     p.Age = 0.0;
     // Its own way and speed, and what it is given of the emitter's motion (InheritVelocity): then the drag takes it
-    p.Velocity = local_to_world(e, localDir) * speed + e.Inherit;
+    [branch]
+    if (atPlace)
+    {
+        p.Position = place.Position + place_to_world(place.Rotation, localPos);
+        p.Velocity = place_to_world(place.Rotation, localDir) * speed + place.Velocity;
+    }
+    else
+    {
+        p.Position = e.Position + local_to_world(e, localPos);
+        p.Velocity = local_to_world(e, localDir) * speed + e.Inherit;
+    }
     p.Lifetime = max(0.01, e.Lifetime * rand_range(1.0 - e.LifetimeRandomness, 1.0 + e.LifetimeRandomness, seed + 3u));
 
     // One random scale factor for start and end size so the size curve keeps its shape
@@ -761,7 +804,9 @@ void CSSimulate(uint3 gid : SV_GroupID, uint3 dtid : SV_DispatchThreadID)
         if (ringPos < e.EmitCount)
         {
             ParticleVisual v;
-            spawn(e, pcg_hash(e.RandomSeed + local * 7919u + slot * 6271u), ringPos, p, v);
+            BurstPlace place;
+            bool atPlace = find_place(e, ringPos, place);
+            spawn(e, pcg_hash(e.RandomSeed + local * 7919u + slot * 6271u), ringPos, atPlace, place, p, v);
 
             // None born under a roof (the box over a camera in a hall), none over a ceiling (what floats in the water, born
             // in a box round the camera that reaches out of the water)

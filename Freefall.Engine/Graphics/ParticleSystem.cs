@@ -79,7 +79,16 @@ namespace Freefall.Graphics
             public Vector3 LeanWind;       public float PivotY;
             public float ForwardScatter;   public float MultipleScattering; public float PyroFire;          public float PyroTemperature;
             public uint MotionTextureIdx;  public float MotionStrength;     public uint Jets;               public float JetSpreadCos;
-            public Vector3 Inherit;        public float InheritPad;
+            public Vector3 Inherit;        public uint Places;              // its places this frame (BurstAt): first row in bits 0-23, count in 24-31
+        }
+
+        /// <summary>A burst's place this frame (ParticleEmitter.BurstAt). Must match struct BurstPlace in particle_common.hlsli.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PlaceRow
+        {
+            public Vector3 Position;       public uint Begin;               // where its particles sit in the frame's emission
+            public Quaternion Rotation;
+            public Vector3 Velocity;       public uint End;                 // what they inherit (InheritVelocity × what threw them)
         }
 
         /// <summary>Everything the system keeps per emitter. The component itself only holds authored data.</summary>
@@ -117,6 +126,13 @@ namespace Freefall.Graphics
             public Vector3 Velocity;     // smoothed, m/s: a flame leans from it, a trail widens the bounds
             public Vector3 Lean;         // the spring a followed flame leans by (m/s of wind), and its rate
             public Vector3 LeanRate;
+
+            // Bursts at places of their own (BurstAt): the box round the places whose particles may still live and until
+            // when (the system's clock), and until when what it let go at its own place may (the box leaves it out after)
+            public Vector3 PlaceMin, PlaceMax;
+            public double PlaceUntil = -1.0, OwnUntil = -1.0;
+            public float PlaceSpeed;     // the fastest velocity given at those places (|x|+|y|+|z|): they drift that far
+            public List<ParticleEmitter.Place> SparePlaces = [];
         }
 
         // The lean spring of a followed flame: about 1.6 swings a second, a third of critical damping,
@@ -127,6 +143,9 @@ namespace Freefall.Graphics
         private readonly List<Entry> _entries = [];
         private EmitterRow[] _rows = new EmitterRow[64];
         private int _rowCount;
+        private PlaceRow[] _placeRows = new PlaceRow[64];
+        private int _placeCount;
+        private double _clock;            // seconds of particle time (Time.Delta summed): when places' particles have died
         private readonly int[] _modeCount = new int[RenderModeCount];
         private bool _anyDepthCollision;
         private bool _anyVolumetric;     // some Lit emitter is Volumetric: the near fog volume takes its particles
@@ -143,6 +162,7 @@ namespace Freefall.Graphics
 
         // GPU
         private StreamingBuffer<EmitterRow>? _emitters;
+        private StreamingBuffer<PlaceRow>? _places;
         private StreamingBuffer<uint>? _chunkMap;
         private GraphicsBuffer? _core;
         private GraphicsBuffer? _visual;
@@ -159,7 +179,7 @@ namespace Freefall.Graphics
             public Matrix4x4 CollisionViewProjection;   // the one the depth G-buffer was drawn with
             public Matrix4x4 ShelterViewProjection;     // SkyCapture.Shelter: world → the top-down capture
             public uint ShelterDepth, ShelterSlice, TerrainPages; public float TerrainMaxHeight;
-            public Vector3 TerrainOrigin; public float _pad0;
+            public Vector3 TerrainOrigin; public uint BurstPlaces;    // StructuredBuffer<BurstPlace>: this frame's places (BurstAt)
             public Vector2 TerrainSize; public Vector2 _pad1;
         }
 
@@ -392,6 +412,8 @@ namespace Freefall.Graphics
             Array.Clear(_modeCount);
 
             float dt = (float)Time.Delta;
+            _clock += dt;
+            _placeCount = 0;
             for (int i = 0; i < count; i++)
             {
                 var entry = _entries[i];
@@ -508,6 +530,46 @@ namespace Freefall.Graphics
             // measured; only the share FollowEmitter does not already carry them by
             float inheritShare = Math.Clamp(e.InheritVelocity, 0f, 1f) * (1f - follow);
             var inherit = inheritShare > 0f ? (e.Velocity ?? entry.Velocity) * inheritShare : Vector3.Zero;
+
+            // Bursts at places of their own (ParticleEmitter.BurstAt): after what it lets go where it stands, each place's
+            // run of the frame's emission, with the place's turn and velocity. The bounds grow over the places whose
+            // particles may still live (and over its own place while what it let go there may)
+            float placeLife = lifetime * (1f + lifeRandom);
+            if (emit > 0) entry.OwnUntil = _clock + placeLife;
+            uint places = 0;
+            var taken = e.TakePlaces(entry.SparePlaces);
+            if (taken != null)
+            {
+                int first = _placeCount;
+                float placeInherit = Math.Clamp(e.InheritVelocity, 0f, 1f);
+                for (int k = 0; k < taken.Count && k < 255 && emit < capacity; k++)
+                {
+                    var place = taken[k];
+                    uint end = (uint)Math.Min((long)capacity, (long)emit + place.Count);
+                    if (_placeCount == _placeRows.Length) Array.Resize(ref _placeRows, _placeRows.Length * 2);
+                    var velocity = place.Velocity * placeInherit;
+                    _placeRows[_placeCount++] = new PlaceRow
+                    {
+                        Position = place.Position, Begin = emit, Rotation = place.Rotation, Velocity = velocity, End = end,
+                    };
+                    float placeSpeed = MathF.Abs(velocity.X) + MathF.Abs(velocity.Y) + MathF.Abs(velocity.Z);
+                    if (entry.PlaceUntil < _clock)
+                    {
+                        entry.PlaceMin = entry.PlaceMax = place.Position;
+                        entry.PlaceSpeed = placeSpeed;
+                    }
+                    else
+                    {
+                        entry.PlaceMin = Vector3.Min(entry.PlaceMin, place.Position);
+                        entry.PlaceMax = Vector3.Max(entry.PlaceMax, place.Position);
+                        entry.PlaceSpeed = MathF.Max(entry.PlaceSpeed, placeSpeed);
+                    }
+                    entry.PlaceUntil = _clock + placeLife;
+                    emit = end;
+                }
+                if (_placeCount > first) places = (uint)first | ((uint)(_placeCount - first) << 24);
+                entry.SparePlaces = taken;   // emptied and handed back at the next take
+            }
 
             // The wind a sprite leans in. One carried along leans back from the way it goes, but not at
             // once and not rigidly: the lean is a damped spring, a little late when the carrier sets off
@@ -645,14 +707,31 @@ namespace Freefall.Graphics
                 PyroFire = MathF.Max(0f, e.PyroFire),
                 PyroTemperature = Math.Clamp(e.PyroTemperature, 1000f, 15000f),
                 Inherit = inherit,
+                Places = places,
             };
+
+            // Places whose particles may still live: the bounds take in their box (and its own place while what it let go
+            // there may live), and how far what they were given carries them
+            if (entry.PlaceUntil >= _clock && e.Shape is not (EmissionShape.Surf or EmissionShape.Ground))
+            {
+                var lo = entry.PlaceMin;
+                var hi = entry.PlaceMax;
+                if (entry.OwnUntil >= _clock)
+                {
+                    lo = Vector3.Min(lo, position);
+                    hi = Vector3.Max(hi, position);
+                }
+                var half = (hi - lo) * 0.5f;
+                row.BoundsCenter = (lo + hi) * 0.5f + e.Gravity * (0.25f * life * life);
+                row.BoundsRadius += half.X + half.Y + half.Z + entry.PlaceSpeed * life;
+            }
 
             if (capacity > 0)
                 entry.Cursor = (entry.Cursor + emit) % capacity;
 
             // Disabled for longer than its particles live (and nothing of another emitter's left to clear): this row,
             // which emits nothing, stands until it is enabled again
-            entry.OutFor = e.Enabled || burst > 0 ? 0f : entry.OutFor + dt;
+            entry.OutFor = e.Enabled || burst > 0 || places != 0 ? 0f : entry.OutFor + dt;
             entry.Asleep = !e.Enabled && !entry.Reset && entry.OutFor > life + 0.5f;
         }
 
@@ -690,6 +769,7 @@ namespace Freefall.Graphics
             }
 
             _emitters!.BulkWrite(_rows.AsSpan(0, _rowCount));
+            _places!.BulkWrite(_placeRows.AsSpan(0, Math.Max(1, _placeCount)));
             _chunkMap!.Upload();
 
             _uploadedSerial = _gatherSerial;
@@ -717,6 +797,7 @@ namespace Freefall.Graphics
                     _frameConstants[i] = GraphicsBuffer.CreateConstantBuffer<FrameData>();
 
                 _emitters = new StreamingBuffer<EmitterRow>(device, 64);
+                _places = new StreamingBuffer<PlaceRow>(device, 64);
                 _heaps = [device.SrvHeap];
             }
 
@@ -850,6 +931,7 @@ namespace Freefall.Graphics
                         TerrainMaxHeight = terrain.MaxHeight,
                         TerrainOrigin = terrain.Origin,
                         TerrainSize = terrain.Size,
+                        BurstPlaces = _places!.SrvIndex,
                     };
                 }
             }
