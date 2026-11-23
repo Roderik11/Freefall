@@ -4,10 +4,19 @@
 #pragma kernel CSHorizontalFFT
 #pragma kernel CSVerticalFFT
 #pragma kernel CSAssembleMaps
+#pragma kernel CSClearTallies
 
 #define PI 3.14159265358979323846
 #define SIZE 512
 #define LOG_SIZE 9
+
+// The whitecap band's tallies, read back every frame (C# OceanFFT.ReadTallies): how squeezed its crests are (1 − J in
+// SQUEEZE_BINS bins of SQUEEZE_STEP from SQUEEZE_FROM) and how much foam lies on it (FOAM_BINS bins over 0..1)
+#define SQUEEZE_BINS 128
+#define SQUEEZE_FROM -1.2
+#define SQUEEZE_STEP 0.025
+#define FOAM_BINS 16
+#define TALLIES (SQUEEZE_BINS + FOAM_BINS)
 
 cbuffer PushConstants : register(b3)
 {
@@ -17,6 +26,7 @@ cbuffer PushConstants : register(b3)
     uint OceanConstantsIdx;    // StructuredBuffer<OceanConstants>
     uint DisplacementIdx;      // RWTexture2DArray<float4> — output displacement + foam
     uint SlopeIdx;             // RWTexture2DArray<float4> — output slope moments (sx, sz, sx², sz²)
+    uint WhitecapTalliesIdx;   // RWStructuredBuffer<uint> — the whitecap band's tallies (TALLIES)
 };
 
 struct OceanConstants
@@ -38,7 +48,10 @@ struct OceanConstants
     uint NumBands;
     uint LengthScalesSRV;
     uint NoWhitecapBands;  // bit per band whose crests make no foam (a swell from afar); 0 = every band foams
-    uint _pad1;
+    uint WhitecapBand;     // the band whose whitecaps follow the wind (+1), tallied; 0 = none (FoamBias for every band)
+    float CapSqueeze;      // its crests whiten past this squeeze (1 − J): the level a share of them reach (C# OceanFFT)
+    float CapSpread;       // the spread of its squeeze; 0 = not tallied yet (FoamBias then)
+    float _pad2;
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -141,14 +154,32 @@ float4 Permute(float4 data, float3 id)
     return data * (1.0f - 2.0f * ((id.x + id.y) % 2));
 }
 
+groupshared uint gsTallies[TALLIES];
+
+// Empties the tallies before CSAssembleMaps counts this frame's
+[numthreads(64, 1, 1)]
+void CSClearTallies(uint3 id : SV_DispatchThreadID)
+{
+    RWStructuredBuffer<uint> tallies = ResourceDescriptorHeap[WhitecapTalliesIdx];
+    if (id.x < TALLIES) tallies[id.x] = 0;
+}
+
 [numthreads(8, 8, 1)]
-void CSAssembleMaps(uint3 id : SV_DispatchThreadID)
+void CSAssembleMaps(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 {
     RWTexture2DArray<float4> spectrumTex = ResourceDescriptorHeap[SpectrumIdx];
     RWTexture2DArray<float4> displacementTex = ResourceDescriptorHeap[DisplacementIdx];
     RWTexture2DArray<float4> slopeTex = ResourceDescriptorHeap[SlopeIdx];
     StructuredBuffer<OceanConstants> constants = ResourceDescriptorHeap[OceanConstantsIdx];
     OceanConstants oc = constants[0];
+
+    // The whitecap band's tallies are counted in the group first, then added to the buffer
+    bool tally = oc.WhitecapBand != 0 && WhitecapTalliesIdx != 0;
+    if (tally)
+    {
+        for (uint t = gi; t < TALLIES; t += 64) gsTallies[t] = 0;
+        GroupMemoryBarrierWithGroupSync();
+    }
 
     for (int i = 0; i < (int)oc.NumBands; ++i)
     {
@@ -180,18 +211,36 @@ void CSAssembleMaps(uint3 id : SV_DispatchThreadID)
         foam *= exp(-oc.FoamDecayRate * foamStep);
         foam = saturate(foam);
 
-        // Whitecaps where the crest is squeezed: J under FoamBias - FoamThreshold, more the deeper. A band that makes no
-        // whitecaps of its own (NoWhitecapBands) stores how squeezed its crests are right now instead (1 - J): ocean.fx
-        // lights those crests up inside the whitecaps of the band that does, as their structure
+        // Whitecaps where the crest is squeezed. A band that makes no whitecaps of its own (NoWhitecapBands) stores how
+        // squeezed its crests are right now instead (1 - J): ocean.fx lights those crests up inside the whitecaps of the
+        // band that does, as their structure
+        float squeeze = 1.0 - jacobian;
         if (((oc.NoWhitecapBands >> i) & 1u) != 0)
         {
-            foam = saturate(1.0 - jacobian);
+            foam = saturate(squeeze);
+        }
+        else if ((uint)i + 1 == oc.WhitecapBand && oc.CapSpread > 0.0)
+        {
+            // The wind's whitecaps (since 2026-11-23): the crests squeezed past the level that the share the wind breaks
+            // reach (CapSqueeze, from this band's own tallies), more the further past, in the band's own spread. A calm
+            // sea's whitecaps are as white as a storm's, only fewer and smaller
+            float past = squeeze - oc.CapSqueeze;
+            if (past > 0.0)
+                foam += oc.FoamAdd * (past / oc.CapSpread) * foamStep;
         }
         else
         {
+            // Authored seas: J under FoamBias - FoamThreshold, more the deeper
             float biasedJacobian = max(0.0f, -(jacobian - oc.FoamBias));
             if (biasedJacobian > oc.FoamThreshold)
                 foam += oc.FoamAdd * biasedJacobian * foamStep;
+        }
+
+        if (tally && (uint)i + 1 == oc.WhitecapBand)
+        {
+            int bin = clamp((int)floor((squeeze - SQUEEZE_FROM) / SQUEEZE_STEP), 0, SQUEEZE_BINS - 1);
+            InterlockedAdd(gsTallies[bin], 1);
+            InterlockedAdd(gsTallies[SQUEEZE_BINS + min((uint)(saturate(foam) * FOAM_BINS), FOAM_BINS - 1)], 1);
         }
 
         // Write output
@@ -199,5 +248,13 @@ void CSAssembleMaps(uint3 id : SV_DispatchThreadID)
         // Slope moments: the mip chain averages all four, so a texel of any mip holds the mean slope and the mean
         // squared slope of the waves it covers: their variance (E[s²] − E[s]²) is the roughness a pixel sees there
         slopeTex[uint3(id.xy, i)] = float4(slopes, slopes * slopes);
+    }
+
+    if (tally)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        RWStructuredBuffer<uint> tallies = ResourceDescriptorHeap[WhitecapTalliesIdx];
+        for (uint t = gi; t < TALLIES; t += 64)
+            if (gsTallies[t] != 0) InterlockedAdd(tallies[t], gsTallies[t]);
     }
 }

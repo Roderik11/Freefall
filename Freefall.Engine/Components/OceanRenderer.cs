@@ -168,14 +168,22 @@ namespace Freefall.Components
          Higher values delay visible looping")]
         public float RepeatTime = 200.0f;
 
-        // Whitecaps: foam where a crest of the whitecap band (WhitecapBand) is squeezed (the Jacobian J of the displacement)
-        // under FoamBias − FoamThreshold; the finer bands' crests give it its structure (ocean.fx). The defaults
-        // (2026-10-18, tuned by eye against a storm reference with WindSea.StormWaveScale 2): calm and moderate seas stay
-        // clean (their crests barely squeeze), a storm's taller crests foam all over and leave trails.
+        // Whitecaps: foam where a crest of the whitecap band (WhitecapBand) is squeezed (the Jacobian J of the displacement);
+        // the finer bands' crests give it its structure (ocean.fx). With a wind sea, since 2026-11-23, as much of the sea as
+        // the wind whitens (Whitecaps, Monahan's measured cover), the crests that whiten picked by how squeezed they are
+        // (OceanFFT's tallies); authored seas foam under FoamBias − FoamThreshold (tuned by eye 2026-10-18 against a storm
+        // reference with WindSea.StormWaveScale 2, when the wind's whitecaps hung on the crests' steepness too).
         [Category("Foam")]
+        [ValueRange(0f, 3f)]
+        [Description(@"How much of the sea the wind's whitecaps cover, as a share of what is measured at sea (Monahan and
+         O'Muircheartaigh 1980: 3.84e-6 × wind^3.41): 1 = as measured, under 0.1 % at 5 m/s, 0.3 % at 7, 1 % at 10,
+         3 % at 14, 7 % at 18, 22 % at 25 m/s. Which crests whiten is the sea's own: the most squeezed. With a wind sea only;
+         an authored sea foams by Foam Bias")]
+        public float Whitecaps = 1f;
+
         [ValueRange(0f, 2f)]
-        [Description(@"Whitecaps form where a crest is squeezed below this Jacobian (minus the threshold).
-         Higher = more crests foam, at lighter winds")]
+        [Description(@"An authored sea's whitecaps (no wind bands) form where a crest is squeezed below this Jacobian (minus
+         the threshold). Higher = more crests foam. A wind sea's whitecaps follow the wind (Whitecaps)")]
         public float FoamBias = 0.82f;
 
         [ValueRange(0f, 0.1f)]
@@ -185,14 +193,31 @@ namespace Freefall.Components
         public float FoamDecayRate = 0.012f;
 
         [ValueRange(0f, 1f)]
-        [Description(@"Minimum Jacobian deviation required before any foam is added.
-         Acts as a noise gate to suppress faint foam")]
+        [Description(@"An authored sea's noise gate: how far under Foam Bias the Jacobian must be before any foam is added")]
         public float FoamThreshold = 0.02f;
 
         [ValueRange(0f, 1f)]
-        [Description(@"Amount of foam injected per frame when the Jacobian exceeds the threshold.
-         Higher values create thicker, more opaque foam")]
+        [Description(@"Amount of foam injected per frame (at 60 fps) on a whitening crest, the more the further it is
+         squeezed past the level (in the band's own spread for the wind's whitecaps, in Jacobian for an authored sea).
+         Higher = whitecaps turn solid sooner")]
         public float FoamAdd = 0.1f;
+
+        /// <summary>
+        /// The share of the sea the wind's whitecaps cover at this wind (m/s), before <see cref="Whitecaps"/>: Monahan and
+        /// O'Muircheartaigh (1980), W = 3.84·10⁻⁶ U^3.41, capped at a half.
+        /// </summary>
+        public static float MonahanCover(float wind) =>
+            wind <= 0f ? 0f : MathF.Min(3.84e-6f * MathF.Pow(wind, 3.41f), 0.5f);
+
+        /// <summary>The share of the sea the wind's whitecaps cover as last measured (−1 before; see OceanFFT).</summary>
+        public float WhitecapCover => _oceanFFT?.WhitecapCover ?? -1f;
+
+        /// <summary>The share they are steered to cover now: <see cref="MonahanCover"/> of the wind × <see cref="Whitecaps"/>.</summary>
+        [Reflection.DontSerialize]
+        public float WhitecapsWanted { get; private set; }
+
+        /// <summary>The share of the whitecap band's crests that whiten, as steered (see OceanFFT).</summary>
+        public float CrestShare => _oceanFFT?.CrestShare ?? 0f;
 
         [Category("Shore")]
         [ValueRange(1f, 100f)]
@@ -1010,9 +1035,14 @@ namespace Freefall.Components
                 _appliedDepth = Depth;
             }
 
-            // Push runtime-tweakable params to OceanFFT each frame
+            // Push runtime-tweakable params to OceanFFT each frame. The whitecaps follow the wind of the moment (whitecaps
+            // come and go with it in minutes; the sea it raises trails it by hours: SeaState), its steady part: the
+            // gusts' are too brief
+            int capBand = WhitecapBand();
+            var wind = Wind.Current;
+            WhitecapsWanted = capBand >= 0 ? MonahanCover(MathF.Sqrt(wind.X * wind.X + wind.Z * wind.Z)) * Whitecaps : 0f;
             _oceanFFT.UpdateParams(Depth, FoamBias, FoamDecayRate, FoamThreshold, FoamAdd,
-                new Vector2(Choppiness, Choppiness), NoWhitecapBands());
+                new Vector2(Choppiness, Choppiness), NoWhitecapBands(), capBand, WhitecapsWanted);
 
             // Update tile scales buffer (in case LengthScale changed)
             UpdateTileScalesBuffer();

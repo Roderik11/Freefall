@@ -4,8 +4,9 @@ using System.Numerics;
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// The sea the weather has raised, which the ocean's wind bands, its whitecaps and the surf it carries to the shore
-    /// read (OceanRenderer), in place of the wind itself:
+    /// The sea the weather has raised, which the ocean's wind bands, the band its whitecaps show on and the surf it
+    /// carries to the shore read (OceanRenderer), in place of the wind itself (how much of the sea whitens follows the
+    /// wind of the moment, <see cref="Wind.Current"/>: OceanRenderer.Whitecaps):
     ///   • the wind sea's wind: the wind as the waves have taken it up. Under a <see cref="Assets.Climate"/> it trails the
     ///     wind, building over a couple of game hours and dying down over several (<see cref="Assets.Climate.SeaRises"/>,
     ///     <see cref="Assets.Climate.SeaFalls"/>), its heading trailing the wind's; a held preset or a zone says its own

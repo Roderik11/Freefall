@@ -25,7 +25,7 @@ namespace Freefall.Graphics
 
         // Cached kernel indices
         private int _kInitSpectrum, _kPackConjugate, _kEvolveSpectrum;
-        private int _kHorizontalFFT, _kVerticalFFT, _kAssembleMaps;
+        private int _kHorizontalFFT, _kVerticalFFT, _kAssembleMaps, _kClearTallies;
         private int _kDownsample;
         private int _kGenerateNoise;
 
@@ -110,7 +110,10 @@ namespace Freefall.Graphics
             public uint NumBands;
             public uint LengthScalesSRV;  // bindless SRV to uint[] buffer
             public uint NoWhitecapBands;  // bit per band whose crests make no foam (a swell); was padding: 0 = all foam
-            public uint _pad1;
+            public uint WhitecapBand;     // the band whose whitecaps follow the wind (+1), tallied; 0 = none
+            public float CapSqueeze;      // its crests whiten past this squeeze (1 − J)
+            public float CapSpread;       // the spread of its squeeze; 0 = not tallied yet (FoamBias then)
+            public float _pad2;
         }
 
         /// <summary>
@@ -136,12 +139,49 @@ namespace Freefall.Graphics
 
         private OceanParams _params;
 
+        // ── The wind's whitecaps (since 2026-11-23) ──
+        // CSAssembleMaps tallies the whitecap band every frame: how squeezed its crests are (1 − J) and how much foam lies
+        // on it. Read back FrameCount frames later, the tallies say what share of the band the foam covers; the share of
+        // crests that whiten is steered so that it covers what the wind wants (Monahan), and their level is the squeeze that
+        // share of the band's crests reach. So the whitecaps follow the wind whatever the waves' steepness (a storm's sea
+        // grown long is less steep than one only grown tall), the choppiness or the foam's lifetime.
+        // ocean_fft.hlsl's tallies: SQUEEZE_BINS of SQUEEZE_STEP from SQUEEZE_FROM, then FOAM_BINS over 0..1
+        private const int SqueezeBins = 128, FoamBins = 16, Tallies = SqueezeBins + FoamBins;
+        private const float SqueezeFrom = -1.2f, SqueezeStep = 0.025f;
+        private const int TallyFrames = 3;
+        // Foam this thick counts as covering the sea (bins of 1/16: from 0.5)
+        private const int CoveringBin = FoamBins / 2;
+        // How fast the share of crests that whiten follows the cover wanted (in e-folds a second, at most one an
+        // update): slower than the foam's life and the crests' passing, or it chases the wave groups
+        private const float ShareGain = 0.3f;
+        private GraphicsBuffer? _tallies;
+        private readonly GraphicsBuffer?[] _tallyReadback = new GraphicsBuffer?[TallyFrames];
+        private readonly int[] _talliedBand = { -1, -1, -1 };   // the band each slot holds tallies of; −1 = none in flight
+        private int _capBand = -1;
+        private float _wantedCover;
+        private float _crestShare = -1f;                         // < 0: not steered yet
+        private float _capSqueeze, _capSpread;
+        private float _measuredCover = -1f;
+
+        /// <summary>The share of the wind sea the whitecaps cover now (foam of half thickness and more on the whitecap
+        /// band), as last read back; −1 until the first reading.</summary>
+        public float WhitecapCover => _measuredCover;
+
+        /// <summary>The share of the whitecap band's crests that whiten, as steered toward the cover wanted.</summary>
+        public float CrestShare => MathF.Max(_crestShare, 0f);
+
+        /// <summary>The squeeze (1 − J) past which the whitecap band's crests whiten, and the spread of its squeeze.</summary>
+        public float CapSqueeze => _capSqueeze;
+        public float CapSpread => _capSpread;
+
         /// <summary>
         /// Update mutable runtime parameters — called each frame before dispatch.
         /// Constants-buffer values (depth, foam, choppiness) take effect immediately.
+        ///   whitecapBand: the band whose whitecaps follow the wind (−1: none, every band foams by FoamBias);
+        ///   whitecapCover: the share of the sea its whitecaps should cover (0..1)
         /// </summary>
         public void UpdateParams(float depth, float foamBias, float foamDecayRate,
-            float foamThreshold, float foamAdd, Vector2 lambda, uint noWhitecapBands)
+            float foamThreshold, float foamAdd, Vector2 lambda, uint noWhitecapBands, int whitecapBand = -1, float whitecapCover = 0f)
         {
             _params.Depth = depth;
             _params.FoamBias = foamBias;
@@ -150,6 +190,79 @@ namespace Freefall.Graphics
             _params.FoamAdd = foamAdd;
             _params.Lambda = lambda;
             _params.NoWhitecapBands = noWhitecapBands;
+            if (whitecapBand != _capBand)
+            {
+                // Another band's tallies say nothing of this one's: its level and spread are measured anew
+                _capBand = whitecapBand;
+                _capSpread = 0f;
+                _measuredCover = -1f;
+            }
+            _wantedCover = Math.Clamp(whitecapCover, 0f, 1f);
+        }
+
+        // The tallies of a frame (slot), read back: the whitecap band's squeeze and foam
+        private unsafe void ReadTallies(uint* t, float dt)
+        {
+            long total = 0;
+            double sum = 0, sum2 = 0;
+            for (int b = 0; b < SqueezeBins; b++)
+            {
+                double s = SqueezeFrom + (b + 0.5) * SqueezeStep;
+                total += t[b];
+                sum += t[b] * s;
+                sum2 += t[b] * s * s;
+            }
+            if (total == 0) return;
+            double mean = sum / total;
+            float spread = (float)Math.Sqrt(Math.Max(sum2 / total - mean * mean, 1e-8));
+
+            long foamTotal = 0, covered = 0;
+            for (int b = 0; b < FoamBins; b++)
+            {
+                foamTotal += t[SqueezeBins + b];
+                if (b >= CoveringBin) covered += t[SqueezeBins + b];
+            }
+            float cover = foamTotal > 0 ? (float)covered / foamTotal : 0f;
+
+            // The share of crests that whiten, steered toward the cover wanted (in e-folds of the ratio, so a sea a tenth
+            // as white as wanted catches up as fast as one ten times too white). It starts at a third of the cover: the
+            // foam lies behind the crests that make it for longer than they stay squeezed
+            bool first = _capSpread <= 0f;
+            float wanted = _wantedCover;
+            if (wanted <= 1e-6f)
+                _crestShare = 0f;
+            else
+            {
+                if (_crestShare <= 0f) _crestShare = wanted / 3f;
+                float ratio = wanted / MathF.Max(cover, wanted * 0.05f);
+                float step = Math.Clamp(MathF.Log(ratio) * ShareGain * dt, -1f, 1f);
+                _crestShare = Math.Clamp(_crestShare * MathF.Exp(step), 1e-5f, 0.5f);
+            }
+
+            // The squeeze that share of the crests reach: counted down from the most squeezed, spread evenly in a bin
+            float level = 10f;
+            if (_crestShare > 0f)
+            {
+                double target = _crestShare * (double)total;
+                long above = 0;
+                level = SqueezeFrom;
+                for (int b = SqueezeBins - 1; b >= 0; b--)
+                {
+                    if (above + t[b] >= target && t[b] > 0)
+                    {
+                        float inside = (float)((target - above) / t[b]);
+                        level = SqueezeFrom + (b + 1 - inside) * SqueezeStep;
+                        break;
+                    }
+                    above += t[b];
+                }
+            }
+
+            // Smoothed over about half a second: one frame's tallies of a tile vary with the wave groups in it
+            float ease = first || _crestShare <= 0f ? 1f : 1f - MathF.Exp(-dt / 0.5f);
+            _capSqueeze += (level - _capSqueeze) * ease;
+            _capSpread += (spread - _capSpread) * ease;
+            _measuredCover = _measuredCover < 0f ? cover : _measuredCover + (cover - _measuredCover) * (1f - MathF.Exp(-dt / 2f));
         }
 
         /// <summary>
@@ -204,6 +317,7 @@ namespace Freefall.Graphics
             _kHorizontalFFT = _fftShader.FindKernel("CSHorizontalFFT");
             _kVerticalFFT = _fftShader.FindKernel("CSVerticalFFT");
             _kAssembleMaps = _fftShader.FindKernel("CSAssembleMaps");
+            _kClearTallies = _fftShader.FindKernel("CSClearTallies");
 
             // Mip downsample shader
             _mipShader = new ComputeShader("ocean_mipgen.hlsl");
@@ -346,6 +460,11 @@ namespace Freefall.Graphics
 
             // Constants: upload buffer with SRV (HLSL reads as StructuredBuffer<OceanConstants>)
             _constantsBuffer = GraphicsBuffer.CreateUpload<OceanConstants>(1, mapped: true);
+
+            // The whitecap band's tallies and their readbacks
+            _tallies = GraphicsBuffer.CreateStructured<uint>(Tallies, uav: true);
+            for (int i = 0; i < TallyFrames; i++)
+                _tallyReadback[i] = GraphicsBuffer.CreateReadback<uint>(Tallies);
         }
 
         private unsafe void UpdateConstants(float frameTime, float deltaTime)
@@ -369,6 +488,9 @@ namespace Freefall.Graphics
                 NumBands = (uint)_numBands,
                 LengthScalesSRV = _lengthScalesBuffer!.SrvIndex,
                 NoWhitecapBands = _params.NoWhitecapBands,
+                WhitecapBand = _capBand >= 0 && _capBand < _numBands ? (uint)(_capBand + 1) : 0u,
+                CapSqueeze = _capSqueeze,
+                CapSpread = _capSpread,
             };
             *_constantsBuffer!.WritePtr<OceanConstants>() = constants;
         }
@@ -392,6 +514,7 @@ namespace Freefall.Graphics
             _fftShader.SetPushConstant("OceanConstants", _constantsBuffer.SrvIndex);
             _fftShader.SetPushConstant("Displacement", _displacementUAV);
             _fftShader.SetPushConstant("Slope", _slopeUAV);
+            _fftShader.SetPushConstant("WhitecapTallies", _tallies?.UavIndex ?? 0u);
         }
 
         /// <summary>
@@ -478,9 +601,15 @@ namespace Freefall.Graphics
         /// <summary>
         /// Per-frame update: evolve spectrum → FFT → assemble maps.
         /// </summary>
-        public void Update(ID3D12GraphicsCommandList cmd, float frameTime, float deltaTime)
+        public unsafe void Update(ID3D12GraphicsCommandList cmd, float frameTime, float deltaTime)
         {
             if (!_initialized || !_spectrumInitialized) return;
+
+            // The tallies this slot took TallyFrames frames ago, if they are of the band that whitens now
+            int slot = Engine.FrameIndex % TallyFrames;
+            if (_talliedBand[slot] >= 0 && _talliedBand[slot] == _capBand && _tallyReadback[slot] is { } readback)
+                ReadTallies(readback.ReadPtr<uint>(), deltaTime);
+            _talliedBand[slot] = -1;
 
             UpdateConstants(frameTime, deltaTime);
             BindSharedPushConstants();
@@ -507,10 +636,23 @@ namespace Freefall.Graphics
             _fftShader.Dispatch(_kVerticalFFT, cmd, 1, (uint)N);
             cmd.ResourceBarrierUnorderedAccessView(_spectrumTex!);
 
-            // 4. Assemble displacement + slope maps
+            // 4. Assemble displacement + slope maps (and tally the whitecap band)
+            bool tally = _capBand >= 0 && _capBand < _numBands && _tallies != null;
+            if (tally)
+            {
+                _tallies!.Transition(cmd, ResourceStates.UnorderedAccess);
+                _fftShader.Dispatch(_kClearTallies, cmd, (uint)(Tallies + 63) / 64);
+                _tallies.UAVBarrier(cmd);
+            }
             _fftShader.Dispatch(_kAssembleMaps, cmd, groups8, groups8);
             cmd.ResourceBarrierUnorderedAccessView(_displacementTex!);
             cmd.ResourceBarrierUnorderedAccessView(_slopeTex!);
+            if (tally)
+            {
+                _tallies!.Transition(cmd, ResourceStates.CopySource);
+                cmd.CopyBufferRegion(_tallyReadback[slot]!.Native, 0, _tallies.Native, 0, (ulong)(Tallies * sizeof(uint)));
+                _talliedBand[slot] = _capBand;
+            }
 
             // 5. Generate mip chain for displacement and slope textures
             GenerateMips(cmd);
@@ -564,6 +706,8 @@ namespace Freefall.Graphics
             _spectrumParamsBuffer?.Dispose();
             _lengthScalesBuffer?.Dispose();
             _constantsBuffer?.Dispose();
+            _tallies?.Dispose();
+            foreach (var r in _tallyReadback) r?.Dispose();
 
             _spectrumShader?.Dispose();
             _fftShader?.Dispose();

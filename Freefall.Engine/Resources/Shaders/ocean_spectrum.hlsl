@@ -54,7 +54,10 @@ struct OceanConstants
     uint NumBands;
     uint LengthScalesSRV;  // bindless SRV to uint[] buffer
     uint NoWhitecapBands;  // (ocean_fft.hlsl)
-    uint _pad1;
+    uint WhitecapBand;     // (ocean_fft.hlsl)
+    float CapSqueeze;
+    float CapSpread;
+    float _pad2;
 };
 
 // ═══════════════════════════════════════════════════════════════════════
