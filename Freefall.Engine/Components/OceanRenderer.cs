@@ -108,9 +108,30 @@ namespace Freefall.Components
         [ValueRange(1f, 3f)]
         public float StormWaveScale = 2f;
 
+        [Description(@"How much of that growth is the whole sea's, not only its height: 1 = its waves grow as long as
+         they grow tall, as a real storm's sea raised over a larger stretch does (the steepness the wind gives, periods ×
+         the root of it); 0 = only taller at the wind's own wavelengths. At 18 m/s over 100 km that was twice as steep as
+         a real sea (6 m waves 84 m long, every 7 s), and hulls of 18 to 48 m pitched at their own periods in it")]
+        [ValueRange(0f, 1f)]
+        public float StormLength = 1f;
+
         /// <summary>The wind sea's height as a multiple of the real one at this wind</summary>
         public float WaveScaleAt(float windSpeed) =>
             1f + (StormWaveScale - 1f) * Math.Clamp((windSpeed - 5f) / 15f, 0f, 1f);
+
+        /// <summary>
+        /// The wind and fetch the wind sea's spectrum is built from at this wind, and what is left of its growth as height
+        /// alone. Grown in every dimension by g (Froude: lengths × g, periods × √g) a JONSWAP sea is the one a wind √g
+        /// as strong raises over g times the fetch: the same dimensionless fetch, so the same steepness.
+        /// </summary>
+        public void Spectrum(float windSpeed, out float wind, out float fetch, out float heightOnly)
+        {
+            float grow = WaveScaleAt(windSpeed);
+            float longer = 1f + (grow - 1f) * Math.Clamp(StormLength, 0f, 1f);
+            wind = windSpeed * MathF.Sqrt(longer);
+            fetch = Fetch * longer;
+            heightOnly = grow / longer;
+        }
     }
 
     /// <summary>
@@ -664,7 +685,7 @@ namespace Freefall.Components
                 var dir = SeaState.Direction;
                 float shortest = finerWind >= 0 ? Bands[finerWind].LengthScale / 4f : Bands[coarsestWind].LengthScale / 16f;
                 float longest = Bands[coarsestWind].LengthScale;
-                float omega = JonswapPeakOmega(WindSea.Fetch, MathF.Max(SeaState.Strength, 0.5f));
+                float omega = WindSeaPeakOmega();
                 omega = Math.Clamp(omega, MathF.Sqrt(2f * MathF.PI * Gravity / longest), MathF.Sqrt(2f * MathF.PI * Gravity / shortest));
                 bands.Add(new ShoreWarp.Band
                 {
@@ -740,7 +761,7 @@ namespace Freefall.Components
 
             // Deep-water wavelength of the spectrum's peak; each wind band holds from a quarter of the next finer one's
             // tile up to a quarter of its own (the coarsest: everything longer), as BuildSpectrumParams shares them out
-            float omega = JonswapPeakOmega(WindSea.Fetch, MathF.Max(SeaState.Strength, 0.5f));
+            float omega = WindSeaPeakOmega();
             float peak = 2f * MathF.PI * Gravity / (omega * omega);
             for (int r = windBands.Count - 1; r > 0; r--)
                 if (peak < Bands[windBands[r]].LengthScale / 4f)
@@ -779,6 +800,14 @@ namespace Freefall.Components
         }
 
         private const float Gravity = 9.81f;
+
+        // The wind sea's spectral peak (rad/s) as its spectrum is built (WindSea.Spectrum: a storm grown long as well as tall)
+        private float WindSeaPeakOmega()
+        {
+            WindSea.Spectrum(MathF.Max(SeaState.Strength, 0.5f), out float wind, out float fetch, out _);
+            return JonswapPeakOmega(fetch, wind);
+        }
+
         private static float JonswapAlpha(float fetch, float windSpeed) =>
             0.076f * MathF.Pow(Gravity * DevelopedFetch(fetch, windSpeed) / windSpeed / windSpeed, -0.22f);
         private static float JonswapPeakOmega(float fetch, float windSpeed) =>
@@ -817,7 +846,7 @@ namespace Freefall.Components
             float windSpeed = MathF.Max(SeaState.Strength, 0.5f);
             var dir = SeaState.Direction;
             float heading = dir.LengthSquared() > 0f ? MathF.Atan2(dir.Z, dir.X) : 0f;
-            float stormScale = WindSea.WaveScaleAt(windSpeed);
+            WindSea.Spectrum(windSpeed, out float seaWind, out float seaFetch, out float heightOnly);
 
             // The wind bands' share of the wavelengths, coarsest first
             var windBands = new List<int>();
@@ -842,13 +871,14 @@ namespace Freefall.Components
                     var sea = WindSea;
                     spectrums[i * 2] = new OceanFFT.SpectrumParameters
                     {
-                        // Storms stand taller than physics (WindSea.StormWaveScale): wave height × that, energy × its square
-                        Scale = sea.Scale * stormScale * stormScale,
+                        // Storms stand taller than physics (WindSea.StormWaveScale): the whole sea grown by StormLength's
+                        // share of it (a stronger wind over a longer fetch), the rest as height alone (energy × its square)
+                        Scale = sea.Scale * heightOnly * heightOnly,
                         Angle = heading + BandAngles[i % BandAngles.Length],
                         SpreadBlend = sea.SpreadBlend,
                         Swell = sea.Swell,
-                        Alpha = JonswapAlpha(sea.Fetch, windSpeed),
-                        PeakOmega = JonswapPeakOmega(sea.Fetch, windSpeed),
+                        Alpha = JonswapAlpha(seaFetch, seaWind),
+                        PeakOmega = JonswapPeakOmega(seaFetch, seaWind),
                         Gamma = sea.PeakEnhancement,
                         ShortWavesFade = sea.ShortWavesFade,
                         LowCutoff = low,
