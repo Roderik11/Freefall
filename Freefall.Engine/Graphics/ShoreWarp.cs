@@ -46,10 +46,22 @@ namespace Freefall.Graphics
             public int Index;            // the ocean band
             public Vector2 Direction;    // world xz unit vector its waves travel along in deep water
             public float Omega;          // its representative angular frequency (rad/s): the spectrum's peak
+            /// <summary>
+            /// The depth (m) from which the band is warped: deeper, its waves run as the open sea's (the march starts there
+            /// as the plane wave), and the warp is whole from half of it. 0 = where its peak begins to feel the bottom
+            /// (2/k0). The wind sea's coarsest band gives its shortest waves' length (2026-11-23): it holds waves a quarter
+            /// of its peak's length and longer, and is warped as a whole by its peak's shortening. Since storms grew long
+            /// (WindSea.StormLength) an 18 m/s peak of 157 m felt TestWorld's whole 40 m floor, and the band's short waves,
+            /// which feel none of it, were squeezed as much: crests stacked a few metres apart, folding over.
+            /// </summary>
+            public float WarpDepth;
+
+            /// <summary>The depth from which the band is warped (<see cref="WarpDepth"/>, at most where its peak feels the bottom).</summary>
+            public float SourceDepth(float k0) => WarpDepth > 0f ? MathF.Min(WarpDepth, 2f / k0) : 2f / k0;
 
             public bool SameAs(Band o) =>
                 Index == o.Index && Vector2.Dot(Direction, o.Direction) > 0.9994f      // 2°
-                && MathF.Abs(Omega - o.Omega) <= 0.02f * o.Omega;
+                && MathF.Abs(Omega - o.Omega) <= 0.02f * o.Omega && WarpDepth == o.WarpDepth;
         }
 
         /// <summary>A baked warp, ready to upload.</summary>
@@ -60,7 +72,37 @@ namespace Freefall.Graphics
             public float[] Warp = Array.Empty<float>();        // slice-major, Size² × (Δu.x, Δu.z, amplitude, hollow m)
             public Half[] Jacobian = Array.Empty<Half>();      // slice-major, Size² × (∂ux/∂x, ∂ux/∂z, ∂uz/∂x, ∂uz/∂z)
             public double Milliseconds;
+            /// <summary>What the surf's pages are marched from (<see cref="BakePage"/>): the waves' travel time over the whole
+            /// terrain at this bake's cells.</summary>
+            public Seeds? Seeds;
         }
+
+        /// <summary>
+        /// The whole terrain's march, kept for the surf's pages (<see cref="SurfPages"/>): a page takes its travel time and
+        /// height, and marches only its coast strip from that travel time, so neighbouring pages, and a page and this coarse
+        /// warp beside it, carry the same waves. Never changed once built (any thread reads it).
+        /// </summary>
+        public sealed class Seeds
+        {
+            public int Size;
+            public float Hx, Hz;
+            public Vector2 Origin;                  // world xz of cell 0
+            public Band[] Bands = Array.Empty<Band>();
+            /// <summary>Per cell: 0 land, 1 beach (the sea mask's reach above the waterline), 2 water, 3 water deeper than
+            /// <see cref="PlainDepth"/> (the bed's detail does not matter there).</summary>
+            public byte[] Class = Array.Empty<byte>();
+            /// <summary>Per slice, per cell: the travel time (s); NaN where the march did not reach.</summary>
+            public float[][] Tau = Array.Empty<float[]>();
+            /// <summary>Per slice, per cell: the wave's height over the open sea's, as this bake gives it (shoaling, the rays'
+            /// crowding, the island's shadow, smooth over a quarter wavelength), and spread a few cells into the land beside
+            /// the sea, where a page's finer water lies. A page takes it as it is: from each page's own rays it was noise at
+            /// fine cells and jumped from page to page, and with the shoaling of the page's own depth unblurred a narrow
+            /// shallow inlet raised breakers the whole terrain's bake never had.</summary>
+            public float[][] Amp = Array.Empty<float[]>();
+        }
+
+        /// <summary>Water deeper than this (m) is plain for the surf: a page over nothing else keeps the coarse warp.</summary>
+        public const float PlainDepth = 25f;
 
         private ID3D12Resource? _warpTex, _jacobianTex;
         private uint _warpSrv, _jacobianSrv;
@@ -110,12 +152,21 @@ namespace Freefall.Graphics
             }
 
             int slices = Math.Min(bands.Length, MaxBands);
+            var seeds = new Seeds
+            {
+                Size = n, Hx = hx, Hz = hz, Origin = origin, Bands = bands[..slices],
+                Class = new byte[count],
+                Tau = new float[slices][], Amp = new float[slices][],
+            };
+            for (int i = 0; i < count; i++)
+                seeds.Class[i] = (byte)(!sea[i] ? 0 : depth[i] <= 0f ? 1 : depth[i] < PlainDepth ? 2 : 3);
             var result = new Result
             {
                 Size = n,
                 Bands = bands[..slices],
                 Warp = new float[count * 4 * MaxBands],
                 Jacobian = new Half[count * 4 * MaxBands],
+                Seeds = seeds,
             };
 
             // Unused slices: no warp
@@ -200,62 +251,34 @@ namespace Freefall.Graphics
         private static float GroupRatio(float kh) =>
             kh > 10f ? 0.5f : 0.5f * (1f + 2f * kh / MathF.Sinh(2f * kh));
 
-        private static void BakeBand(Result r, int slice, Band band, int n, float hx, float hz, Vector2 origin,
-                                     NativeGrid<float> depth, NativeGrid<bool> sea, NativeGrid<float> borderDist,
-                                     NativeGrid<float> hollow, PriorityQueue<int, float> queue)
+        // Fast marching of a band's travel time over a square grid of n² cells: cells become known in order of arrival time,
+        // each from its known neighbours (first-order upwind). Along with the time each cell takes from where its ray came:
+        // the ray's along-crest coordinate (it keeps it all the way) and the exposure. Cells known at the start (state 2)
+        // are where the march begins: the deep sea and the border (sources), or a page's edge seeded from the whole
+        // terrain's march
+        private sealed class Marcher
         {
-            int count = n * n;
-            float omega = MathF.Max(band.Omega, 0.05f);
-            float k0 = omega * omega / Gravity;
-            float c0 = Gravity / omega;
-            Vector2 dir = band.Direction.LengthSquared() > 1e-6f ? Vector2.Normalize(band.Direction) : Vector2.UnitX;
+            private readonly int _n;
+            private readonly float _hx, _hz;
+            private readonly Vector2 _dir;
+            private readonly NativeGrid<float> _slowness, _tau, _side, _exposure;
+            private readonly NativeGrid<byte> _state;          // 0 far, 1 trial, 2 known
+            private readonly NativeGrid<bool> _source;
+            private readonly PriorityQueue<int, float> _queue;
 
-            // Deep enough that the wave hardly feels the bottom (k0·h ≥ 2: 98% of its deep-water speed): the plane wave
-            // there, and on the terrain's border (past it the seabed is unknown)
-            float sourceDepth = 2f / k0;
-
-            // Per cell: the travel time, the ray's along-crest coordinate where it left the deep sea (the deep heading turned
-            // left, d⊥·x there) and the exposure
-            var dPerp = new Vector2(-dir.Y, dir.X);
-            using var slowness = new NativeGrid<float>(count);
-            using var tau = new NativeGrid<float>(count);
-            using var side = new NativeGrid<float>(count);
-            using var exposure = new NativeGrid<float>(count);
-            using var state = new NativeGrid<byte>(count);          // 0 far, 1 trial, 2 known
-            using var source = new NativeGrid<bool>(count);
-
-            for (int z = 0; z < n; z++)
-            for (int x = 0; x < n; x++)
+            public Marcher(int n, float hx, float hz, Vector2 dir, NativeGrid<float> slowness, NativeGrid<float> tau,
+                           NativeGrid<float> side, NativeGrid<float> exposure, NativeGrid<byte> state, NativeGrid<bool> source,
+                           PriorityQueue<int, float> queue)
             {
-                int i = z * n + x;
-                tau[i] = float.PositiveInfinity;
-                if (!sea[i]) continue;
-                float h = MathF.Max(depth[i], MinDepth);
-                float kh = WaveNumberDepth(omega, h);
-                // Up the beach (the sea mask's reach above the waterline) the warp holds still: the swash there runs on
-                // the phase of the wave arriving at the waterline (ocean.fx)
-                slowness[i] = depth[i] > 0f ? kh / h / omega : 1f / c0;  // 1 / c = k / ω
-
-                bool border = x == 0 || z == 0 || x == n - 1 || z == n - 1;
-                if (depth[i] >= sourceDepth || border)
-                {
-                    var p = origin + new Vector2(x * hx, z * hz);
-                    tau[i] = Vector2.Dot(dir, p) / c0;
-                    side[i] = Vector2.Dot(dPerp, p);
-                    exposure[i] = 1f;
-                    state[i] = 2;
-                    source[i] = true;
-                }
+                _n = n; _hx = hx; _hz = hz; _dir = dir;
+                _slowness = slowness; _tau = tau; _side = side; _exposure = exposure; _state = state; _source = source;
+                _queue = queue;
             }
 
-            // Fast marching: cells become known in order of arrival time, each from its known neighbours (first-order
-            // upwind). Along with the time each cell takes from where its ray came: the ray's along-crest coordinate (it
-            // keeps it all the way) and the exposure
-            queue.Clear();
-
-            bool Relax(int i)
+            private bool Relax(int i)
             {
-                int x = i % n, z = i / n;
+                int n = _n, x = i % n, z = i / n;
+                var tau = _tau; var state = _state;
                 int nxI = -1, nzI = -1;
                 float a = float.PositiveInfinity, b = float.PositiveInfinity;
                 float sx = 0f, sz = 0f;
@@ -265,7 +288,8 @@ namespace Freefall.Graphics
                 if (z < n - 1 && state[i + n] == 2 && tau[i + n] < b) { b = tau[i + n]; nzI = i + n; sz = -1f; }
                 if (nxI < 0 && nzI < 0) return false;
 
-                float s = slowness[i];
+                float hx = _hx, hz = _hz;
+                float s = _slowness[i];
                 float t;
                 float gx = 0f, gz = 0f;
                 bool both = false;
@@ -301,55 +325,110 @@ namespace Freefall.Graphics
 
                 float sideUp = 0f, eUp = 0f;
                 float gl = MathF.Sqrt(gx * gx + gz * gz);
-                float along = gl > 0f ? (gx * dir.X + gz * dir.Y) / gl : 1f;
+                float along = gl > 0f ? (gx * _dir.X + gz * _dir.Y) / gl : 1f;
                 // A ray leaving the deep sea against the wave reaches a lee shore: the island's shadow, where only the swell
                 // that wraps round it arrives (LeeShare of its height; shoreward, as the lee rays run). With none, the
                 // open sea off a lee coast showed the full swell and the beach no surf at all (user, 2026-10-19)
                 float leave = LeeShare + (1f - LeeShare) * Smooth(-0.1f, 0.4f, along);
                 if (nxI >= 0)
                 {
-                    sideUp += wx * side[nxI];
-                    eUp += wx * exposure[nxI] * (source[nxI] ? leave : 1f);
+                    sideUp += wx * _side[nxI];
+                    eUp += wx * _exposure[nxI] * (_source[nxI] ? leave : 1f);
                 }
                 if (nzI >= 0)
                 {
-                    sideUp += wz * side[nzI];
-                    eUp += wz * exposure[nzI] * (source[nzI] ? leave : 1f);
+                    sideUp += wz * _side[nzI];
+                    eUp += wz * _exposure[nzI] * (_source[nzI] ? leave : 1f);
                 }
 
                 tau[i] = t;
-                side[i] = sideUp;
-                exposure[i] = eUp;
+                _side[i] = sideUp;
+                _exposure[i] = eUp;
                 return true;
             }
 
-            void Push(int i)
+            private void Push(int i)
             {
                 if (Relax(i))
                 {
-                    state[i] = 1;
-                    queue.Enqueue(i, tau[i]);
+                    _state[i] = 1;
+                    _queue.Enqueue(i, _tau[i]);
                 }
             }
 
-            // From every known cell to its neighbours in the phase's cells, then march until none is left
-            void PushNeighbours(int i, NativeGrid<bool> allowed)
+            // From every known cell to its neighbours in the phase's cells
+            private void PushNeighbours(int i, NativeGrid<bool> allowed)
             {
-                int x = i % n, z = i / n;
+                int n = _n, x = i % n, z = i / n;
+                var state = _state;
                 if (x > 0 && allowed[i - 1] && state[i - 1] != 2) Push(i - 1);
                 if (x < n - 1 && allowed[i + 1] && state[i + 1] != 2) Push(i + 1);
                 if (z > 0 && allowed[i - n] && state[i - n] != 2) Push(i - n);
                 if (z < n - 1 && allowed[i + n] && state[i + n] != 2) Push(i + n);
             }
-            void March(NativeGrid<bool> allowed)
+
+            /// <summary>March over the allowed cells from every cell known so far, until none is left.</summary>
+            public void March(NativeGrid<bool> allowed)
             {
+                _queue.Clear();
+                int count = _n * _n;
                 for (int i = 0; i < count; i++)
-                    if (state[i] == 2) PushNeighbours(i, allowed);
-                while (queue.TryDequeue(out int i, out float t))
+                    if (_state[i] == 2) PushNeighbours(i, allowed);
+                while (_queue.TryDequeue(out int i, out float t))
                 {
-                    if (state[i] == 2 || t > tau[i]) continue;
-                    state[i] = 2;
+                    if (_state[i] == 2 || t > _tau[i]) continue;
+                    _state[i] = 2;
                     PushNeighbours(i, allowed);
+                }
+            }
+        }
+
+        private static void BakeBand(Result r, int slice, Band band, int n, float hx, float hz, Vector2 origin,
+                                     NativeGrid<float> depth, NativeGrid<bool> sea, NativeGrid<float> borderDist,
+                                     NativeGrid<float> hollow, PriorityQueue<int, float> queue)
+        {
+            int count = n * n;
+            float omega = MathF.Max(band.Omega, 0.05f);
+            float k0 = omega * omega / Gravity;
+            float c0 = Gravity / omega;
+            Vector2 dir = band.Direction.LengthSquared() > 1e-6f ? Vector2.Normalize(band.Direction) : Vector2.UnitX;
+
+            // Deep enough that the wave hardly feels the bottom (k0·h ≥ 2: 98% of its deep-water speed), or for the wind sea
+            // than its shortest waves feel it (Band.WarpDepth): the plane wave there, and on the terrain's border (past it
+            // the seabed is unknown)
+            float sourceDepth = band.SourceDepth(k0);
+
+            // Per cell: the travel time, the ray's along-crest coordinate where it left the deep sea (the deep heading turned
+            // left, d⊥·x there) and the exposure
+            var dPerp = new Vector2(-dir.Y, dir.X);
+            using var slowness = new NativeGrid<float>(count);
+            using var tau = new NativeGrid<float>(count);
+            using var side = new NativeGrid<float>(count);
+            using var exposure = new NativeGrid<float>(count);
+            using var state = new NativeGrid<byte>(count);          // 0 far, 1 trial, 2 known
+            using var source = new NativeGrid<bool>(count);
+
+            for (int z = 0; z < n; z++)
+            for (int x = 0; x < n; x++)
+            {
+                int i = z * n + x;
+                tau[i] = float.PositiveInfinity;
+                if (!sea[i]) continue;
+                float h = MathF.Max(depth[i], MinDepth);
+                float kh = WaveNumberDepth(omega, h);
+                // Up the beach (the sea mask's reach above the waterline) the warp holds still: the swash there runs on
+                // the phase of the wave arriving at the waterline (ocean.fx)
+                slowness[i] = depth[i] > 0f ? kh / h / omega : 1f / c0;  // 1 / c = k / ω
+
+                bool border = x == 0 || z == 0 || x == n - 1 || z == n - 1;
+                if (depth[i] >= sourceDepth || border)
+                {
+                    var p = origin + new Vector2(x * hx, z * hz);
+                    tau[i] = Vector2.Dot(dir, p) / c0;
+                    side[i] = Vector2.Dot(dPerp, p);
+                    exposure[i] = 1f;
+                    state[i] = 2;
+                    source[i] = true;
                 }
             }
 
@@ -364,8 +443,9 @@ namespace Freefall.Graphics
                 water[i] = sea[i] && depth[i] > 0f;
                 beach[i] = sea[i] && !water[i];
             }
-            March(water);
-            March(beach);
+            var marcher = new Marcher(n, hx, hz, dir, slowness, tau, side, exposure, state, source, queue);
+            marcher.March(water);
+            marcher.March(beach);
 
             using var known = new NativeGrid<bool>(count);
             for (int i = 0; i < count; i++) known[i] = sea[i] && state[i] == 2;
@@ -378,6 +458,14 @@ namespace Freefall.Graphics
             SmoothSymmetric(tau, n, known, 2);
             for (int pass = 0; pass < 2; pass++)
                 BoxBlurWide(side, n, known, radius);
+
+            // What the pages take away from the coast and march their coast strip from: this travel time
+            if (r.Seeds is { } seeds && slice < seeds.Tau.Length)
+            {
+                var st = seeds.Tau[slice] = new float[count];
+                for (int i = 0; i < count; i++)
+                    st[i] = known[i] ? tau[i] : float.NaN;
+            }
 
             // The sample position u: along the deep heading as far as the wave would have run in deep water in the same
             // time (c0·τ, exact and smooth), across it where the point is: u = d·c0·τ + d⊥·(d⊥·x). Until 2026-10-19 u was
@@ -431,6 +519,15 @@ namespace Freefall.Graphics
             for (int pass = 0; pass < 3; pass++)
                 BoxBlurWide(amp, n, sea, radius);
 
+            // The pages' height: this one, spread into the land beside the sea (DilateSeed)
+            if (r.Seeds is { } ampSeeds && slice < ampSeeds.Amp.Length)
+            {
+                var sa = ampSeeds.Amp[slice] = new float[count];
+                for (int i = 0; i < count; i++)
+                    sa[i] = known[i] ? amp[i] : float.NaN;
+                DilateSeed(sa, n, 4);
+            }
+
             int o = slice * count * 4;
             for (int z = 0; z < n; z++)
             for (int x = 0; x < n; x++)
@@ -458,6 +555,512 @@ namespace Freefall.Graphics
             DilateIntoLand(r, o, n, sea, state);
 
             DebugDump(r, o, slice, n, hx, hz, origin, k0, dir, sea, exposure, depth);
+        }
+
+        // ── The surf's pages (SurfPages, 2026-11-23) ──
+        // The whole terrain's warp above is 1025² cells at most: 4 m on a 4 km terrain, 16 m on TestWorld's 16 km, where its
+        // stairs showed in the swash's terraces and in the breakers along the shore. Round the camera the surf is baked again
+        // in pages on the terrain's page grid (256 texels a side, level 0 at the height samples' own spacing, each level
+        // twice the last). A page takes the whole terrain's travel time and height as they are, the travel time bicubic, and
+        // marches at its own cells only a strip along the coast (StripCells), from the strip's seaward edge: what a strip
+        // cell gets depends on the strip alone, which the page's margin covers, so pages meet each other and the coarse
+        // warp without a step (ocean_system/overview.md §3f-2).
+
+        /// <summary>Texels a page holds a side, the border round it in its slot, and the margin marched round that.</summary>
+        public const int PageTexels = 256, PageBorder = 4, SlotTexels = PageTexels + 2 * PageBorder, PageMargin = 32;
+
+        /// <summary>One page to bake: where it is and what it is marched from. Every input is never changed once handed out.</summary>
+        public sealed class PageJob
+        {
+            public int Level, Px, Py;
+            public Seeds Seeds = null!;
+            public Assets.TerrainPages Heights = null!;
+            public SeaMask.Result? Mask;
+            public float SeaLevel01, MaxHeight;
+            public Vector2 TerrainSize, Origin;
+        }
+
+        /// <summary>A baked page, ready to upload into its slot (<see cref="SlotTexels"/>² texels, border included).</summary>
+        public sealed class Page
+        {
+            public int Level, Px, Py;
+            public Seeds Seeds = null!;
+            /// <summary>Slice-major, per slice (warped band) SlotTexels² × (lag − <see cref="Base"/>, amplitude, g.x, g.z):
+            /// the warp moves a point only along the band's deep heading d, by the lag; ∂u/∂x = d ⊗ g + d⊥ ⊗ d⊥.</summary>
+            public Half[] Data = Array.Empty<Half>();
+            /// <summary>SlotTexels²: up the beach, how far below the ridge before it a spot lies (m).</summary>
+            public Half[] Hollow = Array.Empty<Half>();
+            /// <summary>Per slice: the lag the page's values are kept relative to (half floats near 0 keep their precision).</summary>
+            public float[] Base = new float[MaxBands];
+            public double Milliseconds;
+        }
+
+        /// <summary>
+        /// Whether a page (with its margin) needs its own surf: it holds a beach, water shallower than <see cref="PlainDepth"/>,
+        /// or land beside deep water. Elsewhere the coarse warp is as good. From the whole terrain's cells.
+        /// </summary>
+        public static bool PageWanted(Seeds seeds, int level, int px, int py, int samples, Vector2 terrainSize)
+        {
+            int n = seeds.Size;
+            float cell0 = terrainSize.X / Math.Max(samples - 1, 1);
+            float span = PageTexels * (1 << level) * cell0, margin = (PageBorder + PageMargin) * (1 << level) * cell0;
+            int x0 = Math.Clamp((int)MathF.Floor((px * span - margin) / seeds.Hx), 0, n - 1);
+            int x1 = Math.Clamp((int)MathF.Ceiling(((px + 1) * span + margin) / seeds.Hx), 0, n - 1);
+            int z0 = Math.Clamp((int)MathF.Floor((py * span - margin) / seeds.Hz), 0, n - 1);
+            int z1 = Math.Clamp((int)MathF.Ceiling(((py + 1) * span + margin) / seeds.Hz), 0, n - 1);
+            bool land = false, deep = false;
+            for (int z = z0; z <= z1; z++)
+                for (int x = x0; x <= x1; x++)
+                {
+                    byte c = seeds.Class[z * n + x];
+                    if (c == 1 || c == 2) return true;
+                    if (c == 0) land = true; else deep = true;
+                    if (land && deep) return true;
+                }
+            return false;
+        }
+
+        /// <summary>The strip along the coast a page marches at its own cells, in the whole terrain's cells (3: 48 m on a 16 km
+        /// terrain, 12 m on a 4 km one). Beyond it the page takes the whole terrain's travel time.</summary>
+        public const float StripCells = 3f;
+
+        // Per cell: how far (m) the nearest cell that is not water lies (land, beach, or ground the sea does not reach); 0 on
+        // those. Two chamfer passes (straight and diagonal steps)
+        private static NativeGrid<float> CoastDistance(int n, float hx, float hz, NativeGrid<bool> sea, NativeGrid<float> depth)
+        {
+            var d = new NativeGrid<float>(n * n);
+            float hd = MathF.Sqrt(hx * hx + hz * hz);
+            for (int i = 0; i < n * n; i++) d[i] = sea[i] && depth[i] > 0f ? float.PositiveInfinity : 0f;
+            for (int z = 0; z < n; z++)
+                for (int x = 0; x < n; x++)
+                {
+                    int i = z * n + x;
+                    float v = d[i];
+                    if (x > 0) v = MathF.Min(v, d[i - 1] + hx);
+                    if (z > 0)
+                    {
+                        v = MathF.Min(v, d[i - n] + hz);
+                        if (x > 0) v = MathF.Min(v, d[i - n - 1] + hd);
+                        if (x < n - 1) v = MathF.Min(v, d[i - n + 1] + hd);
+                    }
+                    d[i] = v;
+                }
+            for (int z = n - 1; z >= 0; z--)
+                for (int x = n - 1; x >= 0; x--)
+                {
+                    int i = z * n + x;
+                    float v = d[i];
+                    if (x < n - 1) v = MathF.Min(v, d[i + 1] + hx);
+                    if (z < n - 1)
+                    {
+                        v = MathF.Min(v, d[i + n] + hz);
+                        if (x < n - 1) v = MathF.Min(v, d[i + n + 1] + hd);
+                        if (x > 0) v = MathF.Min(v, d[i + n - 1] + hd);
+                    }
+                    d[i] = v;
+                }
+            return d;
+        }
+
+        // Catmull-Rom over the 4 × 4 cells round a world point when all of them were reached (its gradient continuous, where
+        // bilinear steps at every cell), else bilinear over those that were
+        private static bool SampleSeedCubic(Seeds sd, float[] field, Vector2 p, out float v)
+        {
+            int n = sd.Size;
+            float fx = (p.X - sd.Origin.X) / sd.Hx, fz = (p.Y - sd.Origin.Y) / sd.Hz;
+            int x1 = (int)MathF.Floor(fx), z1 = (int)MathF.Floor(fz);
+            if (x1 >= 1 && z1 >= 1 && x1 + 2 <= n - 1 && z1 + 2 <= n - 1)
+            {
+                float tx = fx - x1, tz = fz - z1;
+                Span<float> wx = stackalloc float[4], wz = stackalloc float[4];
+                CatmullRom(tx, wx);
+                CatmullRom(tz, wz);
+                float sum = 0f;
+                bool all = true;
+                for (int j = 0; j < 4 && all; j++)
+                {
+                    float row = 0f;
+                    for (int k = 0; k < 4; k++)
+                    {
+                        float f = field[(z1 - 1 + j) * n + x1 - 1 + k];
+                        if (float.IsNaN(f)) { all = false; break; }
+                        row += wx[k] * f;
+                    }
+                    sum += wz[j] * row;
+                }
+                if (all) { v = sum; return true; }
+            }
+            return SampleSeed(sd, field, p, out v);
+        }
+
+        private static void CatmullRom(float t, Span<float> w)
+        {
+            float t2 = t * t, t3 = t2 * t;
+            w[0] = 0.5f * (-t3 + 2f * t2 - t);
+            w[1] = 0.5f * (3f * t3 - 5f * t2 + 2f);
+            w[2] = 0.5f * (-3f * t3 + 4f * t2 + t);
+            w[3] = 0.5f * (t3 - t2);
+        }
+
+        // NaN cells next to valued ones take their mean, a ring a pass
+        private static void DilateSeed(float[] f, int n, int passes)
+        {
+            var next = new float[f.Length];
+            for (int pass = 0; pass < passes; pass++)
+            {
+                Array.Copy(f, next, f.Length);
+                for (int z = 0; z < n; z++)
+                    for (int x = 0; x < n; x++)
+                    {
+                        int i = z * n + x;
+                        if (!float.IsNaN(f[i])) continue;
+                        float sum = 0f; int cnt = 0;
+                        for (int dz = -1; dz <= 1; dz++)
+                            for (int dx = -1; dx <= 1; dx++)
+                            {
+                                int xx = x + dx, zz = z + dz;
+                                if (xx < 0 || zz < 0 || xx >= n || zz >= n) continue;
+                                float v = f[zz * n + xx];
+                                if (!float.IsNaN(v)) { sum += v; cnt++; }
+                            }
+                        if (cnt > 0) next[i] = sum / cnt;
+                    }
+                Array.Copy(next, f, f.Length);
+            }
+        }
+
+        // A field of the whole terrain's march at a world point, bilinear over the cells it reached; false where it reached none
+        private static bool SampleSeed(Seeds sd, float[] field, Vector2 p, out float v)
+        {
+            int n = sd.Size;
+            float fx = Math.Clamp((p.X - sd.Origin.X) / sd.Hx, 0f, n - 1), fz = Math.Clamp((p.Y - sd.Origin.Y) / sd.Hz, 0f, n - 1);
+            int x0 = Math.Min((int)fx, n - 2), z0 = Math.Min((int)fz, n - 2);
+            float tx = fx - x0, tz = fz - z0;
+            float sum = 0f, wsum = 0f;
+            for (int k = 0; k < 4; k++)
+            {
+                int dx = k & 1, dz = k >> 1;
+                float f = field[(z0 + dz) * n + x0 + dx];
+                if (float.IsNaN(f)) continue;
+                float w = (dx == 1 ? tx : 1f - tx) * (dz == 1 ? tz : 1f - tz);
+                sum += w * f; wsum += w;
+            }
+            v = wsum > 1e-4f ? sum / wsum : 0f;
+            return wsum > 1e-4f;
+        }
+
+        /// <summary>Bake one page of the surf (any thread).</summary>
+        public static Page BakePage(PageJob job)
+        {
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            var heights = job.Heights;
+            var seeds = job.Seeds;
+            int res = heights.Resolution;
+            int scale = 1 << job.Level;
+            float hx0 = job.TerrainSize.X / (res - 1), hz0 = job.TerrainSize.Y / (res - 1);
+            float hx = hx0 * scale, hz = hz0 * scale;
+            // The margin marched round the page: at least PageMargin, and the coast strip's width with room to spare (a strip
+            // cell's travel time comes from its seaward edge, which must lie inside the grid)
+            int margin = Math.Max(PageMargin, (int)MathF.Ceiling(StripCells * MathF.Max(seeds.Hx, seeds.Hz) / MathF.Min(hx, hz)) + 16);
+            int m = SlotTexels + 2 * margin;
+            int count = m * m;
+            // The page's cells at its level: grid cell 0 is level texel px·256 − border − margin; texel k at the height
+            // sample k·2^level
+            int firstX = job.Px * PageTexels - PageBorder - margin, firstZ = job.Py * PageTexels - PageBorder - margin;
+
+            using var depth = new NativeGrid<float>(count);
+            using var sea = new NativeGrid<bool>(count);
+            using var outside = new NativeGrid<bool>(count);
+            using var borderDist = new NativeGrid<float>(count);
+            var mask = job.Mask;
+            for (int z = 0; z < m; z++)
+            for (int x = 0; x < m; x++)
+            {
+                int i = z * m + x;
+                int sx = (firstX + x) * scale, sz = (firstZ + z) * scale;
+                bool off = sx < 0 || sz < 0 || sx > res - 1 || sz > res - 1;
+                int cx = Math.Clamp(sx, 0, res - 1), cz = Math.Clamp(sz, 0, res - 1);
+                float d = (job.SeaLevel01 - heights.Sample01(cx, cz)) * job.MaxHeight;
+                depth[i] = d;
+                outside[i] = off;
+                borderDist[i] = MathF.Max(0f, MathF.Min(MathF.Min(sx, res - 1 - sx) * hx0, MathF.Min(sz, res - 1 - sz) * hz0));
+                if (off) { sea[i] = d > 0f; continue; }
+                if (mask != null && mask.Size > 1)
+                {
+                    // The mask says which low ground the open sea reaches (and its beaches); the depth here says where its
+                    // edge is: water wherever any mask cell round it is sea, beach where the nearest one is
+                    float fx = cx * (mask.Size - 1) / (float)(res - 1), fz = cz * (mask.Size - 1) / (float)(res - 1);
+                    int mx = (int)MathF.Round(fx), mz = (int)MathF.Round(fz);
+                    if (d > 0f)
+                    {
+                        bool any = false;
+                        for (int dz = -1; dz <= 1 && !any; dz++)
+                        for (int dx = -1; dx <= 1 && !any; dx++)
+                        {
+                            int xx = Math.Clamp(mx + dx, 0, mask.Size - 1), zz = Math.Clamp(mz + dz, 0, mask.Size - 1);
+                            any = mask.Cells[zz * mask.Size + xx] != 0;
+                        }
+                        sea[i] = any;
+                    }
+                    else sea[i] = mask.Cells[mz * mask.Size + mx] != 0;
+                }
+                else sea[i] = d > 0f;
+            }
+
+            var page = new Page
+            {
+                Level = job.Level, Px = job.Px, Py = job.Py, Seeds = seeds,
+                Data = new Half[SlotTexels * SlotTexels * 4 * MaxBands],
+                Hollow = new Half[SlotTexels * SlotTexels],
+            };
+
+            var queue = new PriorityQueue<int, float>();
+            using (var hollow = BeachHollows(m, depth, sea, queue))
+                for (int z = 0; z < SlotTexels; z++)
+                    for (int x = 0; x < SlotTexels; x++)
+                        page.Hollow[z * SlotTexels + x] = (Half)hollow[(z + margin) * m + x + margin];
+
+            int slices = Math.Min(seeds.Bands.Length, MaxBands);
+            for (int s = 0; s < MaxBands; s++)
+            {
+                if (s >= slices)
+                {
+                    // No band: no warp
+                    for (int t = 0; t < SlotTexels * SlotTexels; t++)
+                    {
+                        int o = (s * SlotTexels * SlotTexels + t) * 4;
+                        page.Data[o + 1] = (Half)1f;
+                    }
+                    continue;
+                }
+                BakePageBand(page, s, seeds.Bands[s], seeds, m, hx, hz, job.Origin, firstX, firstZ, scale, hx0, hz0,
+                             depth, sea, outside, borderDist, queue);
+            }
+
+            page.Milliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+            return page;
+        }
+
+        private static void BakePageBand(Page page, int slice, Band band, Seeds seeds, int m, float hx, float hz, Vector2 origin,
+                                         int firstX, int firstZ, int scale, float hx0, float hz0,
+                                         NativeGrid<float> depth, NativeGrid<bool> sea, NativeGrid<bool> outside,
+                                         NativeGrid<float> borderDist, PriorityQueue<int, float> queue)
+        {
+            int count = m * m;
+            int margin = (m - SlotTexels) / 2;
+            float omega = MathF.Max(band.Omega, 0.05f);
+            float k0 = omega * omega / Gravity;
+            float c0 = Gravity / omega;
+            Vector2 dir = band.Direction.LengthSquared() > 1e-6f ? Vector2.Normalize(band.Direction) : Vector2.UnitX;
+            var dPerp = new Vector2(-dir.Y, dir.X);
+            float sourceDepth = band.SourceDepth(k0);
+            Vector2 At(int x, int z) => origin + new Vector2((firstX + x) * scale * hx0, (firstZ + z) * scale * hz0);
+
+            using var slowness = new NativeGrid<float>(count);
+            using var tau = new NativeGrid<float>(count);
+            using var side = new NativeGrid<float>(count);
+            using var exposure = new NativeGrid<float>(count);
+            using var state = new NativeGrid<byte>(count);
+            using var source = new NativeGrid<bool>(count);
+            using var water = new NativeGrid<bool>(count);
+            using var beach = new NativeGrid<bool>(count);
+
+            // Away from the coast the page takes the whole terrain's travel time as it is (bicubic: its gradient, the crests'
+            // spacing, without the 16 m cells' steps); only a strip along the coast (StripCells of the whole terrain's cells)
+            // is marched at the page's own cells, from that strip's seaward edge. Marched from its margin's edge instead, a
+            // page carried the first-order march's errors of its own over hundreds of metres (the waves' local length 5-13 %
+            // off, the whole terrain's too, differently) and neighbouring pages' crests met with steps of tens of metres. The
+            // strip's march reaches no further than its own width, which the margin covers: pages agree, and with the coarse
+            // warp beside them
+            var seedTau = seeds.Tau[slice];
+            float strip = StripCells * MathF.Max(seeds.Hx, seeds.Hz);
+            using var coast = CoastDistance(m, hx, hz, sea, depth);
+            using var open = new NativeGrid<float>(count);   // the whole terrain's travel time where the strip begins (NaN: none)
+            for (int z = 0; z < m; z++)
+            for (int x = 0; x < m; x++)
+            {
+                int i = z * m + x;
+                tau[i] = float.PositiveInfinity;
+                exposure[i] = 1f;
+                open[i] = float.NaN;
+                water[i] = sea[i] && depth[i] > 0f;
+                beach[i] = sea[i] && !water[i];
+                if (!sea[i]) continue;
+                float h = MathF.Max(depth[i], MinDepth);
+                float kh = WaveNumberDepth(omega, h);
+                slowness[i] = depth[i] > 0f ? kh / h / omega : 1f / c0;
+
+                var p = At(x, z);
+                // The deep sea and past the terrain's border: the plane wave, as the whole terrain's march has it
+                if (outside[i] || (water[i] && depth[i] >= sourceDepth))
+                {
+                    tau[i] = Vector2.Dot(dir, p) / c0;
+                    side[i] = Vector2.Dot(dPerp, p);
+                    state[i] = 2;
+                    source[i] = true;
+                    continue;
+                }
+                if (water[i] && coast[i] >= 0.5f * strip && SampleSeedCubic(seeds, seedTau, p, out float t0))
+                {
+                    open[i] = t0;
+                    // Beyond the strip: known from the start, the march's seeds
+                    if (coast[i] >= strip)
+                    {
+                        tau[i] = t0;
+                        side[i] = Vector2.Dot(dPerp, p);
+                        state[i] = 2;
+                    }
+                }
+            }
+
+            var marcher = new Marcher(m, hx, hz, dir, slowness, tau, side, exposure, state, source, queue);
+            marcher.March(water);
+
+            // Water the march did not reach: a narrow inlet or a pool with no water as far as the strip from both its banks,
+            // the waves come in from beyond the grid. Its cells a whole terrain's cell from the coast take that bake's travel
+            // time and the march goes on from them; what is still left takes it as it is. (Left unreached, an inlet kept no
+            // warp: the open sea's long waves at full height in two metres of water, a breaker across it)
+            for (int pass = 0; pass < 2; pass++)
+            {
+                bool any = false;
+                float from = pass == 0 ? MathF.Max(seeds.Hx, seeds.Hz) : 0f;
+                for (int z = 0; z < m; z++)
+                    for (int x = 0; x < m; x++)
+                    {
+                        int i = z * m + x;
+                        if (!water[i] || state[i] == 2 || coast[i] < from) continue;
+                        if (!SampleSeedCubic(seeds, seedTau, At(x, z), out float t1)) continue;
+                        tau[i] = t1;
+                        open[i] = t1;
+                        side[i] = Vector2.Dot(dPerp, At(x, z));
+                        state[i] = 2;
+                        any = true;
+                    }
+                if (any) marcher.March(water);
+            }
+            marcher.March(beach);
+
+            using var known = new NativeGrid<bool>(count);
+            using var marched = new NativeGrid<bool>(count);
+            for (int i = 0; i < count; i++)
+            {
+                known[i] = sea[i] && state[i] == 2;
+                marched[i] = known[i] && !(water[i] && coast[i] >= strip);
+            }
+
+            // The strip's travel time: its creases a little, then eased into the whole terrain's over its outer half, so the
+            // crests do not bend where it begins
+            SmoothSymmetric(tau, m, marched, 2);
+            for (int i = 0; i < count; i++)
+                if (marched[i] && !float.IsNaN(open[i]))
+                {
+                    float t = Smooth(0.5f * strip, strip, coast[i]);
+                    tau[i] += (open[i] - tau[i]) * t;
+                }
+
+            // Per cell: the lag and g = c0·∇τ (∂u/∂x = d ⊗ g + d⊥ ⊗ d⊥) from this march; the height the whole terrain's bake
+            // gives (Seeds.Amp: a function of the point alone, so pages and levels agree on it)
+            var seedAmp = seeds.Amp[slice];
+            using var lag = new NativeGrid<float>(count);
+            using var amp = new NativeGrid<float>(count);
+            using var g = new NativeGrid<float>(count * 2);
+            using var blend = new NativeGrid<float>(count);
+            for (int z = 0; z < m; z++)
+            for (int x = 0; x < m; x++)
+            {
+                int i = z * m + x;
+                amp[i] = 1f; blend[i] = 1f;
+                g[i * 2] = dir.X; g[i * 2 + 1] = dir.Y;
+                if (!known[i]) continue;
+
+                bool l = x > 0 && known[i - 1], rt = x < m - 1 && known[i + 1];
+                bool dn = z > 0 && known[i - m], up = z < m - 1 && known[i + m];
+                int x0 = l ? i - 1 : i, x1 = rt ? i + 1 : i;
+                int z0 = dn ? i - m : i, z1 = up ? i + m : i;
+                float dxs = (x1 - x0) * hx, dzs = ((z1 - z0) / m) * hz;
+                float tx = dxs > 0f ? (tau[x1] - tau[x0]) / dxs : dir.X / c0;
+                float tz = dzs > 0f ? (tau[z1] - tau[z0]) / dzs : dir.Y / c0;
+                g[i * 2] = c0 * tx; g[i * 2 + 1] = c0 * tz;
+
+                var p = At(x, z);
+                amp[i] = SampleSeed(seeds, seedAmp, p, out float av) ? av : 1f;
+                lag[i] = c0 * tau[i] - Vector2.Dot(dir, p);
+                blend[i] = MathF.Max(Smooth(0.5f * sourceDepth, sourceDepth, depth[i]),
+                                     1f - Smooth(0f, BorderFade, borderDist[i]));
+            }
+            BoxBlur(g, 2, m, sea);
+
+            // Blended back to no warp toward deep water and the terrain's border, then into the land beside the sea, so
+            // bilinear filtering at the coast blends warp with warp
+            using var v = new NativeGrid<float>(count * 4);
+            using var filled = new NativeGrid<bool>(count);
+            for (int i = 0; i < count; i++)
+            {
+                bool ok = known[i];
+                float w = blend[i];
+                v[i * 4 + 0] = ok ? lag[i] * (1f - w) : 0f;
+                v[i * 4 + 1] = ok ? amp[i] + (1f - amp[i]) * w : 1f;
+                v[i * 4 + 2] = ok ? g[i * 2] + (dir.X - g[i * 2]) * w : dir.X;
+                v[i * 4 + 3] = ok ? g[i * 2 + 1] + (dir.Y - g[i * 2 + 1]) * w : dir.Y;
+                filled[i] = ok;
+            }
+            Dilate4(v, filled, m, 3);
+
+            // Kept relative to the page's mean lag: half floats near zero hold a fraction of a metre where the lag runs to
+            // hundreds over the terrain
+            double sum = 0; int cnt = 0;
+            for (int z = margin; z < margin + SlotTexels; z++)
+                for (int x = margin; x < margin + SlotTexels; x++)
+                {
+                    int i = z * m + x;
+                    if (filled[i]) { sum += v[i * 4]; cnt++; }
+                }
+            float baseLag = cnt > 0 ? (float)(sum / cnt) : 0f;
+            page.Base[slice] = baseLag;
+            int so = slice * SlotTexels * SlotTexels;
+            for (int z = 0; z < SlotTexels; z++)
+                for (int x = 0; x < SlotTexels; x++)
+                {
+                    int i = (z + margin) * m + x + margin;
+                    int o = (so + z * SlotTexels + x) * 4;
+                    page.Data[o + 0] = (Half)(v[i * 4] - baseLag);
+                    page.Data[o + 1] = (Half)v[i * 4 + 1];
+                    page.Data[o + 2] = (Half)v[i * 4 + 2];
+                    page.Data[o + 3] = (Half)v[i * 4 + 3];
+                }
+        }
+
+        // Cells not filled take the mean of their filled neighbours, a ring a pass (4 values a cell)
+        private static void Dilate4(NativeGrid<float> v, NativeGrid<bool> filled, int n, int passes)
+        {
+            int count = n * n;
+            using var next = new NativeGrid<bool>(count);
+            Span<float> acc = stackalloc float[4];
+            for (int pass = 0; pass < passes; pass++)
+            {
+                filled.CopyTo(next);
+                for (int z = 0; z < n; z++)
+                for (int x = 0; x < n; x++)
+                {
+                    int i = z * n + x;
+                    if (filled[i]) continue;
+                    acc.Clear(); int cnt = 0;
+                    for (int dz = -1; dz <= 1; dz++)
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        int xx = x + dx, zz = z + dz;
+                        if (xx < 0 || zz < 0 || xx >= n || zz >= n) continue;
+                        int j = zz * n + xx;
+                        if (!filled[j]) continue;
+                        for (int c = 0; c < 4; c++) acc[c] += v[j * 4 + c];
+                        cnt++;
+                    }
+                    if (cnt == 0) continue;
+                    for (int c = 0; c < 4; c++) v[i * 4 + c] = acc[c] / cnt;
+                    next[i] = true;
+                }
+                next.CopyTo(filled);
+            }
         }
 
         // Diagnostic: with the environment variable FREEFALL_SHOREWARP_DUMP=<folder> set when the editor starts, every bake

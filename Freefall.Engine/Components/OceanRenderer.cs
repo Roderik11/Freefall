@@ -392,6 +392,10 @@ namespace Freefall.Components
         private Assets.TerrainPages? _warpHeights;   // what the last sea mask was flooded from, for a bake of the warp alone
         private SeaMask.Result? _warpMask;
 
+        // The surf round the camera at the terrain's own detail, marched from the last whole-terrain bake's travel time
+        private readonly SurfPages _surfPages = new();
+        private ShoreWarp.Seeds? _warpSeeds;
+
         // Where the lips stand round the camera, decided once per frame for the ocean's PS and the lip pass alike
         private readonly LipMap _lipMap = new();
 
@@ -471,6 +475,13 @@ namespace Freefall.Components
             public Vector2 WakeOrigin;   // its corner (world xz)
             public float WakeShow;       // EngineSettings.ShowShipWaves: 1 paints them over the sea
             public uint WakeCalmSRV;     // Graphics.WakeWaves.CalmSrv: the calm the hulls left in their track (0 = none). Was padding
+            public uint SurfTableSRV;    // Graphics.SurfPages: the surf's pages round the camera, per level 0 page (0 = none)
+            public uint SurfDataSRV;     // their warp per slot and band (RGBA16F: lag − base, amplitude, g.x, g.z)
+            public uint SurfHollowSRV;   // their beach hollows per slot (R16F)
+            public uint SurfInfoSRV;     // per slot two float4s: base lags, deep headings, ocean bands + 1
+            public uint SurfPagesAcross; // level 0 pages a side
+            public float SurfSamples;    // height samples a side (level 0 texel i lies on sample i)
+            public float _surfPad0, _surfPad1;
         }
 
         protected override void Awake()
@@ -717,6 +728,9 @@ namespace Freefall.Components
                     Index = coarsestWind,
                     Direction = dir.LengthSquared() > 0f ? Vector2.Normalize(new Vector2(dir.X, dir.Z)) : Vector2.UnitX,
                     Omega = omega,
+                    // Warped only where its shortest waves feel the bottom too (from their length's depth, whole from half
+                    // of it): warped by its peak, a storm's long peak squeezed the band's short waves over the whole floor
+                    WarpDepth = shortest,
                 });
             }
             return bands.ToArray();
@@ -738,6 +752,7 @@ namespace Freefall.Components
             Interlocked.Increment(ref _warpRequest);
             _seaMask.Dispose();
             _shoreWarp.Dispose();
+            _surfPages.Dispose();
             _lipMap.Dispose();
 
             // Deferred: the frames in flight still draw the grid, read the tile scales and the FFT textures
@@ -1079,10 +1094,22 @@ namespace Freefall.Components
                 if (seaMask.Reach != null) _quadtree.UploadReach(seaMask.Reach);
             }
             if (Interlocked.Exchange(ref _builtShoreWarp, null) is { } shoreWarp)
+            {
                 _shoreWarp.Upload(shoreWarp);
+                _warpSeeds = shoreWarp.Seeds;
+            }
             if (_seaMaskOwed && Volatile.Read(ref _warpRunning) == 0 && !SceneManager.IsLoading)
                 RequestSeaMask();
             UpdateShoreWarpBands();
+
+            // The surf's pages round the camera, from the last whole-terrain bake (the same heights and mask)
+            if (!Engine.Settings.DisableShoreWarp && Camera.Main != null && _terrain?.Terrain is { } surfTerrain)
+            {
+                var terrainOrigin = _terrain.Transform?.WorldPosition ?? Vector3.Zero;
+                _surfPages.Update(Camera.Main.Position, _warpSeeds, Volatile.Read(ref _warpHeights), Volatile.Read(ref _warpMask),
+                    (Transform.WorldPosition.Y - terrainOrigin.Y) / MathF.Max(surfTerrain.MaxHeight, 0.001f), surfTerrain.MaxHeight,
+                    surfTerrain.TerrainSize, new Vector2(terrainOrigin.X, terrainOrigin.Z));
+            }
 
             // The uploaded warp's slices: which band each carries and its deep heading
             var warpBands = _shoreWarp.Bands;
@@ -1178,6 +1205,13 @@ namespace Freefall.Components
                 WakeOrigin = WakeWaves.Origin,
                 WakeShow = Engine.Settings.ShowShipWaves ? 1f : 0f,
                 WakeCalmSRV = Engine.Settings.DisableWakeCalm ? 0u : WakeWaves.CalmSrv,
+                SurfTableSRV = warpSlots != 0 && !Engine.Settings.DisableShoreWarp && !Engine.Settings.DisableSurfPages
+                    ? _surfPages.TableSrv : 0u,
+                SurfDataSRV = _surfPages.DataSrv,
+                SurfHollowSRV = _surfPages.HollowSrv,
+                SurfInfoSRV = _surfPages.InfoSrv,
+                SurfPagesAcross = (uint)_surfPages.PagesAcross,
+                SurfSamples = _surfPages.Samples,
             };
             _params.SetParameter("OceanData", data);
 

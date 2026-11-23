@@ -41,6 +41,13 @@ namespace Freefall.Graphics
         /// <summary>The page table (StructuredBuffer&lt;uint&gt;, one entry per level 0 page), read only.</summary>
         public uint TableSrv => _table?.SrvIndex ?? 0u;
 
+        /// <summary>
+        /// The entry of a level 0 page with no resident page over it. 0 (slot 0 at level 0) for the terrain's maps, whose
+        /// page over the whole map is always there; a map whose readers fall back to something else when nothing is
+        /// resident (the surf, <see cref="SurfPages"/>) sets one no slot can have before <see cref="Reset"/>.
+        /// </summary>
+        public uint EmptyEntry { get; set; }
+
         /// <summary>The table needs copying up (<see cref="RecordTable"/>).</summary>
         public bool TableDirty => _entriesDirty;
 
@@ -210,7 +217,7 @@ namespace Freefall.Graphics
                 int s = _slots[l][(qy >> l) * PagesAcrossAt(l) + (qx >> l)];
                 if (s >= 0 && _shown[s]) return (uint)s | ((uint)l << LevelShift);
             }
-            return 0u;   // nothing resident over it yet
+            return EmptyEntry;   // nothing resident over it yet
         }
 
         /// <summary>

@@ -1332,6 +1332,9 @@ namespace Freefall
          public int RCDebugSubMode { get; set; } = 1;                       // 0=off, 1=tile lookup, 2=per-level radiance, 3=constant bypass, 4=raw pool readback
          public bool DisableSeaMask { get; set; } = false;                  // the ocean draws over all ground below sea level again (A/B of SeaMask)
         public bool DisableShoreWarp { get; set; } = false;                // the ocean's bands are sampled unwarped at the coast again (A/B of ShoreWarp)
+        [System.ComponentModel.Description(@"The surf reads only the whole terrain's warp (16 m cells on a 16 km terrain), not its
+         pages round the camera at the terrain's own detail (Graphics.SurfPages): for comparing the two")]
+        public bool DisableSurfPages { get; set; } = false;
         public bool DisableSurfLip { get; set; } = false;                  // no breaking lips (ocean_lip.fx, OceanRenderer): A/B and cost
         [System.ComponentModel.Description("Ships raise no waves in the sea round the camera (Graphics.WakeWaves, the wake simulation): to compare with and without, or to save its cost.")]
         public bool DisableShipWaves { get; set; } = false;

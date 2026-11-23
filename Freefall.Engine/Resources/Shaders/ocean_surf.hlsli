@@ -76,7 +76,20 @@ struct OceanData
     float2 WakeOrigin;          // its corner (world xz)
     float WakeShow;             // EngineSettings.ShowShipWaves: 1 paints them over the sea (ocean.fx)
     uint WakeCalmSRV;           // the calm the hulls left in their track over the same grid (WakeCalmAt); 0 = none. Was padding
+    uint SurfTableSRV;          // C# SurfPages: the surf's pages round the camera, per level 0 page slot | level << 24 (0xFFFFFFFF none); 0 = no pages
+    uint SurfDataSRV;           // Texture2DArray RGBA16F, per slot and warped band: lag − base, amplitude, g.x, g.z
+    uint SurfHollowSRV;         // Texture2DArray R16F, per slot: the beach's hollows (m)
+    uint SurfInfoSRV;           // StructuredBuffer<float4>, two per slot: (base lag 0, base lag 1, heading 0), (heading 1, band 0 + 1, band 1 + 1)
+    uint SurfPagesAcross;       // level 0 pages a side
+    float SurfSamples;          // height samples a side: level 0 texel i lies on sample i
+    float _surfPad0;
+    float _surfPad1;
 };
+
+// The surf's pages (C# SurfPages, ShoreWarp.BakePage): 256 texels a side in slots of 264 (a border of 4)
+#define SURF_PAGE_TEXELS 256
+#define SURF_PAGE_BORDER 4
+#define SURF_SLOT_TEXELS 264
 
 SamplerState OceanSampler : register(s0);
 
@@ -280,30 +293,85 @@ uint WarpSlice(OceanData ocean, uint band)
     return 0xFF;
 }
 
+// The surf's page over a point, when one is resident and carries the band: its warp, else false (the whole terrain's)
+bool SampleSurfPage(OceanData ocean, uint slice, float2 worldXZ, float2 terrainUV, out BandWarp b, out float2 d)
+{
+    b = (BandWarp)0;
+    d = float2(1.0, 0.0);
+    if (ocean.SurfTableSRV == 0) return false;
+    // Level 0 texels: texel i on height sample i, a page's texel k (border included) at k - border
+    float2 c = saturate(terrainUV) * (ocean.SurfSamples - 1.0);
+    uint2 page0 = min(uint2(c) / SURF_PAGE_TEXELS, ocean.SurfPagesAcross - 1);
+    StructuredBuffer<uint> table = ResourceDescriptorHeap[ocean.SurfTableSRV];
+    uint e = table[page0.y * ocean.SurfPagesAcross + page0.x];
+    if (e == 0xFFFFFFFFu) return false;
+    uint slot = e & 0xFFFFFFu, level = e >> 24;
+
+    // Which of the page's slices carries the band of the whole terrain's slice asked for (a page keeps what it was baked
+    // with until it is baked again)
+    StructuredBuffer<float4> info = ResourceDescriptorHeap[ocean.SurfInfoSRV];
+    float4 i0 = info[slot * 2], i1 = info[slot * 2 + 1];
+    uint band = slice == 0 ? (ocean.WarpSlots & 0xFFu) : ((ocean.WarpSlots >> 8) & 0xFFu);
+    uint pageSlice;
+    if (band != 0 && (uint)i1.z == band) pageSlice = 0;
+    else if (band != 0 && (uint)i1.w == band) pageSlice = 1;
+    else return false;
+
+    float2 local = c / float(1u << level) - float2((page0 >> level) * SURF_PAGE_TEXELS) + SURF_PAGE_BORDER;
+    float2 uv = (local + 0.5) / SURF_SLOT_TEXELS;
+    Texture2DArray<float4> data = ResourceDescriptorHeap[ocean.SurfDataSRV];
+    Texture2DArray<float> hollow = ResourceDescriptorHeap[ocean.SurfHollowSRV];
+    float4 v = data.SampleLevel(OceanSampler, float3(uv, slot * 2 + pageSlice), 0);
+    float baseLag = pageSlice == 0 ? i0.x : i0.y;
+    d = pageSlice == 0 ? i0.zw : i1.xy;
+
+    // The warp moves a point only along the deep heading d, by the lag; ∂u/∂x = d ⊗ g + d⊥ ⊗ d⊥ (ShoreWarp.BakePage)
+    float2 dp = float2(-d.y, d.x);
+    float2 g = v.zw;
+    b.u = worldXZ + d * (baseLag + v.x);
+    b.amp = v.y;
+    b.hollow = hollow.SampleLevel(OceanSampler, float3(uv, slot), 0);
+    b.J = float2x2(d.x * g.x + dp.x * dp.x, d.x * g.y + dp.x * dp.y,
+                   d.y * g.x + dp.y * dp.x, d.y * g.y + dp.y * dp.y);
+    return true;
+}
+
 //   terrainUV: the point's terrain UV (outside the terrain the border's, where the warp is none)
 BandWarp SampleBandWarp(OceanData ocean, uint slice, float2 worldXZ, float2 terrainUV)
 {
-    Texture2DArray<float4> warpTex = ResourceDescriptorHeap[ocean.ShoreWarpSRV];
-    Texture2DArray<float4> jacobianTex = ResourceDescriptorHeap[ocean.ShoreWarpJacobianSRV];
-    float w, h, slices;
-    warpTex.GetDimensions(w, h, slices);
-    // The bake's cell i lies at UV i / (n - 1), its texel's centre at (i + 0.5) / n
-    float2 uv = (saturate(terrainUV) * (float2(w, h) - 1.0) + 0.5) / float2(w, h);
-    float4 a = warpTex.SampleLevel(OceanSampler, float3(uv, slice), 0);
-    float4 j = jacobianTex.SampleLevel(OceanSampler, float3(uv, slice), 0);
-
     BandWarp b;
-    b.u = worldXZ + a.xy;
-    b.amp = a.z;
-    b.hollow = a.w;
-    b.J = float2x2(j.x, j.y, j.z, j.w);
+    float2 d;
+    // Round the camera the surf's pages at the terrain's own detail (C# SurfPages); elsewhere, and where none is baked yet,
+    // the whole terrain's warp
+    if (!SampleSurfPage(ocean, slice, worldXZ, terrainUV, b, d))
+    {
+        Texture2DArray<float4> warpTex = ResourceDescriptorHeap[ocean.ShoreWarpSRV];
+        Texture2DArray<float4> jacobianTex = ResourceDescriptorHeap[ocean.ShoreWarpJacobianSRV];
+        float w, h, slices;
+        warpTex.GetDimensions(w, h, slices);
+        // The bake's cell i lies at UV i / (n - 1), its texel's centre at (i + 0.5) / n
+        float2 uv = (saturate(terrainUV) * (float2(w, h) - 1.0) + 0.5) / float2(w, h);
+        float4 a = warpTex.SampleLevel(OceanSampler, float3(uv, slice), 0);
+        float4 j = jacobianTex.SampleLevel(OceanSampler, float3(uv, slice), 0);
+        b.u = worldXZ + a.xy;
+        b.amp = a.z;
+        b.hollow = a.w;
+        b.J = float2x2(j.x, j.y, j.z, j.w);
+        d = slice == 0 ? ocean.WarpDirs.xy : ocean.WarpDirs.zw;
+    }
     // The local heading: the gradient of the deep phase d·u, Jᵀd
-    float2 d = slice == 0 ? ocean.WarpDirs.xy : ocean.WarpDirs.zw;
     float2 r = mul(d, b.J);
     r *= rsqrt(max(dot(r, r), 1e-12));
     b.turn = float2(dot(d, r), d.x * r.y - d.y * r.x);
     b.heading = r;
     return b;
+}
+
+// How far the warp squeezes a band's pattern here: the longest of ∂u/∂x's columns (the displacement's mip, the
+// surface's tessellation: SurfTessScale)
+float WarpStretch(BandWarp w)
+{
+    return sqrt(max(w.J[0][0] * w.J[0][0] + w.J[1][0] * w.J[1][0], w.J[0][1] * w.J[0][1] + w.J[1][1] * w.J[1][1]));
 }
 
 // The surf's wave at a point. A carried band's height and its sideways displacement along the local heading are in
@@ -489,7 +557,7 @@ float3 SampleDisplacement(OceanData ocean, float2 worldXZ, float depthAtten, flo
             turn = w.turn;
             heading = w.heading;
             wave.hollow = max(wave.hollow, w.hollow);
-            stretch = sqrt(max(w.J[0][0] * w.J[0][0] + w.J[1][0] * w.J[1][0], w.J[0][1] * w.J[0][1] + w.J[1][1] * w.J[1][1]));
+            stretch = WarpStretch(w);
         }
         else
             amp = BandShoreAtten(shoreAtten, depth, tileScales[i]);

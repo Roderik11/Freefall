@@ -35,9 +35,10 @@ HullConstantOutput PatchConstantFunc(InputPatch<ControlPoint, 3> patch, uint pat
     // Edge indices: edge[0] = opposite vertex 0 = edge(1,2)
     //               edge[1] = opposite vertex 1 = edge(0,2)
     //               edge[2] = opposite vertex 2 = edge(0,1)
-    output.EdgeTess[0] = OceanEdgeFactor(p1, p2);
-    output.EdgeTess[1] = OceanEdgeFactor(p2, p0);
-    output.EdgeTess[2] = OceanEdgeFactor(p0, p1);
+    OceanData ocean = oceanData[patch[0].InstanceIdx];
+    output.EdgeTess[0] = OceanEdgeFactor(p1, p2, ocean);
+    output.EdgeTess[1] = OceanEdgeFactor(p2, p0, ocean);
+    output.EdgeTess[2] = OceanEdgeFactor(p0, p1, ocean);
 
     output.InsideTess = (output.EdgeTess[0] + output.EdgeTess[1] + output.EdgeTess[2]) / 3.0;
 

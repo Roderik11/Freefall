@@ -72,17 +72,40 @@ float WorldEdgeFactor(float3 p0, float3 p1, float pixelsPerEdge, float maxFactor
     return clamp(edgePixels / pixelsPerEdge, TessMinFactor, maxFactor);
 }
 
+// How much finer the surf's warp wants the surface at a point: its largest squeeze of a carried band's waves
+// (WarpStretch), at most SURF_TESS_MOST. Sized by distance alone (until 2026-11-23) the triangles were too long for the
+// waves the warp had shortened: a vertex here and there caught a sharp crest and stood up from it, saw teeth and spikes
+// along the crests off TestWorld's coasts, gone with the surface tessellated four times finer
+#define SURF_TESS_MOST 4.0
+float SurfTessScale(OceanData ocean, float2 xz)
+{
+    if (ocean.ShoreWarpSRV == 0) return 1.0;
+    float2 uv = (xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ)) / float2(ocean.TerrainSizeX, ocean.TerrainSizeZ);
+    if (any(uv < 0.0) || any(uv > 1.0)) return 1.0;
+    float s = 1.0;
+    [unroll] for (uint slice = 0; slice < 2; slice++)
+    {
+        uint band = slice == 0 ? (ocean.WarpSlots & 0xFFu) : ((ocean.WarpSlots >> 8) & 0xFFu);
+        if (band == 0) continue;
+        s = max(s, WarpStretch(SampleBandWarp(ocean, slice, xz, uv)));
+    }
+    return min(s, SURF_TESS_MOST);
+}
+
 // The surface's edges (ocean.fx HS): OceanEdgePixels within EngineSettings.OceanFineDistance of the eye (push slot 19; 0,
 // or anything a draw that does not set it left there, keeps that size everywhere), growing in proportion to the distance
 // beyond it: past a few hundred metres a wave's height is a pixel or two, and the sea's look is its normal maps. The
-// pixel shader is most of the sea's cost and runs more often on small triangles (2 x 2 quads along their edges). Both
-// sides of an edge get the same factor: it depends on the edge's two ends alone, in either order
-float OceanEdgeFactor(float3 p0, float3 p1)
+// pixel shader is most of the sea's cost and runs more often on small triangles (2 x 2 quads along their edges). Finer
+// by the surf's squeeze of the waves at the edge's middle (SurfTessScale). Both sides of an edge get the same factor: it
+// depends on the edge's two ends alone, in either order
+float OceanEdgeFactor(float3 p0, float3 p1, OceanData ocean)
 {
     float pixels = OceanEdgePixels();
     float fine = OceanFineDistance;
+    float3 mid = 0.5 * (p0 + p1);
     if (fine > 0.0 && fine <= 2000.0)
-        pixels *= max(1.0, distance(0.5 * (p0 + p1), ViewInverse[3].xyz) / fine);
+        pixels *= max(1.0, distance(mid, ViewInverse[3].xyz) / fine);
+    pixels /= SurfTessScale(ocean, mid.xz);
     return WorldEdgeFactor(p0, p1, pixels, TessMaxFactor);
 }
 
