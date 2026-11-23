@@ -745,11 +745,11 @@ namespace Freefall.World
         {
             var kind = g.Slice.Owner.Kinds[g.Kind];
             if (kind.NoFar)   // where the GPU stops drawing the largest of them, with the camera as it is now
-                return cullFactor > 0f ? kind.CullTerm * g.MaxScale * cullFactor + 0.71f * CellSize : kind.Ring;
+                return MathF.Max(cullFactor > 0f ? kind.CullTerm * g.MaxScale * cullFactor + 0.71f * CellSize : kind.Ring, FarTier.HeldOffWithin);
             float ring = FarTier.FromOf(kind.Profile) + FarTier.BandOf(kind.Profile);
             if (kind.CullTerm > 0f && cullFactor > 0f)
                 ring = MathF.Min(ring, kind.CullTerm * g.MaxScale * cullFactor + 0.71f * CellSize);
-            return ring;
+            return MathF.Max(ring, FarTier.HeldOffWithin);
         }
 
         private static readonly MaterialBlock NoParams = new();

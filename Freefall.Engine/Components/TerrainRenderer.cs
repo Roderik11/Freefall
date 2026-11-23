@@ -2011,6 +2011,15 @@ namespace Freefall.Components
         // ───── Streaming heights (TERRAIN_PAGES_PLAN.md 5a) ──────────────
 
         private Graphics.TerrainHeightResidency? _residency;
+
+        /// <summary>
+        /// Height, paint and decoration pages still to come round the camera after the last frame (waiting for a slot, an
+        /// upload or a bake, or baked partway and hidden until whole). The world map's bake waits for 0 after it moves the
+        /// camera: a page arriving changes the ground.
+        /// </summary>
+        public int PagesWaiting => (_residency?.Waiting ?? 0)
+            + (_paintResidency is { } paint ? paint.Waiting + paint.InHandCount : 0)
+            + (_decoResidency is { } deco ? deco.Waiting + deco.InHandCount : 0);
         private static readonly ProfilerMarker _residencyMarker = ProfilerMarker.Get("Terrain height residency");
         private static readonly ProfilerMarker _cpuRangesMarker = ProfilerMarker.Get("Terrain height ranges on the CPU");
 

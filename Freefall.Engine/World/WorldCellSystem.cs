@@ -45,6 +45,17 @@ namespace Freefall.World
         /// </summary>
         public static int Queued { get; private set; }
 
+        /// <summary>Looks made so far. The world map's bake waits for one made after it moved the camera.</summary>
+        public static int Looks { get; private set; }
+
+        private static bool s_lookNow;
+
+        /// <summary>
+        /// The next update looks round the camera at once instead of at the next 0.25 s: after the camera jumps (the world
+        /// map's bake moves it from chunk to chunk), so <see cref="Queued"/> speaks of the new place a frame later.
+        /// </summary>
+        public static void LookNow() => s_lookNow = true;
+
         private float _sinceLook = LookEvery;
         private bool _farTierOn;
         private int _stamp;
@@ -69,7 +80,8 @@ namespace Freefall.World
             // The shaders' far tier is on while any owner keeps records
             if (OwnerCount > 0)
             {
-                if (!_farTierOn || FarTier.Band <= 0) FarTier.Band = FarTier.DefaultBand;
+                if (FarTier.HeldOffWithin > 0f) FarTier.Band = 0f;
+                else if (!_farTierOn || FarTier.Band <= 0) FarTier.Band = FarTier.DefaultBand;
                 _farTierOn = true;
             }
             else if (_farTierOn)
@@ -97,10 +109,12 @@ namespace Freefall.World
 
             // Real time: the camera moves while the game clock stands still (a pause, slow motion, a stopped clock)
             _sinceLook += Time.RealDelta;
-            if (_sinceLook >= LookEvery)
+            if (_sinceLook >= LookEvery || s_lookNow)
             {
                 _sinceLook = 0;
+                s_lookNow = false;
                 using (s_lookMarker.Auto()) Look();
+                Looks++;
             }
 
             // Within the budget: what left first, then instances for the nearest, then entities for the nearest. At least
@@ -192,7 +206,7 @@ namespace Freefall.World
             float enter = a * a, leave = enter * Leave * Leave;
             // The grid round the camera as far as the far tier's ring; slices wanted from further away (drawn until the
             // GPU drops them: rocks, logs, a town) come from their owners' lists below, by distance
-            float reach = MathF.Max(FarTier.From + FarTier.Band, FarTier.From + FarTier.DefaultBand) + RingMargin;
+            float reach = MathF.Max(MathF.Max(FarTier.From + FarTier.Band, FarTier.From + FarTier.DefaultBand), FarTier.HeldOffWithin) + RingMargin;
 
             _toSpawn.Clear(); _toDespawn.Clear(); _toInstance.Clear(); _toDrop.Clear();
             _stamp++;

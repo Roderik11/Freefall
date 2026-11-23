@@ -31,6 +31,15 @@ namespace Freefall.Graphics
         /// <summary>The band while the far tier is on.</summary>
         public const float DefaultBand = 100f;
 
+        /// <summary>
+        /// Metres round the camera (level) within which every kind of the world cells keeps its instances and nothing takes
+        /// a far form; 0 = off, the far tier as usual. While above 0 the world cells hold <see cref="Band"/> at 0 (instances
+        /// draw at any distance; far meshes and the far forest nowhere) and every kind's ring reaches at least this far. For
+        /// the world map's bake, which draws a chunk up to 1 km wide from straight above: a tree kind hands over where its
+        /// coarsest LOD starts, as near as 128 m, so the chunk's corners showed far forms.
+        /// </summary>
+        public static float HeldOffWithin;
+
         /// <summary>Metres a side of a cell, the unit they fade by: a cell's centre is at (floor(x / CellSize) + 0.5) × CellSize.</summary>
         public static float CellSize = 64f;
 

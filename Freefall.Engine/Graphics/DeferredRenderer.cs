@@ -322,13 +322,27 @@ namespace Freefall.Graphics
         public (byte[] Albedo, byte[] Normals, byte[] Depth) ReadBackGBuffer()
         {
             if (!_captured || _capture == null) throw new InvalidOperationException("No frame has copied its G-buffer: turn CaptureGBuffer on and draw one");
+            var result = new byte[3][];
+            for (int i = 0; i < 3; i++) result[i] = new byte[_captureWidth * CaptureBytes[i] * _captureHeight];
+            ReadBackGBuffer(result[0], result[1], result[2]);
+            return (result[0], result[1], result[2]);
+        }
+
+        /// <summary>
+        /// <see cref="ReadBackGBuffer()"/> into the caller's arrays, which must hold the whole render size (8, 8 and 4 bytes a
+        /// pixel): the bake reads a 2048² G-buffer every frame while a chunk settles, 80 MB of new arrays a look otherwise.
+        /// </summary>
+        public void ReadBackGBuffer(byte[] albedo, byte[] normals, byte[] depth)
+        {
+            if (!_captured || _capture == null) throw new InvalidOperationException("No frame has copied its G-buffer: turn CaptureGBuffer on and draw one");
             RenderView.Primary?.WaitForGpu();
             int w = _captureWidth, h = _captureHeight;
-            var result = new byte[3][];
+            var result = new[] { albedo, normals, depth };
             for (int i = 0; i < 3; i++)
             {
                 int rowBytes = w * CaptureBytes[i];
-                var data = result[i] = new byte[rowBytes * h];
+                var data = result[i];
+                if (data.Length < rowBytes * h) throw new ArgumentException($"G-buffer readback needs {rowBytes * h} bytes, got {data.Length}");
                 unsafe
                 {
                     void* mapped;
@@ -338,7 +352,6 @@ namespace Freefall.Graphics
                     _capture[i]!.Unmap(0);
                 }
             }
-            return (result[0], result[1], result[2]);
         }
 
         public int RenderWidth { get; private set; } = 1;

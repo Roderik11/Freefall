@@ -222,5 +222,28 @@ namespace Freefall.Graphics
                 }
             }, cpuHandle);
         }
+
+        /// <summary>
+        /// Gives back the slices' and the whole array's depth views and the bindless slot. The DSV heap holds 64: a
+        /// renderer's cascades (7 views) and point light atlas (5) were never given back, so an editor that made a
+        /// renderer for each world map bake ran out after a few bakes ("Out of DSV descriptors", 2026-11-23).
+        /// </summary>
+        public new void Dispose()
+        {
+            var device = Engine.Device;
+            foreach (var dsv in SliceDsvHandles) device.FreeDsv(dsv);
+            SliceDsvHandles.Clear();
+            if (FullArrayDsvHandle.Ptr != 0)
+            {
+                device.FreeDsv(FullArrayDsvHandle);
+                FullArrayDsvHandle = default;
+            }
+            if (BindlessIndex != 0)
+            {
+                device.ReleaseBindlessIndex(BindlessIndex);
+                BindlessIndex = 0;
+            }
+            base.Dispose();
+        }
     }
 }
