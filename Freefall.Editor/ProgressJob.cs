@@ -11,7 +11,7 @@ namespace Freefall.Editor
     /// main thread through Engine.RunOnMainThreadAsync slices (the pattern of ProjectOpening, editor_debugging/project_open.md).
     /// Publish, Scan and the texture caps use it.
     /// </summary>
-    internal sealed class ProgressJob
+    internal sealed class ProgressJob : Freefall.Base.IEditorJob
     {
         /// <summary>Where a job stands: the title, the step i/n with what it is doing, the whole job 0..1.</summary>
         public sealed record Status(string Title, int StepIndex, int StepCount, string Step, string Detail, float Fraction, double Seconds);

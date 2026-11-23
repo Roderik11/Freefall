@@ -396,6 +396,22 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
             return tex;
         }
 
+        /// <summary>
+        /// As <see cref="CreateAsync"/>, but the texture counts as ready only once the copy queue has finished its pixels:
+        /// <see cref="Uploaded"/> says when a compute pass may read them (the world map's tiles, lit as they arrive). Main thread.
+        /// </summary>
+        public static Texture CreateTracked(GraphicsDevice device, CpuTextureData cpuData)
+        {
+            var texture = new Texture();
+            texture.CreateGpuCopy(device, cpuData, trackUpload: true);
+            texture.AssetPath = cpuData.Path;
+            texture.Name = Path.GetFileNameWithoutExtension(cpuData.Path);
+            return texture;
+        }
+
+        /// <summary>The pixels are on the GPU: the copy queue has finished the upload (<see cref="CreateTracked"/>).</summary>
+        public bool Uploaded => IsReady(StreamingManager.Instance?.GetCompletedFence() ?? long.MaxValue);
+
         public static Texture CreateAsync(GraphicsDevice device, CpuTextureData cpuData)
         {
             var texture = new Texture();

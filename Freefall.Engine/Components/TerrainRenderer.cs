@@ -25,6 +25,12 @@ namespace Freefall.Components
         public static bool ComputeReady { get; set; }
         public static string ComputeError { get; set; } = "";
 
+        /// <summary>
+        /// The decorations (grass, flowers, ferns, crops) spawned round the camera. Off while the world map bakes: their
+        /// ring would not reach a chunk's corners. The ground's tint under them stays (Terrain.DecorationGroundTint).
+        /// </summary>
+        public static bool DrawDecorations { get; set; } = true;
+
         // ───── Asset Reference ────────────────────────────────────────────
         public Terrain? Terrain;
 
@@ -921,7 +927,7 @@ namespace Freefall.Components
             CommandBuffer.Enqueue(RenderPass.Shadow, (list) => { PixMarker.Begin(list, "Terrain"); self.DrawTerrainShadow(list, fi); PixMarker.End(list); });
 
             // Decoration pipeline — CPU-side setup
-            if (Terrain.DrawDetail && _decoratorPalette.Count > 0 && DecoratorMaterial?.Effect != null)
+            if (Terrain.DrawDetail && DrawDecorations && _decoratorPalette.Count > 0 && DecoratorMaterial?.Effect != null)
             {
                 if (Terrain.ConsumeFlags(TerrainDirtyFlags.DecoStructure | TerrainDirtyFlags.DecoParams) || _decoratorSlotsBuffer == null)
                     RebuildDecoSlots();

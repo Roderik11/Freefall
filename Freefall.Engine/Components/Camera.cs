@@ -43,6 +43,20 @@ namespace Freefall.Components
         public Vector3 Up => Transform?.Up ?? Vector3.UnitY;
 
         public float FieldOfView { get; set; } = 45f; // In degrees, like Apex
+
+        /// <summary>
+        /// Parallel rays: the view is <see cref="OrthographicSize"/> metres high and the same at every depth, and the near
+        /// plane may lie behind the camera. For the world map's bake, which reads the G-buffer only: the passes after it
+        /// (lighting, ambient occlusion, fog, the depth analysis) take every camera for a perspective one. <see cref="FieldOfView"/>
+        /// still sets <see cref="FoVFactor"/>, which the level-of-detail measures read.
+        /// </summary>
+        [System.ComponentModel.Browsable(false)]
+        public bool Orthographic { get; set; }
+
+        /// <summary>How many metres the view is high while <see cref="Orthographic"/>; its width is that × <see cref="AspectRatio"/>.</summary>
+        [System.ComponentModel.Browsable(false)]
+        public float OrthographicSize { get; set; } = 256f;
+
         public float AspectRatio { get; set; } = 16.0f / 9.0f;
         public float NearPlane { get; set; } = 0.1f;
         public float FarPlane { get; set; } = 2048f;
@@ -117,11 +131,21 @@ namespace Freefall.Components
             // Create reverse-Z projection matrix (near→1.0, far→0.0)
             // Can't use CreatePerspectiveFieldOfViewLeftHanded — it validates near < far
             float vFOV = FieldOfView * (MathF.PI / 180f);
-            UnjitteredProjection = CreateReverseZPerspectiveLH(vFOV, AspectRatio, NearPlane, FarPlane);
-            // The sub-pixel offset a temporal upscaler asks for (Jitter, set by the renderer): NDC = x·w / z + M31
-            var projection = UnjitteredProjection;
-            projection.M31 += Jitter.X;
-            projection.M32 += Jitter.Y;
+            var projection = UnjitteredProjection = Orthographic
+                ? CreateReverseZOrthographicLH(OrthographicSize * AspectRatio, OrthographicSize, NearPlane, FarPlane)
+                : CreateReverseZPerspectiveLH(vFOV, AspectRatio, NearPlane, FarPlane);
+            // The sub-pixel offset a temporal upscaler asks for (Jitter, set by the renderer): NDC = x·w / z + M31 in
+            // perspective, where w = z; NDC = x + M41 orthographic, where w = 1
+            if (Orthographic)
+            {
+                projection.M41 += Jitter.X;
+                projection.M42 += Jitter.Y;
+            }
+            else
+            {
+                projection.M31 += Jitter.X;
+                projection.M32 += Jitter.Y;
+            }
             Projection = projection;
 
             // radius² / distance² * FoVFactor = squared screen size, where screen size is the bounding
@@ -243,6 +267,21 @@ namespace Freefall.Components
                 0,    h,    0,    0,
                 0,    0,    near / (near - far),  1,
                 0,    0,    far * near / range, 0
+            );
+        }
+
+        /// <summary>
+        /// A left-handed orthographic projection with reverse-Z: view depth <paramref name="near"/> → 1, <paramref name="far"/> → 0,
+        /// linear between (z_ndc = (far − z) / (far − near)). <paramref name="near"/> may be negative.
+        /// </summary>
+        private static Matrix4x4 CreateReverseZOrthographicLH(float width, float height, float near, float far)
+        {
+            float range = far - near;
+            return new Matrix4x4(
+                2f / width, 0,           0,              0,
+                0,          2f / height, 0,              0,
+                0,          0,           -1f / range,    0,
+                0,          0,           far / range,    1
             );
         }
 

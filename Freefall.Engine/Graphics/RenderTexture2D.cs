@@ -9,22 +9,34 @@ namespace Freefall.Graphics
     {
         public CpuDescriptorHandle RtvHandle { get; private set; }
         public uint UavIndex { get; private set; }
-        
-        public RenderTexture2D(GraphicsDevice device, int width, int height, Format format, bool useMultiSampling = false, bool randomWrite = false)
+
+        /// <summary>Whether it has a render target view: a texture only compute writes (renderTarget false) takes none.</summary>
+        public bool IsRenderTarget { get; }
+
+        /// <param name="renderTarget">
+        /// A render target view (from the device's small RTV heap). False for a texture only compute shaders write and
+        /// shaders read (randomWrite): the world map's lit tiles, a hundred of them, ran the RTV heap out at a few hundred.
+        /// </param>
+        public RenderTexture2D(GraphicsDevice device, int width, int height, Format format, bool useMultiSampling = false, bool randomWrite = false,
+                               bool renderTarget = true)
         {
-            ResourceFlags flags = ResourceFlags.AllowRenderTarget;
+            IsRenderTarget = renderTarget;
+            ResourceFlags flags = renderTarget ? ResourceFlags.AllowRenderTarget : ResourceFlags.None;
             if (randomWrite) flags |= ResourceFlags.AllowUnorderedAccess;
 
             // Must start in Common state when no optimized clear value is provided
             _resource = device.CreateTexture2D(format, width, height, 1, 1, flags, ResourceStates.Common, null);
 
             // RTV
-            RtvHandle = device.AllocateRtv();
-            device.CreateRenderTargetView(_resource, new RenderTargetViewDescription
+            if (renderTarget)
             {
-                Format = format,
-                ViewDimension = RenderTargetViewDimension.Texture2D
-            }, RtvHandle);
+                RtvHandle = device.AllocateRtv();
+                device.CreateRenderTargetView(_resource, new RenderTargetViewDescription
+                {
+                    Format = format,
+                    ViewDimension = RenderTargetViewDimension.Texture2D
+                }, RtvHandle);
+            }
 
             // SRV
             var cpuSrv = device.AllocateSrv(out var gpuSrv, out uint index);
@@ -50,7 +62,7 @@ namespace Freefall.Graphics
         public new void Dispose()
         {
             var device = Engine.Device;
-            device.FreeRtv(RtvHandle);
+            if (IsRenderTarget) device.FreeRtv(RtvHandle);
             if (BindlessIndex != 0)
             {
                 device.ReleaseBindlessIndex(BindlessIndex);

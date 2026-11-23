@@ -145,6 +145,7 @@ namespace Freefall.Editor
             // --- Landing page ---
             RecentProjects.Load();
             EditorPreferences.Load();
+            Freefall.Base.EditorJobs.Starter = (title, tag, steps) => ProgressJob.Start(title, tag, steps);
             landingDesktop = new LandingDesktop();
             landingDesktop.OnProjectSelected += OpenProject;
             activeDesktop = landingDesktop;

@@ -247,6 +247,100 @@ namespace Freefall.Graphics
         /// The size the scene is drawn at (<see cref="EngineSettings.RenderScale"/> of the display size): every target
         /// up to <see cref="Composite"/>, and everything sized from them (fog, clouds, light clusters, GTAO, Hi-Z).
         /// </summary>
+        /// <summary>
+        /// The decal pass (and the weather's wet surfaces and snow, drawn by it) on the G-buffer. Off for the world map's
+        /// bake: its orthographic camera has no linear depth in the G-buffer to place decals by.
+        /// </summary>
+        public bool DrawDecals = true;
+
+        /// <summary>
+        /// Every frame copies its G-buffer for the CPU (<see cref="ReadBackGBuffer"/>) as the opaque pass and the decals left
+        /// it: before the sky pass and the forward pass, so the depth is the ground's and not the water's over it. For the
+        /// world map's bake.
+        /// </summary>
+        public bool CaptureGBuffer;
+
+        // The capture's readback buffers (albedo, normals, depth), kept while the size holds; the frame drawn last wrote them
+        private ID3D12Resource?[]? _capture;
+        private readonly uint[] _capturePitch = new uint[3];
+        private int _captureWidth, _captureHeight;
+        private bool _captured;
+        private static readonly int[] CaptureBytes = { 8, 8, 4 };
+
+        private void RecordGBufferCapture(ID3D12GraphicsCommandList list)
+        {
+            int w = RenderWidth, h = RenderHeight;
+            var native = Engine.Device.NativeDevice;
+            if (_capture == null || _captureWidth != w || _captureHeight != h)
+            {
+                // A size change happens at a resize point, with the GPU idle (RenderView.ProcessPendingResize)
+                DisposeCapture();
+                _capture = new ID3D12Resource[3];
+                for (int i = 0; i < 3; i++)
+                {
+                    _capturePitch[i] = (uint)((w * CaptureBytes[i] + 255) & ~255);
+                    _capture[i] = native.CreateCommittedResource(new HeapProperties(HeapType.Readback), HeapFlags.None,
+                        ResourceDescription.Buffer((ulong)_capturePitch[i] * (uint)h), ResourceStates.CopyDest);
+                }
+                _captureWidth = w;
+                _captureHeight = h;
+            }
+
+            // Albedo and normals are still render targets here, the depth still written to
+            var sources = new (ID3D12Resource Resource, ResourceStates State)[]
+            {
+                (Albedo.Native, ResourceStates.RenderTarget), (Normals.Native, ResourceStates.RenderTarget), (Depth.Native, ResourceStates.DepthWrite),
+            };
+            for (int i = 0; i < 3; i++)
+            {
+                var (resource, state) = sources[i];
+                Transition(list, resource, state, ResourceStates.CopySource);
+                var footprint = new PlacedSubresourceFootPrint
+                {
+                    Offset = 0,
+                    Footprint = new SubresourceFootPrint(resource.Description.Format, (uint)w, (uint)h, 1, _capturePitch[i]),
+                };
+                list.CopyTextureRegion(new TextureCopyLocation(_capture[i]!, footprint), 0, 0, 0, new TextureCopyLocation(resource, 0), null);
+                Transition(list, resource, ResourceStates.CopySource, state);
+            }
+            _captured = true;
+        }
+
+        private void DisposeCapture()
+        {
+            if (_capture != null)
+                foreach (var buffer in _capture) buffer?.Dispose();
+            _capture = null;
+            _captured = false;
+        }
+
+        /// <summary>
+        /// The G-buffer the last frame copied while <see cref="CaptureGBuffer"/> was on, row by row without padding: the
+        /// albedo (RGBA16F, 8 bytes a pixel), the normals (RGBA16 SNORM, world space) and the hardware depth (32-bit float,
+        /// reverse-Z). Main thread, between frames (after the frame was submitted): waits for the GPU to finish it.
+        /// </summary>
+        public (byte[] Albedo, byte[] Normals, byte[] Depth) ReadBackGBuffer()
+        {
+            if (!_captured || _capture == null) throw new InvalidOperationException("No frame has copied its G-buffer: turn CaptureGBuffer on and draw one");
+            RenderView.Primary?.WaitForGpu();
+            int w = _captureWidth, h = _captureHeight;
+            var result = new byte[3][];
+            for (int i = 0; i < 3; i++)
+            {
+                int rowBytes = w * CaptureBytes[i];
+                var data = result[i] = new byte[rowBytes * h];
+                unsafe
+                {
+                    void* mapped;
+                    _capture[i]!.Map(0, &mapped);
+                    for (int y = 0; y < h; y++)
+                        System.Runtime.InteropServices.Marshal.Copy((IntPtr)((byte*)mapped + (long)y * _capturePitch[i]), data, y * rowBytes, rowBytes);
+                    _capture[i]!.Unmap(0);
+                }
+            }
+            return (result[0], result[1], result[2]);
+        }
+
         public int RenderWidth { get; private set; } = 1;
         public int RenderHeight { get; private set; } = 1;
 
@@ -1084,7 +1178,7 @@ namespace Freefall.Graphics
 
              // 1b. Decals and the weather (wet surfaces, snow) on the opaque G-buffer: everything that reads it later
              //     (GTAO, the screen-space displacement, the lighting, the particles' depth collision) sees them
-             if (_decals.Render(list, camera, this, BindSceneConstantsForCompute))
+             if (DrawDecals && _decals.Render(list, camera, this, BindSceneConstantsForCompute))
              {
                  list.OMSetRenderTargets(_cachedGBufferRtvHandles, Depth.DsvHandle);
                  list.RSSetViewport(vp);
@@ -1225,6 +1319,11 @@ namespace Freefall.Graphics
                  _cloudView.Render(list, camera.Position, _relativeVP, BindSceneConstantsForCompute, DepthGBuffer.BindlessIndex);
                  Transition(list, DepthGBuffer.Native, ResourceStates.NonPixelShaderResource, ResourceStates.RenderTarget);
              }
+
+             // 2h. The G-buffer as the opaque pass and the decals left it, copied for the CPU (CaptureGBuffer): before the sky,
+             //     whose dome is round the camera, and before the forward pass writes the water's surfaces into the depth
+             if (CaptureGBuffer)
+                 RecordGBufferCapture(list);
 
              // 3. Sky pass
              using (_skyMarker.Auto())
@@ -2124,6 +2223,7 @@ namespace Freefall.Graphics
             VolumetricFog?.Dispose();
             _lightClusters.Dispose();
             _decals.Dispose();
+            DisposeCapture();
             _ssr?.Dispose();
             WaterReflections?.Dispose();
             _precipitation?.Dispose();

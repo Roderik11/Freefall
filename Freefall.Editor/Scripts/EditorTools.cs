@@ -175,10 +175,10 @@ namespace Freefall.Editor
                 return;
 
             // Always run gizmo lifecycle so stale geometry gets cleared
-            // when selection changes or becomes empty.
-            gizmoManager.DrawGizmos(Selector.Selection);
+            // when selection changes or becomes empty. Hidden: as for an empty selection (a capture reads the G-buffer)
+            gizmoManager.DrawGizmos(GizmoContext.Hidden ? (IReadOnlyList<Entity>)Array.Empty<Entity>() : Selector.Selection);
 
-            if (Selector.Selection.Count < 1) return;
+            if (GizmoContext.Hidden || Selector.Selection.Count < 1) return;
             activeTool.Render();
         }
 

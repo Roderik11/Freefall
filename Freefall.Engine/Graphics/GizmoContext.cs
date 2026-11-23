@@ -23,6 +23,12 @@ namespace Freefall.Graphics
     /// </summary>
     public class GizmoContext
     {
+        /// <summary>
+        /// The editor draws no gizmos of the selection while this is set (its tools check it): for a capture of the picture
+        /// that reads the G-buffer, where they draw (the world map's bake).
+        /// </summary>
+        public static bool Hidden { get; set; }
+
         // ── Public State ──
 
         /// <summary>Current draw color. Set before calling Draw* methods.</summary>

@@ -70,6 +70,33 @@ namespace Freefall.Assets.Loaders
             return true;
         }
 
+        // A member named …CacheFile holding "{guid}.{ext}": a file of the asset's own in the Cache root, which no meta lists
+        // (the world map's tiles, WorldMap.TilesCacheFile)
+        private static readonly System.Text.RegularExpressions.Regex CacheFileRef = new(
+            @"^\s*\w*CacheFile:\s*""?([0-9a-fA-F]{32})\.(\w+)""?\s*$",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+
+        /// <summary>
+        /// The Cache-root files the asset's members name (…CacheFile: "{guid}.{ext}"), read from its YAML: a published game
+        /// packs them, and their GUIDs are no "unknown GUID" to the scan.
+        /// </summary>
+        public System.Collections.Generic.IEnumerable<ImplicitArtifact> GetImplicitDependencies(string guid)
+        {
+            var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
+            if (cachePath == null || !Artifacts.Exists(cachePath)) yield break;
+
+            AssetDefinitionData defData;
+            using (var stream = Artifacts.Open(cachePath))
+                defData = _packer.Read(stream);
+
+            foreach (System.Text.RegularExpressions.Match m in CacheFileRef.Matches(Encoding.UTF8.GetString(defData.YamlBytes)))
+            {
+                var fileGuid = m.Groups[1].Value;
+                var ext = m.Groups[2].Value;
+                yield return new ImplicitArtifact(fileGuid, Path.Combine(AssetDatabase.Project.CacheDirectory, $"{fileGuid}.{ext}"), ext);
+            }
+        }
+
         public void Save(Asset asset, string savePath)
         {
             var yaml = NativeImporter.SaveToString(asset);

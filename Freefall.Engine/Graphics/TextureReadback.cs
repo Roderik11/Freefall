@@ -17,7 +17,10 @@ namespace Freefall.Graphics
         /// Read RGBA8 pixels from a GPU texture.
         /// Performs a synchronous GPU→CPU copy (creates a staging buffer, copies, fence-waits, maps).
         /// </summary>
-        public static byte[] ReadPixels(ID3D12Resource source, int width, int height)
+        public static byte[] ReadPixels(ID3D12Resource source, int width, int height) => ReadPixels(source, width, height, ResourceStates.Common);
+
+        /// <summary>As <see cref="ReadPixels(ID3D12Resource, int, int)"/> for a texture that rests in <paramref name="state"/> (put back after).</summary>
+        public static byte[] ReadPixels(ID3D12Resource source, int width, int height, ResourceStates state)
         {
             var device = Engine.Device;
             var nativeDevice = device.NativeDevice;
@@ -39,7 +42,7 @@ namespace Freefall.Graphics
             using var cmd = nativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator);
 
             // Transition source to CopySource
-            cmd.ResourceBarrierTransition(source, ResourceStates.Common, ResourceStates.CopySource);
+            cmd.ResourceBarrierTransition(source, state, ResourceStates.CopySource);
 
             var srcLoc = new TextureCopyLocation(source, 0);
             var dstLoc = new TextureCopyLocation(readbackBuffer,
@@ -52,7 +55,7 @@ namespace Freefall.Graphics
             cmd.CopyTextureRegion(dstLoc, 0, 0, 0, srcLoc, null);
 
             // Transition back to Common
-            cmd.ResourceBarrierTransition(source, ResourceStates.CopySource, ResourceStates.Common);
+            cmd.ResourceBarrierTransition(source, ResourceStates.CopySource, state);
 
             cmd.Close();
             device.SubmitAndWait(cmd);

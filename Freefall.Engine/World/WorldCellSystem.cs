@@ -39,6 +39,12 @@ namespace Freefall.World
         private const float Leave = 1.15f;       // what is made goes again this much further out
         private const float CopiesPerMsAwake = 200f;   // copies whose colliders a cell's body makes in a millisecond when it wakes (play)
 
+        /// <summary>
+        /// Cells still to spawn or to make instances of, and far meshes still to make, after the last update: 0 when what
+        /// the last look wanted is all there (the world map's bake waits for it). The look itself comes every 0.25 s.
+        /// </summary>
+        public static int Queued { get; private set; }
+
         private float _sinceLook = LookEvery;
         private bool _farTierOn;
         private int _stamp;
@@ -165,6 +171,7 @@ namespace Freefall.World
             _toSpawn.RemoveRange(0, next);
 
             Stats.MaxFrameMs = Math.Max(Stats.MaxFrameMs, Stopwatch.GetElapsedTime(start).TotalMilliseconds);
+            Queued = _toSpawn.Count + _toInstance.Count + Built.Count;
         }
 
         // Which slices want entities (a viewer within A) and which groups instances (the camera within their ring and a margin)
