@@ -126,8 +126,9 @@ namespace Freefall.Graphics
                 _transforms.Set(slot, Matrix4x4.Identity);
                 if (slot < _slotToEntity.Length) _slotToEntity[slot] = null;
             }
-            // The next entity to take the slot is not the one that followed a frame
+            // The next entity to take the slot is not the one that followed a frame, nor the one marks were carried by
             WeatherFrames.Remove(slot);
+            DecalBuffer.Instance?.CarrierGone(slot);
         }
 
         /// <summary>

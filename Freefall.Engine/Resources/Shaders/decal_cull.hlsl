@@ -51,7 +51,7 @@ bool CullDecal(uint slot, DecalFrame frame, out DecalRecord r, out float importa
         ageFade = saturate(left / max(r.FadeOut, 1e-3));
     }
 
-    float4x4 m = DecalMatrix(TransformsIdx, r.TransformSlot);
+    float4x4 m = DecalMatrix(TransformsIdx, r);
     float radius = 0.5 * sqrt(dot(m[0].xyz, m[0].xyz) + dot(m[1].xyz, m[1].xyz) + dot(m[2].xyz, m[2].xyz));
     float3 p = m[3].xyz - frame.CameraPosition;
     [unroll]

@@ -22,7 +22,8 @@ struct DecalRecord
     uint TransformSlot;     // the world matrix in the global transform buffer (the entity's, or the ring slot's own)
     uint MaterialId;        // the decal material: its settings block (decal.fx Settings) by MaterialData
     uint Flags;
-    uint Variant;           // tile of the material's atlas
+    uint Variant;           // bits 0..7 the tile of the material's atlas (DecalTile); 8..31 spawned: the transform slot
+                            // + 1 of what carries it (0: nothing), its own matrix then the box in that one's space
     float3 Tint;            // multiplies the material's colour
     float Opacity;          // multiplies every target's opacity
     float SpawnTime;        // spawned: Time when it was made
@@ -61,11 +62,32 @@ struct DecalFrame
     float2 ShelterEye;          // world xz the cover map's levels are centred on (ShelterMap.EyeFor): their blend
 };
 
-// The world matrix's rows: X and Z span the decal (scaled), Y is the projection axis (scaled), T its centre
+#define DECAL_CARRIER_SHIFT 8u      // DecalBuffer.CarrierShift
+#define DECAL_TILE_MASK 0xFFu
+
+// The tile of the material's atlas it shows
+uint DecalTile(DecalRecord r)
+{
+    return r.Variant & DECAL_TILE_MASK;
+}
+
+// A transform slot's world matrix (row vectors: rows 0-2 the axes, row 3 the origin)
 float4x4 DecalMatrix(uint transformsIdx, uint transformSlot)
 {
     StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[transformsIdx];
     return transforms[transformSlot];
+}
+
+// A decal's world matrix: X and Z span the decal (scaled), Y is the projection axis (scaled), T its centre. A spawned
+// mark that something carries (a print on a ship's deck: Decals.Spawn's carrier) keeps its box in that one's space and
+// goes where it goes: its matrix under the carrier's, read from the same buffer, so nothing is written as it moves.
+float4x4 DecalMatrix(uint transformsIdx, DecalRecord r)
+{
+    float4x4 m = DecalMatrix(transformsIdx, r.TransformSlot);
+    uint carrier = r.Variant >> DECAL_CARRIER_SHIFT;
+    if (carrier != 0u)
+        m = mul(m, DecalMatrix(transformsIdx, carrier - 1u));
+    return m;
 }
 
 #endif

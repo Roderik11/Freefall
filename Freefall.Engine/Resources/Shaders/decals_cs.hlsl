@@ -296,7 +296,7 @@ void CSTileDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi
         StructuredBuffer<DecalRecord> records = ResourceDescriptorHeap[RecordsIdx];
         for (uint i = gi; i < count; i += DECAL_TILE * DECAL_TILE)
         {
-            float4x4 m = DecalMatrix(TransformsIdx, records[sorted[i].x].TransformSlot);
+            float4x4 m = DecalMatrix(TransformsIdx, records[sorted[i].x]);
             float3 c = m[3].xyz - CamPos;
             float3 ax = 0.5 * m[0].xyz, ay = 0.5 * m[1].xyz, az = 0.5 * m[2].xyz;
             bool inside = true;
@@ -413,7 +413,7 @@ void ApplyDecal(uint i, float3 rel, float3 geo, float3 dx, float3 dy, uint surfa
     uint2 entry = sorted[i];
     StructuredBuffer<DecalRecord> records = ResourceDescriptorHeap[RecordsIdx];
     DecalRecord r = records[entry.x];
-    float4x4 m = DecalMatrix(TransformsIdx, r.TransformSlot);
+    float4x4 m = DecalMatrix(TransformsIdx, r);
 
     float3 d = rel - (m[3].xyz - CamPos);
     float3 lx = m[0].xyz, ly = m[1].xyz, lz = m[2].xyz;
@@ -440,7 +440,7 @@ void ApplyDecal(uint i, float3 rel, float3 geo, float3 dx, float3 dy, uint surfa
 
     // The texture coordinates and their steps to the neighbouring pixels, from the neighbours' places
     uint cols = max(S.AtlasColumns, 1u), rows = max(S.AtlasRows, 1u);
-    uint tile = r.Variant % (cols * rows);
+    uint tile = DecalTile(r) % (cols * rows);
     float2 tileSize = 1.0 / float2(cols, rows);
     float2 uv = (float2(tile % cols, tile / cols) + float2(local.x + 0.5, 0.5 - local.z)) * tileSize;
     float2 uvDx = float2(dot(dx, lx) * invLen2.x, -dot(dx, lz) * invLen2.z) * tileSize;

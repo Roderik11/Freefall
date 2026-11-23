@@ -33,6 +33,8 @@ namespace Freefall.Graphics
         private const uint Enabled = 1;                 // decals.hlsli DECAL_ENABLED
         private const uint Spawned = 2;                 // DECAL_SPAWNED
         private const int PriorityShift = 8;            // DECAL_PRIORITY_SHIFT
+        private const int CarrierShift = 8;             // DECAL_CARRIER_SHIFT: Variant's bits above the atlas tile
+        private const uint TileMask = 0xFF;             // DECAL_TILE_MASK
 
         /// <summary>One per decal. Must match DecalRecord in decals.hlsli (48 bytes).</summary>
         [StructLayout(LayoutKind.Sequential)]
@@ -41,7 +43,7 @@ namespace Freefall.Graphics
             public uint TransformSlot;
             public uint MaterialId;
             public uint Flags;
-            public uint Variant;
+            public uint Variant;            // bits 0..7 the atlas tile; 8..31 spawned: what carries it (transform slot + 1)
             public Vector3 Tint;
             public float Opacity;
             public float SpawnTime, Lifetime, FadeOut, SpawnSnow;
@@ -57,6 +59,8 @@ namespace Freefall.Graphics
         private int _placed;                    // placed decals registered
 
         private int[]? _ringTransforms;         // the ring's own transform slots, taken at the first spawn
+        private int[]? _ringCarriers;           // per ring slot: the transform slot + 1 of what carries it (0: nothing)
+        private readonly Dictionary<int, int> _carried = new();    // a carrier's transform slot: how many it carries
         private int _ringNext;
         private double _ringLiveUntil = double.NegativeInfinity;   // Time.TotalTime the last spawned one has faded by
         private readonly HashSet<Material> _ringMaterials = new(); // held while the ring has used them (until it starts over)
@@ -101,6 +105,8 @@ namespace Freefall.Graphics
             {
                 for (int i = 0, n = Math.Min(_ringNext, RingSize); i < n; i++)
                     _records.Set(i, default); // disabled
+                if (_ringCarriers != null) Array.Clear(_ringCarriers);
+                _carried.Clear();
                 _ringNext = 0;
                 _ringLiveUntil = double.NegativeInfinity;
                 foreach (var material in _ringMaterials)
@@ -169,10 +175,12 @@ namespace Freefall.Graphics
         /// <summary>
         /// A decal in the spawned ring (<see cref="Decals.Spawn"/>): its box as a world matrix (X and Z span it, Y is the
         /// projection axis, as a Decal's entity), lasting <paramref name="lifetime"/> seconds and fading out over the last
-        /// <paramref name="fadeOut"/>; it overwrites the oldest when the ring comes round.
+        /// <paramref name="fadeOut"/>; it overwrites the oldest when the ring comes round. With a
+        /// <paramref name="carrier"/> the box is kept in that transform's space and goes where it goes (the GPU puts it
+        /// under the carrier's matrix: decals.hlsli DecalMatrix); a carrier given up takes its marks with it.
         /// </summary>
         internal void Spawn(Material material, in Matrix4x4 box, int variant, Vector3 tint, float opacity, int priority,
-            float lifetime, float fadeOut)
+            float lifetime, float fadeOut, Transform? carrier = null)
         {
             if (material == null || !IsDecalMaterial(material) || TransformBuffer.Instance == null) return;
             lock (_lock)
@@ -180,12 +188,35 @@ namespace Freefall.Graphics
                 if (_ringTransforms == null)
                 {
                     _ringTransforms = new int[RingSize];
+                    _ringCarriers = new int[RingSize];
                     for (int i = 0; i < RingSize; i++)
                         _ringTransforms[i] = TransformBuffer.Instance.AllocateSlot();
                 }
+
+                var matrix = box;
+                int carrierSlot = -1;
+                if (carrier != null && !carrier.IsDestroyed)
+                {
+                    var carrierMatrix = carrier.Matrix;
+                    carrierSlot = carrier.TransformSlot;
+                    if (carrierSlot >= 0 && Matrix4x4.Invert(carrierMatrix, out var toCarrier))
+                    {
+                        matrix = box * toCarrier;
+                        // A transform slot taken on first access holds identity until the transform next changes
+                        TransformBuffer.Instance.SetTransform(carrierSlot, carrierMatrix);
+                    }
+                    else carrierSlot = -1;
+                }
+
                 int slot = _ringNext++ % RingSize;
+                Uncarry(slot);
+                if (carrierSlot >= 0)
+                {
+                    _ringCarriers![slot] = carrierSlot + 1;
+                    _carried[carrierSlot] = _carried.GetValueOrDefault(carrierSlot) + 1;
+                }
                 if (_ringMaterials.Add(material)) material.Acquire();   // held until the ring starts over
-                TransformBuffer.Instance.SetTransform(_ringTransforms[slot], box);
+                TransformBuffer.Instance.SetTransform(_ringTransforms[slot], matrix);
                 double now = Base.Time.TotalTime;
                 lifetime = MathF.Max(lifetime, 0.01f);
                 _records.Set(slot, new Record
@@ -193,7 +224,7 @@ namespace Freefall.Graphics
                     TransformSlot = (uint)_ringTransforms[slot],
                     MaterialId = (uint)Math.Max(material.MaterialID, 0),
                     Flags = Enabled | Spawned | ((uint)Math.Clamp(priority, 0, 15) << PriorityShift),
-                    Variant = (uint)Math.Max(variant, 0),
+                    Variant = ((uint)Math.Max(variant, 0) & TileMask) | ((uint)(carrierSlot + 1) << CarrierShift),
                     Tint = tint,
                     Opacity = Math.Clamp(opacity, 0f, 1f),
                     SpawnTime = (float)now,
@@ -202,6 +233,38 @@ namespace Freefall.Graphics
                     SpawnSnow = Weather.SnowFallen,
                 });
                 _ringLiveUntil = Math.Max(_ringLiveUntil, now + lifetime);
+            }
+        }
+
+        // A ring slot about to be written again no longer counts for what carried it (under _lock)
+        private void Uncarry(int slot)
+        {
+            int carrier = _ringCarriers![slot] - 1;
+            if (carrier < 0) return;
+            _ringCarriers[slot] = 0;
+            if (_carried.TryGetValue(carrier, out int count))
+            {
+                if (count <= 1) _carried.Remove(carrier);
+                else _carried[carrier] = count - 1;
+            }
+        }
+
+        /// <summary>
+        /// A transform slot was given back (<see cref="TransformBuffer.ReleaseSlot"/>: its entity is gone): the marks it
+        /// carried go with it, before the slot's next owner could take them somewhere else.
+        /// </summary>
+        internal void CarrierGone(int transformSlot)
+        {
+            lock (_lock)
+            {
+                if (!_carried.Remove(transformSlot) || _ringCarriers == null) return;
+                int key = transformSlot + 1;
+                for (int i = 0, n = Math.Min(_ringNext, RingSize); i < n; i++)
+                {
+                    if (_ringCarriers[i] != key) continue;
+                    _ringCarriers[i] = 0;
+                    _records.Set(i, default); // disabled
+                }
             }
         }
 
@@ -221,7 +284,7 @@ namespace Freefall.Graphics
                 TransformSlot = (uint)Math.Max(transformSlot, 0),
                 MaterialId = (uint)Math.Max(material?.MaterialID ?? 0, 0),
                 Flags = (drawn ? Enabled : 0) | ((uint)Math.Clamp(decal.Priority, 0, 15) << PriorityShift),
-                Variant = (uint)Math.Max(decal.Variant, 0),
+                Variant = (uint)Math.Max(decal.Variant, 0) & TileMask,
                 Tint = new Vector3(decal.Tint.R, decal.Tint.G, decal.Tint.B),
                 Opacity = Math.Clamp(decal.Opacity, 0f, 1f),
             });
