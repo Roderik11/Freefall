@@ -170,6 +170,8 @@ namespace Freefall.Animation
             public float Height;        // where the foot is put in the world, eased
             public Vector2 Slope;
             public FootGround Ground;   // the same for the pose
+            public RigidDynamic Body;   // the body its ground belongs to when that can move (a ship's deck), else null
+            public Matrix4x4 BodyPose;  // where that body stood when the ground above was last brought up to date
         }
 
         private readonly Animator _animator;
@@ -182,6 +184,7 @@ namespace Freefall.Animation
         private Func<RaycastHit[], bool> _onHits;
         private float _hitAt;
         private Vector3 _hitNormal;
+        private Shape _hitShape;
         private bool _hitAny;
 
         public FootPlacement(Animator animator)
@@ -270,6 +273,9 @@ namespace Freefall.Animation
             ball = Vector3.Transform(ball, world);
             ankle = Vector3.Transform(ankle, world);
 
+            // Ground that moves (a ship's deck) takes what was found on it along, the foot's eased height too
+            if (foot.Looked && foot.Body != null) Ride(ref foot, ankle);
+
             // A foot that is down keeps the ground it landed on: nothing new to find under it,
             // however long it stands
             bool down = (left ? LeftDown : RightDown) >= 0.5f;
@@ -316,9 +322,10 @@ namespace Freefall.Animation
         {
             foot.Looked = true;
             foot.LookedAt = ball;
+            foot.Body = null;
 
-            bool onBall = Ray(ball.X, ball.Z, feetY, out float ballY, out var ballNormal);
-            bool onHeel = Ray(heel.X, heel.Z, feetY, out float heelY, out var heelNormal);
+            bool onBall = Ray(ball.X, ball.Z, feetY, out float ballY, out var ballNormal, out var ballShape);
+            bool onHeel = Ray(heel.X, heel.Z, feetY, out float heelY, out var heelNormal, out var heelShape);
             foot.Found = onBall || onHeel;
             if (!foot.Found) return;
 
@@ -343,9 +350,57 @@ namespace Freefall.Animation
             if (steep > steepest) gradient *= MathF.Sqrt(steepest / steep);
 
             foot.Gradient = gradient;
-            foot.Anchor = !onHeel || (onBall && ballY >= heelY)
+            bool onBallsHit = !onHeel || (onBall && ballY >= heelY);
+            foot.Anchor = onBallsHit
                 ? new Vector3(ball.X, ballY, ball.Z)
                 : new Vector3(heel.X, heelY, heel.Z);
+
+            // Found on something that can move: what was found is that body's, and goes with it (Ride)
+            if ((onBallsHit ? ballShape : heelShape)?.Actor is RigidDynamic body && !body.Disposed)
+            {
+                foot.Body = body;
+                foot.BodyPose = body.GlobalPose;
+            }
+        }
+
+        // The body the foot's ground was found on has moved since (a ship's deck heaving, rolling, sailing on): where
+        // the foot looked, the ground's anchor and its slope go with it, and so does the foot's eased height, by as much
+        // as the ground rose or fell under the ankle. Easing it there instead, a foot that is down trailed the deck by
+        // its PlantedEase; and at anchor, where the feet hardly move over the deck and look for nothing new, the ground
+        // they kept stayed where the deck had been, and they sank into it and stood over it as it rose and fell (2026-11-24).
+        private void Ride(ref Foot foot, Vector3 ankle)
+        {
+            var body = foot.Body;
+            if (body.Disposed)
+            {
+                foot.Body = null;
+                foot.Looked = false;   // the ground is gone: look again
+                return;
+            }
+            var pose = body.GlobalPose;
+            if (pose == foot.BodyPose || !Matrix4x4.Invert(foot.BodyPose, out var from)) return;
+            var moved = from * pose;   // where a point of the body was to where it is now, in the world
+            foot.BodyPose = pose;
+
+            foot.LookedAt = Vector3.Transform(foot.LookedAt, moved);
+            if (!foot.Found) return;
+
+            float before = foot.Anchor.Y + foot.Gradient.X * (ankle.X - foot.Anchor.X) + foot.Gradient.Y * (ankle.Z - foot.Anchor.Z);
+            var gradientBefore = foot.Gradient;
+
+            // The ground's normal turned with the body, and the slope read off it again as Look reads it
+            var normal = Vector3.TransformNormal(new Vector3(-foot.Gradient.X, 1f, -foot.Gradient.Y), moved);
+            float up = MathF.Max(normal.Y, 0.1f);
+            var gradient = new Vector2(-normal.X / up, -normal.Z / up);
+            float steepest = MaxSlope * MaxSlope, steep = gradient.LengthSquared();
+            if (steep > steepest) gradient *= MathF.Sqrt(steepest / steep);
+
+            foot.Anchor = Vector3.Transform(foot.Anchor, moved);
+            foot.Gradient = gradient;
+            if (!foot.Placed) return;
+            float after = foot.Anchor.Y + gradient.X * (ankle.X - foot.Anchor.X) + gradient.Y * (ankle.Z - foot.Anchor.Z);
+            foot.Height += after - before;
+            foot.Slope += gradient - gradientBefore;
         }
 
         // A foot's ray's hits: Scene.RaycastInto writes them here instead of making an object per hit (PhysX.Net's
@@ -353,11 +408,12 @@ namespace Freefall.Animation
         // every character's feet at once on workers (CharacterSystem's Feet), while nothing writes the physics scene
         [ThreadStatic] private static RaycastHitData[] t_rayHits;
 
-        private bool Ray(float x, float z, float feetY, out float y, out Vector3 normal)
+        private bool Ray(float x, float z, float feetY, out float y, out Vector3 normal, out Shape shape)
         {
             float top = feetY + ReachUp, length = ReachUp + ReachDown;
             _hitAt = length;
             _hitNormal = Vector3.UnitY;
+            _hitShape = null;
             _hitAny = false;
             var scene = PhysicsWorld.Scene;
             if (scene != null)
@@ -373,6 +429,8 @@ namespace Freefall.Animation
             }
             y = top - _hitAt;
             normal = _hitNormal;
+            shape = _hitShape;
+            _hitShape = null;
             return _hitAny;
         }
 
@@ -393,6 +451,7 @@ namespace Freefall.Animation
             if (shape == null || (shape.Flags & ShapeFlag.TriggerShape) != 0 || shape.UserData is not Collider) return;
             _hitAt = distance;
             _hitNormal = normal;
+            _hitShape = shape;
             _hitAny = true;
         }
 
