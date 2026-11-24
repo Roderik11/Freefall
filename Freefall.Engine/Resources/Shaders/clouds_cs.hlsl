@@ -13,6 +13,7 @@
 //   CSCloudProbeFace  one face of the sky probe's clouds (64², coarser)
 //   CSCloudShadowMap  rows of the ground shadow map: the optical depth toward the light from where a ray crosses the
 //                 slab's bottom, marched through the field (the shadows on the ground, the water, the air)
+//   CSCloudShadowMip  rows of one of its mips from the level above (the aerial perspective reads it along its steps)
 //   CSPrecipitation / CSPrecipitationProbe  what reaches the ground round the camera (Graphics/Weather.cs): the map, and
 //                 the camera's own for the CPU
 // Docs: .agent/knowledge/atmospheric_effects/volumetric_clouds.md, weather.md.
@@ -27,6 +28,7 @@
 #pragma kernel CSCloudProbeFace
 #pragma kernel CSCloudSceneDepth
 #pragma kernel CSCloudShadowMap
+#pragma kernel CSCloudShadowMip
 #pragma kernel CSPrecipitation
 #pragma kernel CSPrecipitationProbe
 
@@ -42,7 +44,7 @@ cbuffer PushConstants : register(b3)
     uint TargetWidth;           // march, reconstruct: the view's half-size target; probe: the face's size
     uint TargetHeight;
     uint FrameIndex;            // march, reconstruct: the jitter's frame and which texel of each 2×2 is marched
-    uint SourceTexIdx;          // light step: the last pass (Texture3D<float>)
+    uint SourceTexIdx;          // light step: the last pass (Texture3D<float>); shadow mip: the level above (Texture2D<float4>)
     uint LightStepBits;         // light step: asfloat, this pass's reach along the light (m)
     uint DepthUAVIdx;           // march, reconstruct: the depth written (RWTexture2D<float>, km)
     uint MarchMode;             // march: 0 every texel, 1 one of each 2×2 block (sparse)
@@ -757,6 +759,25 @@ void CSCloudShadowMap(uint3 id : SV_DispatchThreadID)
     float tauClamped = min(tau, CLOUD_SHADOW_MARCH_TAU);
     RWTexture2D<float4> target = ResourceDescriptorHeap[TargetUAVIdx];
     target[phys] = float4(tau, exp(-tauClamped), CloudThrough(tau), CloudForwardAt(tauClamped));
+}
+
+// A mip of the ground shadow map: TargetHeight rows of TargetWidth texels from row RegionZ0Bits, each the mean of the
+// 2×2 texels above it (Clouds.cs makes the levels in turn after the rows CSCloudShadowMap wrote). The shares (gba) are
+// what the readers filter, and their means are what a wider footprint lets through (sky_common.fx
+// CloudShadowMapAlong); τ's mean is kept beside them but nobody reads it (CloudShadowDepthAt reads level 0). The map is
+// toroidal and a power of two wide, so its levels are too.
+[numthreads(8, 8, 1)]
+void CSCloudShadowMip(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= TargetWidth || id.y >= TargetHeight)
+        return;
+    Texture2D<float4> above = ResourceDescriptorHeap[SourceTexIdx];
+    int2 p = int2((int)id.x, (int)(asuint(RegionZ0Bits) + id.y));
+    int2 q = p * 2;
+    float4 sum = above.Load(int3(q, 0)) + above.Load(int3(q + int2(1, 0), 0))
+               + above.Load(int3(q + int2(0, 1), 0)) + above.Load(int3(q + int2(1, 1), 0));
+    RWTexture2D<float4> target = ResourceDescriptorHeap[TargetUAVIdx];
+    target[p] = 0.25 * sum;
 }
 
 // Schneider's in-scatter probability (Nubis 2017): light gets scattered toward the eye only where it has had some cloud

@@ -33,7 +33,7 @@ cbuffer PushConstants : register(b3)
 #include "atmosphere_common.hlsli"
 #include "sky_common.fx"
 
-SamplerState CloudWrapSampler : register(s0);       // linear wrap (the cloud noise)
+SamplerState CloudWrapSampler : register(s0);       // wrap, anisotropic (the cloud noise; the ground shadow map along a step)
 
 struct ScatteringResult
 {
@@ -444,6 +444,7 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
     // The ray's margin above the terrain's shadow toward the sun and the moon where the step starts
     float sunMargin = sunLit ? AtmTerrainLightMargin(A, APWorldPos(A, pos), false) : 1e4;
     float moonMargin = moonLit ? AtmTerrainLightMargin(A, APWorldPos(A, pos), true) : 1e4;
+    float3 worldStart = APWorldPos(A, pos);     // where the step starts (the clouds are read along it)
     for (uint s = 0; s < slices; s++)
     {
         float w = (s + 0.5) / slices;
@@ -460,9 +461,13 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
                 float3 up = P / pHeight;
                 AtmMedium medium = SampleAtmMedium(P, A);
 
-                // The cloud layer at the step's middle (the near fog volume's own CloudAirLight, so the two meet at
-                // its range without a seam)
+                // The clouds over the whole step, centred on its middle (the near fog volume's own CloudAirLight, so
+                // the two meet at its range without a seam; sky_common.fx CloudShadowMapAlong): a step far out is
+                // hundreds of metres long, and read at its middle it went lit or shaded as a whole as a cloud's edge
+                // drifted past, so the glow's edges in the haze jumped from slice to slice
                 float3 relMid = worldMid - CamPos;
+                float3 along = worldEnd - worldStart;
+                worldStart = worldEnd;
                 float3 S = 0;
                 if (sunLit)
                 {
@@ -471,7 +476,8 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
                     float sunShare = 0.5 * (APLitShare(sunMargin, midMargin) + APLitShare(midMargin, endMargin));
                     sunMargin = endMargin;
                     float3 sunTint;
-                    float3 sunCloud = CloudAirLight(CloudWrapSampler, relMid, A.SunDirection, skyDimming, sunTint);
+                    float3 sunCloud = CloudAirLightAlong(CloudWrapSampler, relMid, A.SunDirection, skyDimming, along,
+                                                         sunTint);
                     S = A.SunIlluminance * APSampleLight(A, medium, P, up, pHeight, sunShare, sunCloud, sunTint,
                                                          A.SunDirection, sunMie, sunRayleigh);
                 }
@@ -482,7 +488,8 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
                     float moonShare = 0.5 * (APLitShare(moonMargin, midMargin) + APLitShare(midMargin, endMargin));
                     moonMargin = endMargin;
                     float3 moonTint;
-                    float3 moonCloud = CloudAirLight(CloudWrapSampler, relMid, A.MoonDirection, skyDimming, moonTint);
+                    float3 moonCloud = CloudAirLightAlong(CloudWrapSampler, relMid, A.MoonDirection, skyDimming, along,
+                                                          moonTint);
                     S += A.MoonIlluminance * APSampleLight(A, medium, P, up, pHeight, moonShare, moonCloud, moonTint,
                                                            A.MoonDirection, moonMie, moonRayleigh);
                 }

@@ -467,6 +467,32 @@ float3 CloudShadowMapDisc(CloudParams C, SamplerState wrapSampler, float2 uv, fl
     return t / (taps + 1.0);
 }
 
+// How far a stretch of a ray (camera-relative metres) moves the place where the light's path from it crosses the slab's
+// bottom: the stretch slid along the light onto one level (the planet's curve changes that little over a stretch)
+float2 CloudCrossingAlong(float3 along, float3 toLight)
+{
+    return along.xz - toLight.xz * (along.y / max(toLight.y, 0.02));
+}
+
+// The ground shadow map's shares through the light's disc, as CloudShadowMapDisc's, over a stretch of a ray: the mean
+// along the stretch's crossing (alongUV, the map's uv it spans, centred on uv) and as wide as the disc, from one
+// anisotropic lookup in the map's mips (Clouds.cs: six levels of 2×2 means). The aerial perspective's march reads the
+// clouds once a step, and its steps run to hundreds of metres; read at a point, a step went lit or shaded as a whole as
+// a cloud's edge drifted past its middle, and the glow's edges in the haze jumped from slice to slice as the clouds
+// moved (user, 2026-11-24). Along a stretch shorter than the disc is wide, CloudShadowMapDisc itself, so a short step
+// (the near slices, and the near fog volume's froxels next to them) reads what it read before. wrapSampler: the
+// anisotropic static sampler (s0); a linear one takes the mean over a square as long as the stretch instead.
+float3 CloudShadowMapAlong(CloudParams C, SamplerState wrapSampler, float2 uv, float radiusTexels, float2 alongUV)
+{
+    float alongTexels = length(alongUV) * CLOUD_SHADOW_TEXELS;
+    float across = max(2.0 * radiusTexels, 1.0);
+    if (alongTexels <= across)
+        return CloudShadowMapDisc(C, wrapSampler, uv, radiusTexels);
+    Texture2D<float4> map = ResourceDescriptorHeap[C.ShadowMap];
+    float2 side = float2(-alongUV.y, alongUV.x) * (across / alongTexels);
+    return map.SampleGrad(wrapSampler, uv, alongUV, side).gba;
+}
+
 // Of what the clouds let through beyond their beam (t: CloudTransmission), the share that goes on forward
 // (CloudForwardAt), τ from the share passing through (CloudThrough = 1 / (1 + CLOUD_DIFFUSION τ); the beam underflows
 // past τ ~14)
@@ -481,7 +507,10 @@ float CloudForwardShare(float2 t)
 // shadow map's window that map through the light's disc (CloudShadowMapDisc); for a light the volumes are not built for
 // (a moon by day, the sun once the moon lights the clouds) the means round the camera stand in (CloudDeck), below the
 // base. wrapSampler: linear wrap.
-float3 CloudTransmissionForward(SamplerState wrapSampler, float3 relPos, float3 toLight)
+// along: a stretch of a ray centred on relPos whose mean is wanted (CloudShadowMapAlong; 0 = at the place itself), the
+// aerial perspective's steps; only the ground shadow map's window takes it (past it the light volume's texels are
+// 0.25-1 km already).
+float3 CloudTransmissionForwardAlong(SamplerState wrapSampler, float3 relPos, float3 toLight, float3 along)
 {
     float2 t;
     if (CloudsOn != 0)
@@ -495,11 +524,17 @@ float3 CloudTransmissionForward(SamplerState wrapSampler, float3 relPos, float3 
         float4 mapAt;
         float tau = CloudShadowDepthAt(C, relPos, toLight, wrapSampler, false, mapAt);
         if (mapAt.w >= 1.0)
-            return CloudShadowMapDisc(C, wrapSampler, mapAt.xy, mapAt.z * CLOUD_LIGHT_DISC / C.ShadowTexel);
+            return CloudShadowMapAlong(C, wrapSampler, mapAt.xy, mapAt.z * CLOUD_LIGHT_DISC / C.ShadowTexel,
+                                       CloudCrossingAlong(along, toLight) / (CLOUD_SHADOW_TEXELS * C.ShadowTexel));
         return float3(exp(-tau), CloudThrough(tau), CloudForwardAt(tau));
     }
     float tau = CloudLayerDepth(wrapSampler, relPos, toLight);
     return float3(exp(-tau), CloudThrough(tau), CloudForwardAt(tau));
+}
+
+float3 CloudTransmissionForward(SamplerState wrapSampler, float3 relPos, float3 toLight)
+{
+    return CloudTransmissionForwardAlong(wrapSampler, relPos, toLight, 0.0);
 }
 
 float2 CloudTransmission(SamplerState wrapSampler, float3 relPos, float3 toLight)
@@ -539,9 +574,12 @@ float CloudSkyDimming(float4 deck)
 // diffusedTint: what .y's light carries over the beam's colour at the place: under the volumetric clouds it entered them
 // above, through less air than a beam down to here takes (clouds_cs.hlsl CloudMarchClouds), so × the air's transmittance
 // there over here's (the air under a storm came out sepia); 1 for the 2D layer.
-float3 CloudAirLight(SamplerState wrapSampler, float3 relPos, float3 toLight, float skyDimming, out float3 diffusedTint)
+// along: the stretch of the ray the light is wanted over, centred on relPos (CloudTransmissionForwardAlong; the aerial
+// perspective's steps), 0 at the place.
+float3 CloudAirLightAlong(SamplerState wrapSampler, float3 relPos, float3 toLight, float skyDimming, float3 along,
+                          out float3 diffusedTint)
 {
-    float3 tf = CloudTransmissionForward(wrapSampler, relPos, toLight);
+    float3 tf = CloudTransmissionForwardAlong(wrapSampler, relPos, toLight, along);
     float2 t = tf.xy;
     diffusedTint = 1.0;
     float sky;
@@ -578,6 +616,11 @@ float3 CloudAirLight(SamplerState wrapSampler, float3 relPos, float3 toLight, fl
     float diffused = max(t.y - t.x, 0.0);
     float forward = min(tf.z, diffused);
     return float3(t.x + forward, diffused - forward, sky);
+}
+
+float3 CloudAirLight(SamplerState wrapSampler, float3 relPos, float3 toLight, float skyDimming, out float3 diffusedTint)
+{
+    return CloudAirLightAlong(wrapSampler, relPos, toLight, skyDimming, 0.0, diffusedTint);
 }
 
 // Light on a lit particle or ribbon (smoke, rain, snow, a blade's trail), as a multiple of its albedo (E / π,

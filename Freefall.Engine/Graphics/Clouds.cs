@@ -130,7 +130,7 @@ namespace Freefall.Graphics
         private readonly record struct Bake(int Level, long X0, long Z0, int BricksX, int BricksZ);
 
         private static ComputeShader? _cs;
-        private static int _kBake, _kLightInit, _kLightStep, _kLightChain, _kSkyScan, _kProbeFace, _kShadowMap;
+        private static int _kBake, _kLightInit, _kLightStep, _kLightChain, _kSkyScan, _kProbeFace, _kShadowMap, _kShadowMip;
 
         // The ground shadow map (clouds_cs.hlsl CSCloudShadowMap, VOLUMETRIC_CLOUDS_PLAN §8): the optical depth toward the
         // light from where a ray toward it crosses the slab's bottom, 1024² over 32 km of cloud space round the camera's
@@ -142,8 +142,18 @@ namespace Freefall.Graphics
         // All of it every 16 steps (UpkeepHz): ~0.075 ms at 64 rows (0.15 ms at 128); the map is in cloud space, so only
         // the clouds' own slow change and a moving light age it
         private const int ShadowRowsPerFrame = ShadowMapTexels / 16;
-        private static RenderTexture2D? _shadowMap;
-        private static ResourceStates _shadowMapState = ResourceStates.Common;
+        // With mips, each the 2×2 means of the one above (CSCloudShadowMip, the rows a step made): the aerial perspective
+        // reads the map along each step of its march, an anisotropic lookup as long as the step (sky_common.fx
+        // CloudShadowMapAlong). Read at a point, a step a few hundred metres long went lit or shaded as a whole as a
+        // cloud's edge drifted past its middle, and the glow's edges jumped from slice to slice (user, 2026-11-24).
+        // Six levels: a lookup's narrow side is the light's disc (up to ~9 texels for a crossing 30 km off), its long
+        // side up to 16 of those.
+        private const int ShadowMapMips = 6;
+        private static ID3D12Resource? _shadowMap;
+        private static uint _shadowMapSrv;                                  // every level
+        private static readonly uint[] _shadowMipSrv = new uint[ShadowMapMips];
+        private static readonly uint[] _shadowMipUav = new uint[ShadowMapMips];
+        private static ResourceStates _shadowMapState = ResourceStates.Common;     // of every level between frames
         private static int _shadowRow;
         private static bool _shadowAll = true;                  // every row this frame (a rebake, the light jumped, a teleport)
         private static Vector3 _shadowLightDir;                 // last frame's
@@ -246,6 +256,7 @@ namespace Freefall.Graphics
             _kSkyScan = _cs.FindKernel("CSCloudSkyScan");
             _kProbeFace = _cs.FindKernel("CSCloudProbeFace");
             _kShadowMap = _cs.FindKernel("CSCloudShadowMap");
+            _kShadowMip = _cs.FindKernel("CSCloudShadowMip");
         }
 
         private static void EnsureResources()
@@ -277,8 +288,36 @@ namespace Freefall.Graphics
             }
 
             // The optical depth (half floats as the light volumes) and what it lets through: the beam, all of it, the
-            // forward share (CSCloudShadowMap), which the readers filter as they are
-            _shadowMap = new RenderTexture2D(device, ShadowMapTexels, ShadowMapTexels, Format.R16G16B16A16_Float, randomWrite: true);
+            // forward share (CSCloudShadowMap), which the readers filter as they are; its mips for the aerial perspective
+            const Format shadowFormat = Format.R16G16B16A16_Float;
+            _shadowMap = device.CreateTexture2D(shadowFormat, ShadowMapTexels, ShadowMapTexels, 1, ShadowMapMips,
+                                                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+            for (int m = 0; m < ShadowMapMips; m++)
+            {
+                _shadowMipUav[m] = device.AllocateBindlessIndex();
+                device.NativeDevice.CreateUnorderedAccessView(_shadowMap, null, new UnorderedAccessViewDescription
+                {
+                    Format = shadowFormat,
+                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
+                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = (uint)m }
+                }, device.GetCpuHandle(_shadowMipUav[m]));
+                _shadowMipSrv[m] = device.AllocateBindlessIndex();
+                device.NativeDevice.CreateShaderResourceView(_shadowMap, new ShaderResourceViewDescription
+                {
+                    Format = shadowFormat,
+                    ViewDimension = ShaderResourceViewDimension.Texture2D,
+                    Shader4ComponentMapping = ShaderComponentMapping.Default,
+                    Texture2D = new Texture2DShaderResourceView { MostDetailedMip = (uint)m, MipLevels = 1 }
+                }, device.GetCpuHandle(_shadowMipSrv[m]));
+            }
+            _shadowMapSrv = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateShaderResourceView(_shadowMap, new ShaderResourceViewDescription
+            {
+                Format = shadowFormat,
+                ViewDimension = ShaderResourceViewDimension.Texture2D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = ShadowMapMips }
+            }, device.GetCpuHandle(_shadowMapSrv));
 
             // The probe's clouds: pre-exposed light and a transmittance, as the probe holds light
             const Format probeFormat = Format.R16G16B16A16_Float;
@@ -510,7 +549,7 @@ namespace Freefall.Graphics
                 // The light spreads through the cloud's mean extinction round the flash, a tenth of a full cloud's: at
                 // 0.4 only the core within ~1 km lit, where a flash lights a whole storm cell
                 FlashSpread = MathF.Max(s.Density, 0f) * 0.1f,
-                ShadowMap = _shadowMap!.BindlessIndex,
+                ShadowMap = _shadowMapSrv,
                 ShadowTexel = ShadowMapTexel,
                 ShadowCentre = centre,
                 FreezingLevel = s.FreezingLevel,
@@ -890,17 +929,37 @@ namespace Freefall.Graphics
             {
                 if (_shadowMapState != ResourceStates.UnorderedAccess)
                 {
-                    list.ResourceBarrierTransition(_shadowMap!.Native, _shadowMapState, ResourceStates.UnorderedAccess);
+                    list.ResourceBarrierTransition(_shadowMap!, _shadowMapState, ResourceStates.UnorderedAccess);
                     _shadowMapState = ResourceStates.UnorderedAccess;
                 }
-                cs.SetPushConstant(_kShadowMap, "TargetUAV", _shadowMap!.UavIndex);
+                cs.SetPushConstant(_kShadowMap, "TargetUAV", _shadowMipUav[0]);
                 cs.SetPushConstant(_kShadowMap, "TargetWidth", (uint)ShadowMapTexels);
                 cs.SetPushConstant(_kShadowMap, "TargetHeight", (uint)rows);
                 cs.SetPushConstant(_kShadowMap, "RegionZ0Bits", (uint)firstRow);
                 cs.Dispatch(_kShadowMap, list, ShadowMapTexels / 8, (uint)(rows + 7) / 8, 1);
+
+                // The mips of the rows just made (firstRow is a whole number of the share, so each level's rows are whole):
+                // each level read through its own view once made, as the bloom's chain is (no typed UAV loads)
+                for (int m = 1; m < ShadowMapMips; m++)
+                {
+                    list.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowMap!,
+                        ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource, (uint)(m - 1))));
+                    int size = ShadowMapTexels >> m;
+                    int first = firstRow >> m, last = (firstRow + rows - 1) >> m;
+                    cs.SetPushConstant(_kShadowMip, "SourceTex", _shadowMipSrv[m - 1]);
+                    cs.SetPushConstant(_kShadowMip, "TargetUAV", _shadowMipUav[m]);
+                    cs.SetPushConstant(_kShadowMip, "TargetWidth", (uint)size);
+                    cs.SetPushConstant(_kShadowMip, "TargetHeight", (uint)(last - first + 1));
+                    cs.SetPushConstant(_kShadowMip, "RegionZ0Bits", (uint)first);
+                    cs.Dispatch(_kShadowMip, list, (uint)(size + 7) / 8, (uint)(last - first + 1 + 7) / 8, 1);
+                }
+                for (int m = 0; m < ShadowMapMips; m++)
+                {
+                    var before = m < ShadowMapMips - 1 ? ResourceStates.NonPixelShaderResource : ResourceStates.UnorderedAccess;
+                    list.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowMap!, before, shaderRead, (uint)m)));
+                }
                 if (!_shadowAll) _shadowRow = (_shadowRow + rows) % ShadowMapTexels;
                 _shadowAll = false;
-                list.ResourceBarrierTransition(_shadowMap.Native, ResourceStates.UnorderedAccess, shaderRead);
                 _shadowMapState = shaderRead;
             }
             _shadowRowsLast = rows;
