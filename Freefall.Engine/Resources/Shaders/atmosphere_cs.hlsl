@@ -360,12 +360,18 @@ float3 APWorldPos(AtmosphereParams A, float3 P)
     return float3(CamPos.x + P.x * 1000.0, (P.y - A.BottomRadius) * 1000.0, CamPos.z + P.z * 1000.0);
 }
 
-// A point of a column's ray past the ground, lifted onto it: the march goes on along the ground (APGroundEnd)
+// A point of a column's ray past the ground, lifted onto it: the march goes on along the ground (APGroundEnd).
+// Lifted AP_LIFT_CLEAR over PLANET_RADIUS_OFFSET: APSampleLight tests the light against the planet raised by that offset,
+// and a point lifted to exactly its surface fell inside or outside it by the floats' rounding (R² is good to ~4 km² at
+// 6360 km). Each lifted sample was in the earth's shadow or in the sun by chance, re-drawn every frame by the jitter, and
+// the haze over the sea at the foot of an island, seen from a ship's deck, flickered in a band under the horizon (user,
+// 2026-11-24). 5 m puts it 64 km² clear.
+#define AP_LIFT_CLEAR 0.005
 float3 APAboveGround(AtmosphereParams A, float3 P)
 {
     float r = length(P);
     float ground = A.BottomRadius + PLANET_RADIUS_OFFSET;
-    return r < ground ? P * (ground / r) : P;
+    return r < ground ? P * ((ground + AP_LIFT_CLEAR) / r) : P;
 }
 
 // The camera-relative view direction through a point of the volume's grid (cells; its rows at fixed elevations,
