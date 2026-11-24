@@ -10,7 +10,7 @@ using Vortice.Mathematics;
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// Material texture indices + scalar properties for bindless lookup — matches HLSL MaterialData (80 bytes)
+    /// Material texture indices + scalar properties for bindless lookup — matches HLSL MaterialData (96 bytes)
     /// </summary>
     public struct MaterialData
     {
@@ -28,6 +28,8 @@ namespace Freefall.Graphics
         public float EmissiveIntensity;
         public Vector3 Tint;            // multiplies the albedo map (Material "Tint", default white)
         public uint SettingsBufferIdx;  // the raw buffer of every material's effect settings (Material.SettingsStride bytes at its MaterialID); was padding
+        public float BlendRadius;       // Material "BlendRadius": the mesh blending's reach from a seam (MeshBlendPass), 0 = never
+        public Vector3 MaterialPad;
 
         /// <summary>
         /// Texture slot names derived from this struct's fields (strips "Idx" suffix).
@@ -460,6 +462,9 @@ namespace Freefall.Graphics
                 if (before.TryGetValue(name, out var old)) prop.CopyFrom(old);
                 _effectProperties.Add(prop);
             }
+            // Not the effect's: the mesh blending's, which every material has (BlendProperty)
+            if (HasOwnSettings && !_effectProperties.Exists(p => p.Name == "BlendRadius"))
+                _effectProperties.Add(BlendProperty);
         }
 
         // ── Effect settings on the GPU ──
@@ -561,7 +566,41 @@ namespace Freefall.Graphics
                 (m, v) => m.UpdateMaterialScalar((ref MaterialData d) => d.DetailTiling = v)));
             _materialProperties.Add(new MaterialProperty<Vector2>("DetailOffset", this, Vector2.Zero,
                 (m, v) => m.UpdateMaterialScalar((ref MaterialData d) => d.DetailOffset = v)));
+            _materialProperties.Add(BlendProperty);
         }
+
+        private float _blendRadius;
+        private static int s_blendingMaterials;
+        private MaterialProperty<float>? _blendProperty;
+
+        // Mesh blending (MeshBlendPass): every material has it, whatever its effect, since no shader of the material reads
+        // it: listed after an effect's own settings too (InitEffectProperties), so the .mat, the inspector and the editor's
+        // commands reach it either way. One object kept across rebuilds, so its value stays
+        private MaterialProperty<float> BlendProperty => _blendProperty ??= new MaterialProperty<float>("BlendRadius", this, 0f, (m, v) =>
+        {
+            float radius = Math.Max(0f, v);
+            if ((radius > 0f) != (m._blendRadius > 0f))
+                System.Threading.Interlocked.Add(ref s_blendingMaterials, radius > 0f ? 1 : -1);
+            m._blendRadius = radius;
+            m.UpdateMaterialScalar((ref MaterialData d) => d.BlendRadius = radius);
+        })
+        {
+            Description = "Metres from where this mesh cuts into the ground or another mesh over which it takes on that surface's look (albedo, normal, roughness, AO), so the cut reads as a soft join. Against a surface without one (the terrain) it takes all of that look at the seam; two that both have one meet half way. 0 = a hard cut",
+            Range = new Vector2(0f, 4f),
+        };
+
+        /// <summary>
+        /// The mesh blending's reach from a seam (metres; the "BlendRadius" property, MeshBlendPass). 0 = this material's
+        /// surfaces keep a hard cut where they meet others.
+        /// </summary>
+        public float BlendRadius
+        {
+            get => _blendRadius;
+            set => BlendProperty.Value = value;
+        }
+
+        /// <summary>How many materials have a <see cref="BlendRadius"/>: the mesh blending is skipped while none has.</summary>
+        public static int BlendingMaterials => System.Threading.Volatile.Read(ref s_blendingMaterials);
 
         /// <summary>
         /// Raised after a material's effect was swapped. Persistent (GPU-resident) draws live in

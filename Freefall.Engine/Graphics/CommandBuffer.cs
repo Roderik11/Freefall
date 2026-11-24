@@ -840,6 +840,9 @@ namespace Freefall.Graphics
             lock (group.Held)
                 group.Held.Add(material);
 
+            // The slot's surfaces read their mesh blending from it if it blends furthest of the slot's parts
+            TransformBuffer.Instance?.OfferMaterial(transformSlot, material);
+
             lock (_persistentLock)
                 _persistentOps.Add(op);
         }

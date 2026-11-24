@@ -360,7 +360,7 @@ float2 MotionOfVertex(float3 worldNow, float3 worldBefore)
     return MotionVector(MotionClip(worldNow), PrevMotionClip(worldBefore));
 }
 // Material data for bindless texture lookup via Material ID indirection
-// 80 bytes — matches C# MaterialData layout exactly
+// 96 bytes — matches C# MaterialData layout exactly
 // One draw holds every instance of a mesh part, whatever its material: a wave mixes materials, so fetch these
 // indices with NonUniformResourceIndex (AMD otherwise uses one lane's descriptor for the whole wave)
 struct MaterialData
@@ -379,6 +379,8 @@ struct MaterialData
     float EmissiveIntensity;
     float3 Tint;                // multiplies the albedo map (Material "Tint", default white)
     uint SettingsBufferIdx;     // the raw buffer of every material's effect settings (Material.SettingsStride bytes at its MaterialID); was padding
+    float BlendRadius;          // metres near a seam with another surface over which this one takes on its look (mesh_blend_cs.hlsl); 0 = never
+    float3 _materialPad;
 };
 
 // A texture in an effect's material settings or instance data: its bindless index. Declared "TextureRef Noise; //= Gray"

@@ -7,7 +7,7 @@ using System.Threading;
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// Global persistent GPU buffer for all entity transforms + per-instance materialIDs.
+    /// Global persistent GPU buffer for all entity transforms + per-slot materials (the mesh blending's radius).
     /// Thin wrapper around StreamingBuffer&lt;T&gt; with a free-list slot allocator.
     /// </summary>
     public class TransformBuffer : IDisposable
@@ -15,7 +15,14 @@ namespace Freefall.Graphics
         private const int InitialCapacity = 1024;
 
         private StreamingBuffer<Matrix4x4> _transforms;
+
+        // Per slot, the MaterialID + 1 of the material its surfaces' mesh blending reads (MaterialData.BlendRadius,
+        // mesh_blend_cs.hlsl RadiusOf); 0 = none. Offered by every persistent draw (CommandBuffer.AddPersistent): of a
+        // renderer's parts the one with the largest radius keeps it, the first when none has one. The radius itself is
+        // read from the material on the GPU, so editing it shows at once; a part's material taking over from another needs
+        // the slot to be given back and taken again (a reload).
         private StreamingBuffer<uint> _materials;
+        private Material?[] _slotMaterials = new Material?[InitialCapacity];
 
         // The slots uploaded this tick, one bit per slot (cull_instances.hlsl ChangedSlotsIdx): the camera culling's
         // transform cache (InstanceBatch) reads an instance's transform again only when its slot's bit is set. A tick
@@ -62,7 +69,8 @@ namespace Freefall.Graphics
         public uint PreviousSrvIndex => _transforms.PreviousSrvIndex;
 
         /// <summary>
-        /// Bindless SRV index for the current frame's materialID buffer.
+        /// Bindless SRV index of the current frame's per-slot materials (StructuredBuffer&lt;uint&gt;: MaterialID + 1, 0 =
+        /// none), for the mesh blending.
         /// </summary>
         public uint MaterialSrvIndex => _materials.SrvIndex;
 
@@ -125,6 +133,11 @@ namespace Freefall.Graphics
                 _activeSlots--;
                 _transforms.Set(slot, Matrix4x4.Identity);
                 if (slot < _slotToEntity.Length) _slotToEntity[slot] = null;
+                if (slot < _slotMaterials.Length && _slotMaterials[slot] != null)
+                {
+                    _slotMaterials[slot] = null;
+                    _materials.Set(slot, 0u);
+                }
             }
             // The next entity to take the slot is not the one that followed a frame, nor the one marks were carried by
             WeatherFrames.Remove(slot);
@@ -141,12 +154,23 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Set materialID for a slot. Enables per-instance materials indexed by TransformSlot.
+        /// A draw of <paramref name="material"/> under <paramref name="slot"/> was registered: the slot's surfaces read their
+        /// mesh blending from it if the slot has none yet or it blends further than the one it has (MaterialData.BlendRadius).
+        /// Thread-safe (persistent draws are added from the parallel draw loop).
         /// </summary>
-        public void SetMaterialId(int slot, uint materialId)
+        public void OfferMaterial(int slot, Material material)
         {
-            if (slot < 0 || slot >= _nextSlot) return;
-            _materials.Set(slot, materialId);
+            if (slot < 0 || material == null || material.MaterialID < 0) return;
+            lock (_slotLock)
+            {
+                if (slot >= _nextSlot) return;
+                if (slot >= _slotMaterials.Length)
+                    Array.Resize(ref _slotMaterials, Math.Max(slot + 1, _slotMaterials.Length * 2));
+                var had = _slotMaterials[slot];
+                if (had == material || (had != null && material.BlendRadius <= had.BlendRadius)) return;
+                _slotMaterials[slot] = material;
+                _materials.Set(slot, (uint)material.MaterialID + 1u);
+            }
         }
 
         /// <summary>

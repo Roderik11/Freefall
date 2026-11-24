@@ -401,6 +401,7 @@ namespace Freefall.Graphics
         private readonly LightClusters _lightClusters = new();
         // Decals and the weather on the G-buffer, right after the opaque pass (1b)
         private readonly DecalPass _decals = new();
+        private readonly MeshBlendPass _meshBlend = new();
         // Screen-space reflections, after the lighting, before the composition (made on first use)
         private ScreenSpaceReflections? _ssr;
         /// <summary>The water's screen-space reflections' pyramids (nearest depth, the scene's colour), made before the
@@ -500,6 +501,12 @@ namespace Freefall.Graphics
 
         private bool _isFirstFrame = true;
         private bool _compositeSnapshotFirstFrame = true;
+
+        /// <summary>
+        /// The targets were made since the last frame (a resize too): still in Common, not in the states the frame leaves
+        /// them in. <see cref="Composite"/> is in NonPixelShaderResource from the opaque pass to composition otherwise.
+        /// </summary>
+        internal bool IsFirstFrame => _isFirstFrame;
         
         // Bloom compute shader and kernel indices
         private ComputeShader _bloomCS = null!;
@@ -1187,6 +1194,15 @@ namespace Freefall.Graphics
                  ulong frustumGpuAddr = UploadFrustumConstants(camera, Engine.Device);
                  CommandBuffer.Execute(RenderPass.Opaque, list, Engine.Device, frustumGpuAddr);
                  PixMarker.End(list); // Opaque
+             }
+
+             // 1a. Mesh blending: where meshes cut into the ground or each other, softened toward what they meet, before the
+             //     decals and the weather are laid over the joins (MeshBlendPass)
+             if (_meshBlend.Render(list, camera, this, BindSceneConstantsForCompute))
+             {
+                 list.OMSetRenderTargets(_cachedGBufferRtvHandles, Depth.DsvHandle);
+                 list.RSSetViewport(vp);
+                 list.RSSetScissorRect(scissor);
              }
 
              // 1b. Decals and the weather (wet surfaces, snow) on the opaque G-buffer: everything that reads it later
@@ -2236,6 +2252,7 @@ namespace Freefall.Graphics
             VolumetricFog?.Dispose();
             _lightClusters.Dispose();
             _decals.Dispose();
+            _meshBlend.Dispose();
             DisposeCapture();
             _ssr?.Dispose();
             WaterReflections?.Dispose();

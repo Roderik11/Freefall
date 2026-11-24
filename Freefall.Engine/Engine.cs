@@ -696,7 +696,8 @@ namespace Freefall
         SkyVisibility = 8,          // light_directional_cs: the sky's share a surface sees past terrain and meshes
         MeshSkyVisibility = 9,      // the meshes' part of it alone (SkyCapture)
         Motion = 10,                // motion_cs CSMotionView: where each pixel came from (hue = direction, brightness = up to 16 px)
-        Reactive = 11               // oit_reactive_cs CSReactiveView: how far the temporal upscaler distrusts its history (red)
+        Reactive = 11,              // oit_reactive_cs CSReactiveView: how far the temporal upscaler distrusts its history (red)
+        MeshBlend = 12              // mesh_blend_cs: the mesh blending's weight painted red into the albedo (full red at a seam)
     }
 
     /// <summary>EngineSettings.Upscaler: the temporal upscaler (UPSCALING_PLAN.md)</summary>
@@ -1124,6 +1125,19 @@ namespace Freefall
 
          [ValueRange(1f, 128f)]
          public float PixelErrorThreshold { get; set; } = 128.0f;
+
+         /// <summary>
+         /// Where a mesh cuts into the ground or another mesh, it takes on the look of what it meets near the seam, by its
+         /// material's BlendRadius (Graphics.MeshBlendPass). Materials without one keep their hard cuts.
+         /// </summary>
+         [Category("Mesh Blending")]
+         [System.ComponentModel.Description("Soften where meshes cut into the ground and into each other: near the seam a mesh takes on the look of what it meets, as far as its material's Blend Radius (materials without one keep a hard cut)")]
+         public bool MeshBlending { get; set; } = true;
+
+         /// <summary>A blend's reach from its seam on screen at most (pixels of the render size); up close it narrows past this.</summary>
+         [ValueRange(8, 256)]
+         [System.ComponentModel.Description("How far from its seam a blend reaches on screen at most, in pixels: up close a blend narrows to this whatever its material's radius")]
+         public int MeshBlendMaxPixels { get; set; } = 96;
 
          [Category("Fog")]
          public bool Fog { get; set; } = true;                              // Aerial perspective: the atmosphere and its ground fog between camera and scene (Graphics.Atmosphere)
