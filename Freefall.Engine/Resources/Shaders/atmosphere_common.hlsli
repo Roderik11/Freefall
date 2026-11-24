@@ -381,6 +381,53 @@ float4 SampleScreenBSpline(Texture3D<float4> volume, float2 screenUV, float w)
                  + g1.x * volume.SampleLevel(AtmosphereLinearClamp, float3(h1.x, h1.y, w), 0));
 }
 
+// ── The aerial perspective volume's rows: at fixed elevations, not at fixed places on the screen ──
+// Its columns are a cell per ~20 pixels across the screen, but its rows stand at whole steps of elevation: the angle
+// in the camera's vertical plane plus the camera's pitch, a step being the field of view over the rows less one (the
+// one spare row takes the offset). Rows tied to the screen (until 2026-11-24) carried the haze with them as the camera
+// tilted: toward the horizon the haze's light changes over a fraction of a degree (the ground fog thins with height, and
+// a ray 0.5° up is 270 m higher 31 km out), far finer than a row, so the bright band over the horizon rode up and down
+// with the rows and jumped back a row at a time. At fixed elevations the rows stay where they are in the world (exactly
+// along the screen's middle column, within a second-order term toward its sides; a rolled camera keeps a smooth mapping
+// that is no longer fixed). An orthographic view keeps rows on the screen.
+struct APRowFrame
+{
+    float tanY;     // tan of half the vertical field of view; 0 = orthographic: rows on the screen
+    float pitch;    // radians: the camera's forward above the horizontal
+    float step;     // radians of elevation a row
+    float first;    // the first row's lower edge, in steps of elevation (a whole number: the rows stand still)
+};
+
+APRowFrame APRows(float rows)
+{
+    APRowFrame f;
+    f.tanY = abs(Projection._34) > 0.5 ? 1.0 / Projection._22 : 0.0;
+    float3 forward = normalize(float3(View._13, View._23, View._33));
+    f.pitch = asin(clamp(forward.y, -1.0, 1.0));
+    float halfFov = atan(f.tanY);
+    f.step = 2.0 * halfFov / max(rows - 1.0, 1.0);
+    f.first = f.tanY > 0.0 ? floor((f.pitch - halfFov) / f.step) : 0.0;
+    return f;
+}
+
+// A screen v (0 at the top) as the volume's v
+float APRowFromScreen(APRowFrame f, float rows, float screenV)
+{
+    if (f.tanY <= 0.0)
+        return screenV;
+    float theta = atan((1.0 - 2.0 * screenV) * f.tanY);     // above the view's axis in its vertical plane
+    return ((theta + f.pitch) / f.step - f.first) / rows;
+}
+
+// The volume's v as a screen v (0 at the top)
+float APScreenFromRow(APRowFrame f, float rows, float v)
+{
+    if (f.tanY <= 0.0)
+        return v;
+    float theta = (v * rows + f.first) * f.step - f.pitch;
+    return 0.5 - 0.5 * tan(theta) / f.tanY;
+}
+
 // Aerial perspective between the camera and a point on screen at a view depth (metres): rgb = light scattered in
 // on the way (cd/m² × Exposure, i.e. what the pixel stores), a = how much of the point's own light gets through.
 // From this view's volume (SceneConstants.AerialPerspectiveIdx); a build that predates it set the shared one in the
@@ -399,7 +446,10 @@ float4 AtmosphereAerialPerspectiveFrom(AtmosphereParams A, uint volume, float2 s
         w = 0.5 / AP_SLICES;
     }
     Texture3D<float4> ap = ResourceDescriptorHeap[volume];
-    float4 s = SampleScreenBSpline(ap, screenUV, w);
+    float apWidth, apRows, apSlices;
+    ap.GetDimensions(apWidth, apRows, apSlices);
+    float2 apUV = float2(screenUV.x, APRowFromScreen(APRows(apRows), apRows, screenUV.y));
+    float4 s = SampleScreenBSpline(ap, apUV, w);
     float3 inscatter = s.rgb * weight;   // already sun + moon, × Exposure (CSAerialPerspective)
     float transmittance = 1.0 - weight * (1.0 - s.a);
     return float4(inscatter, transmittance);

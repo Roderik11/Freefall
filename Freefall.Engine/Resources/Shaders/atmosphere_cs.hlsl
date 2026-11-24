@@ -360,6 +360,48 @@ float3 APWorldPos(AtmosphereParams A, float3 P)
     return float3(CamPos.x + P.x * 1000.0, (P.y - A.BottomRadius) * 1000.0, CamPos.z + P.z * 1000.0);
 }
 
+// A point of a column's ray past the ground, lifted onto it: the march goes on along the ground (APGroundEnd)
+float3 APAboveGround(AtmosphereParams A, float3 P)
+{
+    float r = length(P);
+    float ground = A.BottomRadius + PLANET_RADIUS_OFFSET;
+    return r < ground ? P * (ground / r) : P;
+}
+
+// The camera-relative view direction through a point of the volume's grid (cells; its rows at fixed elevations,
+// atmosphere_common.hlsli APRows; reverse-Z: the far plane is z = 0)
+float3 APCellDirection(APRowFrame rows, float2 cell, float2 size)
+{
+    float2 uv = float2(cell.x / size.x, APScreenFromRow(rows, size.y, cell.y / size.y));
+    float4 farClip = mul(float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0, 1), CameraInverse);
+    return normalize(farClip.xyz / farClip.w);
+}
+
+// Where a column's march may end, km along its ray: where the ray of every pixel that reads the column has met the
+// ground. The lookup's B-spline (atmosphere_common.hlsli SampleScreenBSpline) reads a column from pixels up to two cells
+// away, and a pixel a cell or two higher meets the ground farther off or not at all (over the horizon). Ending at the
+// column's own ground point, as the march did until 2026-11-24, left the slices past it at that point's value: the sky
+// just over the sea's horizon lost the air from 20-odd km on wherever the cell under it pointed a little down, a dark
+// stripe that jumped a cell row as the camera tilted, and a far hill above a cell aimed at nearer ground got too little
+// haze. So the march goes on along the ground (APAboveGround) as far as the footprint's highest ray reaches: to the
+// volume's end when one of its corners misses the ground, near the column's own ground point when the whole footprint
+// looks down at it (no more work there than before).
+float APGroundEnd(APRowFrame rows, float3 pos, float3 dir, float3 forward, float2 cell, float2 size, float bottomRadius)
+{
+    float viewDepth = 0.0;      // km of view depth where the footprint's last ray meets the ground
+    [unroll]
+    for (uint c = 0; c < 4; c++)
+    {
+        float2 corner = cell + float2((c & 1) != 0 ? 2.5 : -2.5, (c & 2) != 0 ? 2.5 : -2.5);
+        float3 d = APCellDirection(rows, corner, size);
+        float t = RaySphereIntersectNearest(pos, d, float3(0, 0, 0), bottomRadius);
+        if (t < 0.0)
+            return 1e9;
+        viewDepth = max(viewDepth, t * dot(d, forward));
+    }
+    return viewDepth / max(dot(dir, forward), 0.05);
+}
+
 // Sky pixels take their air from it too, out to its end (sky_common.fx AtmosphereSkyWithClouds): the shafts through a
 // broken layer and a mountain's shadow at sunset reach over the sky.
 [numthreads(8, 8, 1)]
@@ -373,19 +415,19 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
         return;
     AtmosphereParams A = LoadAtmosphere();
 
-    // Camera-relative view direction through the column's centre (reverse-Z: the far plane is z = 0)
-    float2 uv = (float2(id.xy) + 0.5) / float2(width, height);
-    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    float4 farClip = mul(float4(ndc, 0, 1), CameraInverse);
-    float3 dir = normalize(farClip.xyz / farClip.w);
+    // Camera-relative view direction through the column's centre (its row at a fixed elevation)
+    float2 cell = float2(id.xy) + 0.5, size = float2(width, height);
+    APRowFrame rows = APRows(height);
+    float3 dir = APCellDirection(rows, cell, size);
     float3 forward = normalize(float3(View._13, View._23, View._33));
     float kmPerMetre = 0.001 / max(dot(dir, forward), 0.05);      // km along the ray per metre of view depth
 
-    // The march ends where the ray meets the ground (the slices past it keep the last value) or leaves the air
+    // The march ends where the ray leaves the air, or past the ground where every pixel reading the column has met it
+    // (APGroundEnd; the samples between lifted onto the ground); the slices past the end keep the last value
     float3 pos = float3(0, AtmosphereViewHeight(A, CamPos.y), 0);
     float tGround = RaySphereIntersectNearest(pos, dir, float3(0, 0, 0), A.BottomRadius);
     float tTop = RaySphereIntersectNearest(pos, dir, float3(0, 0, 0), A.TopRadius);
-    float tEnd = tGround >= 0.0 ? tGround : max(tTop, 0.0);
+    float tEnd = tGround >= 0.0 ? APGroundEnd(rows, pos, dir, forward, cell, size, A.BottomRadius) : max(tTop, 0.0);
 
     // The phases depend on the column's direction only
     float sunCos = dot(dir, A.SunDirection), moonCos = dot(dir, A.MoonDirection);
@@ -411,9 +453,9 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
         {
             for (uint k = 0; k < AP_STEPS; k++)
             {
-                float3 P = pos + (t + (k + 0.5) * dt) * dir;
+                float3 P = APAboveGround(A, pos + (t + (k + 0.5) * dt) * dir);
                 float3 worldMid = APWorldPos(A, P);
-                float3 worldEnd = APWorldPos(A, pos + (t + (k + 1.0) * dt) * dir);
+                float3 worldEnd = APWorldPos(A, APAboveGround(A, pos + (t + (k + 1.0) * dt) * dir));
                 float pHeight = length(P);
                 float3 up = P / pHeight;
                 AtmMedium medium = SampleAtmMedium(P, A);
