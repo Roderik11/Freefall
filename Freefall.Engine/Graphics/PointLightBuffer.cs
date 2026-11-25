@@ -260,6 +260,11 @@ namespace Freefall.Graphics
             _lampsCS.SetPushConstant("SkyCaptureViews", meshes ? captures.Views : 0u);
             _lampsCS.SetPushConstant("SkyCaptureDepth", meshes ? captures.Depth : 0u);
             _lampsCS.SetPushConstant("SkyCaptureBounce", BitConverter.SingleToUInt32Bits(Math.Clamp(Engine.Settings.SkyCaptureBounce, 0f, 1f)));
+            // A lamp on something that has left the sky captures (a ship under way) is covered by its own cover map
+            // (WeatherFrame), drawn by ShelterMap.Render before this
+            _lampsCS.SetPushConstant("WeatherFrames", WeatherFrames.Srv);
+            _lampsCS.SetPushConstant("WeatherFrameMask", WeatherFrames.Mask);
+            _lampsCS.SetPushConstant("WeatherFrameCovers", WeatherFrames.CoversSrv);
             _lampsCS.Dispatch(_kLamps, list, (uint)((SlotCount + LampsPerGroup - 1) / LampsPerGroup));
             list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_lampStates.Native)));
 
@@ -311,7 +316,8 @@ namespace Freefall.Graphics
         /// <summary>
         /// For engine_stats: the lamps (enabled lights marked OnlyWhenDark) as judged FrameCount - 1 frames ago: how many
         /// are lit, the open ground's daylight and lamps (Daylight), the share of it that reaches the lamps (the middle and
-        /// the darkest tenth), and the lamps lit while those on open ground are out (in rooms, caves).
+        /// the darkest tenth), the lamps lit while those on open ground are out (in rooms, caves, below decks), and the
+        /// lamps nearest the camera with the daylight each is judged by (which lantern of a ship, which street lamp).
         /// </summary>
         public unsafe object DescribeLamps()
         {
@@ -324,6 +330,8 @@ namespace Freefall.Graphics
             float open = Daylight.GroundIlluminance();
             var shares = new List<float>();
             var litByDay = new List<object>();
+            var eye = Camera.Main?.Position;
+            var near = new List<(float Distance, int Slot)>();
             for (int s = 0; s < slots; s++)
             {
                 var light = LightAt(s);
@@ -336,9 +344,27 @@ namespace Freefall.Graphics
                 if (state.Lamp > 0f && state.Lamp < 1f) fading++;
                 if (open > 0f) shares.Add(state.Lux / open);
                 if (isLit && Daylight.Lamps < 1f && litByDay.Count < 32)
-                    litByDay.Add(new { entity = light.Entity?.Id ?? 0, name = light.Entity?.Name, lux = MathF.Round(state.Lux, 3) });
+                    litByDay.Add(new { entity = light.Entity?.Id ?? 0, name = PathOf(light), lux = MathF.Round(state.Lux, 3) });
+                if (eye.HasValue && light.Transform != null)
+                    near.Add((Vector3.Distance(light.Transform.WorldPosition, eye.Value), s));
             }
             shares.Sort();
+            near.Sort((a, b) => a.Distance.CompareTo(b.Distance));
+            var nearest = new List<object>();
+            for (int i = 0; i < Math.Min(near.Count, 16); i++)
+            {
+                var (distance, s) = near[i];
+                var state = states![s];
+                nearest.Add(new
+                {
+                    entity = LightAt(s)!.Entity?.Id ?? 0,
+                    name = PathOf(LightAt(s)!),
+                    metres = MathF.Round(distance, 1),
+                    lux = MathF.Round(state.Lux, 2),
+                    share = open > 0f ? MathF.Round(state.Lux / open, 4) : (float?)null,
+                    lit = (state.Seen & LampLit) != 0,
+                });
+            }
             return new
             {
                 lamps,
@@ -348,8 +374,21 @@ namespace Freefall.Graphics
                 openGroundLamps = Daylight.Lamps,
                 daylightShareMedian = shares.Count > 0 ? MathF.Round(shares[shares.Count / 2], 3) : (float?)null,
                 daylightShareLowestTenth = shares.Count > 0 ? MathF.Round(shares[shares.Count / 10], 3) : (float?)null,
+                onBelowLux = Daylight.LampsOnBelowLux,
+                offAboveLux = Daylight.LampsOffAboveLux,
                 litByDay,
+                nearest,
             };
+        }
+
+        // "Galleon/HBK_HangingLantern/Light": a lamp's entity and up to two above it, so a ship's lanterns are told apart
+        private static string PathOf(PointLight light)
+        {
+            var name = light.Entity?.Name ?? "?";
+            var t = light.Transform?.Parent;
+            for (int i = 0; i < 2 && t?.Entity != null; i++, t = t.Parent)
+                name = t.Entity.Name + "/" + name;
+            return name;
         }
 
         public void Dispose()

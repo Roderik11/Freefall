@@ -49,6 +49,15 @@ namespace Freefall.Components
         [Description("The sun's own tint (its brightness stays SunIlluminance); the reddening of a low sun comes from the air")]
         public Color3 SunDayColor = new Color3(1.0f, 0.95f, 0.85f);
 
+        [Description("EV the weather's gloom takes from the sun's and the moons' light before it lights anything (a " +
+                     "thunderstorm −8; EnvironmentPreset.LightDimming): light, not exposure, so lamps, fires and lightning show " +
+                     "against it")]
+        [ValueRange(-12f, 0f)]
+        public float LightDimming = 0f;
+
+        // 2^LightDimming: the share of the sun's and the moons' light the weather's gloom leaves
+        private float Gloom => MathF.Pow(2f, Math.Clamp(LightDimming, -12f, 0f));
+
         [Description("Size of the sun's disc as a multiple of the real sun (0.53° across). Only the disc changes: it sends " +
                      "the same light spread wider, so the sunlight, the sky's glow round the sun and the glint on the water stay as they are")]
         [ValueRange(1f, 10f)]
@@ -392,7 +401,7 @@ namespace Freefall.Components
             Atmosphere.Settings = new AtmosphereSettings
             {
                 SunDirection = SunDirection,
-                SunIlluminance = Tint(SunDayColor) * SunIlluminance,
+                SunIlluminance = Tint(SunDayColor) * (SunIlluminance * Gloom),
                 SunAngularRadius = AtmosphereSettings.Default.SunAngularRadius * Math.Clamp(SunDiscScale, 1f, 10f),
                 MoonDirection = brightest >= 0 ? _moonLights[brightest].Direction : -SunDirection,
                 MoonIlluminance = brightest >= 0 ? _moonLights[brightest].Top : Vector3.Zero,
@@ -443,7 +452,7 @@ namespace Freefall.Components
                 _moonLights[i] = new MoonLight
                 {
                     Direction = dir,
-                    Top = Tint(moon.LightColor) * (moon.LightIntensity * lit),
+                    Top = Tint(moon.LightColor) * (moon.LightIntensity * lit * Gloom),
                 };
 
                 // The disc gives the moon's light: its luminance where the sun shines straight on (a Lambert sphere's
@@ -550,6 +559,7 @@ namespace Freefall.Components
 
             SunIlluminance = p.SunIlluminance;
             SunDayColor = p.SunDayColor;
+            LightDimming = p.LightDimming;
 
             RayleighScale = p.RayleighScale;
             MieScale = p.MieScale;
@@ -586,6 +596,7 @@ namespace Freefall.Components
 
             p.SunIlluminance = SunIlluminance;
             p.SunDayColor = SunDayColor;
+            p.LightDimming = LightDimming;
 
             p.RayleighScale = RayleighScale;
             p.MieScale = MieScale;

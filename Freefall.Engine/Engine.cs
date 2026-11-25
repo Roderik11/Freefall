@@ -384,7 +384,14 @@ namespace Freefall
             TickCount++;
 
             Time.Update();
-            if (!SceneManager.IsLoading) GameClock.Advance(Time.Delta);
+            if (!SceneManager.IsLoading)
+            {
+                GameClock.Advance(Time.Delta);
+                // Whether or not the clock runs: a held hour still has its weather, and the clouds move on. Stepped
+                // only while the clock ran (2026-11-02 to 11-25), the open ground's lamps and the lamp glass froze
+                // with a stopped clock (TestWorld's), lit or out, whatever the sky did after.
+                Graphics.Daylight.Update(Time.Delta);
+            }
             Graphics.Wind.Advance(Time.Delta);
             Input.Update();
 

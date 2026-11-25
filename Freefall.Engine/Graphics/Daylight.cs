@@ -11,17 +11,23 @@ namespace Freefall.Graphics
     /// through the clouds round the camera) falls below <see cref="LampsOnBelowLux"/>, out again above
     /// <see cref="LampsOffAboveLux"/>, so a cloud passing at the mark does not blink them. Materials marked
     /// EmissiveWhenDark follow it. Lights marked PointLight.OnlyWhenDark use the same thresholds on the daylight where
-    /// each one hangs, past the terrain and the meshes round it (point_light_lamps.hlsl): a lamp in a closed room or a
-    /// cave is lit at noon; <see cref="Lamps"/> stands in for one not judged yet. Clear Day (SunAzimuth 161.2, Day 1):
-    /// noon ~50000 lux, 18:00 ~940, 18:20 ~50, 18:35 ~1.5 (lamps on), 18:45 ~0.06, 19:00 ~0.001 (no moon up); a
-    /// thunderstorm noon is still thousands of lux, so storms by day do not light the lamps. The point light shadow
-    /// selection weighs a light's lux against the daylight's (<see cref="SunIlluminance"/>, <see cref="SkyIlluminance"/>,
-    /// local_shadow_select.hlsl).
+    /// each one hangs, past the terrain and the meshes round it (point_light_lamps.hlsl): a lamp in a closed room, below
+    /// decks or in a cave is lit at noon; <see cref="Lamps"/> stands in for one not judged yet.
+    ///
+    /// The mark is the open ground as the sun sets: a lamp is lit where it is that dark, as someone would light it then.
+    /// TestWorld, Clear Day: noon ~82000 lux, 17:00 ~12900, 17:30 ~4300, 17:45 ~1400 (lamps on, the sun 3° up), 18:00 (the
+    /// sun on the horizon) ~930, 18:15 ~16, 18:30 ~4, 18:45 ~0.07. Noon under the presets: Overcast ~11500 (out in the open;
+    /// lit where a sixth of the sky or less reaches: below decks, under a deep roof), Thunderstorm 800-1050 as the clouds
+    /// pass (lit, well under the mark: at 1000 lux the storm sat on it). Until 2026-11-25 the mark was 1 lux, the end of
+    /// civil dusk: only the night lit a lamp in the open, and a hold or a gun deck with a hundredth of the sky stayed dark
+    /// with its lanterns out through a storm ("lamps only turn on at night", user). Updated every tick whether or not the
+    /// clock runs (Engine.Tick). The point light shadow selection weighs a light's lux against the daylight's
+    /// (<see cref="SunIlluminance"/>, <see cref="SkyIlluminance"/>, local_shadow_select.hlsl).
     /// </summary>
     public static class Daylight
     {
-        public const float LampsOnBelowLux = 1f;      // ~18:37 on a clear evening (stage 0 lamps: 18:40-18:50)
-        public const float LampsOffAboveLux = 2f;
+        public const float LampsOnBelowLux = 2000f;   // the open ground as the sun sets (TestWorld: ~17:45, the sun 3° up)
+        public const float LampsOffAboveLux = 4000f;  // point_lights.hlsli LAMPS_ON_BELOW_LUX / LAMPS_OFF_ABOVE_LUX
         public const float LampFadeSeconds = 1.5f;
 
         /// <summary>The open ground's lamps: 0 = out, 1 = lit; in between while they fade. 1 until a sky updates it.</summary>
@@ -33,7 +39,7 @@ namespace Freefall.Graphics
         private static bool _lit = true;
         private static bool _started;
 
-        /// <summary>Once per frame, after the sky has set the sun (SkyboxRenderer.Update).</summary>
+        /// <summary>Once per tick from Engine.Tick, clock running or not (the sun and clouds as the sky set them last frame).</summary>
         public static void Update(float deltaSeconds)
         {
             float lux = GroundIlluminance();

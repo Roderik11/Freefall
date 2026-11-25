@@ -5,9 +5,10 @@
 //
 // The daylight at a lamp, in lux on level ground: the sun's (or moon's) SunLight × SunHeight and the sky's Ambient, as far
 // as they reach the lamp past the terrain (sky_visibility.hlsli: under a hill, the horizons of a valley, light through a
-// cave mouth) and past the meshes (sky_capture.hlsli: walls, roofs, the cave kit). In the open that is the ground
-// illuminance Daylight.Lamps follows; in a closed room or deep in a cave it is 0 at noon, and the lamp is lit. Hysteresis
-// per lamp (on below LAMPS_ON_BELOW_LUX, out above LAMPS_OFF_ABOVE_LUX) and a fade, as Daylight does for the open ground.
+// cave mouth) and past the meshes (sky_capture.hlsli: walls, roofs, the cave kit; on a ship under way, its own cover map:
+// weather_frames.hlsli). In the open that is the ground illuminance Daylight.Lamps follows; in a closed room, a hold or
+// deep in a cave it is 0 at noon, and the lamp is lit. Hysteresis per lamp (on below LAMPS_ON_BELOW_LUX, the open ground as
+// the sun sets, so a storm lights them too; out above LAMPS_OFF_ABOVE_LUX) and a fade, as Daylight does for the open ground.
 //
 // The sun's cascades are not used: they cover only what the camera looks at, so a lamp in a room at the edge of the view
 // or behind the camera was sunlit to them (out), and came on as the camera turned to it. Outdoors a lamp switches with
@@ -35,11 +36,15 @@ cbuffer PushConstants : register(b3)
     uint SkyCaptureViewsIdx;    // StructuredBuffer<SkyCaptureView>[SKY_CAPTURE_VIEWS]; 0 = no captures
     uint SkyCaptureDepthIdx;    // their depth maps (Texture2DArray)
     uint SkyCaptureBounceIdx;   // asfloat: EngineSettings.SkyCaptureBounce, for SurfaceLux
+    uint WeatherFramesIdx;      // StructuredBuffer<uint4>: transform slot -> the WeatherFrame it rides with (WeatherFrames.Srv); 0 = none
+    uint WeatherFrameMask;      // its length - 1
+    uint WeatherFrameCoversIdx; // the frames' own cover maps (WeatherFrames.CoversSrv)
 };
 
 #include "point_lights.hlsli"
 #include "sky_visibility.hlsli"
 #include "sky_capture.hlsli"
+#include "weather_frames.hlsli"
 
 #define LAMPS_PER_GROUP (64 / SKY_CAPTURE_VIEWS)    // PointLightBuffer.LampsPerGroup
 #define LAMP_TAPS 5
@@ -152,6 +157,19 @@ void CSLamps(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
         }
         v[t] = total > 0.0 ? lit / total : 1.0;
     }
+
+    // A light on something that has left the sky captures under way (a ship's lantern below decks: Ship.LeaveSkyCaptures,
+    // so they do not darken its deck where it lay): they hold the world round it but no longer what it rides on, which
+    // would leave its hold under the open sky. That thing's own cover map, drawn in its own frame as it left them
+    // (WeatherFrame), covers the five taps in their place; the world's captures still count for what lies over it (a bridge)
+    WeatherSpace space = WeatherSpaceIn(WeatherFramesIdx, WeatherFrameMask, TransformsIdx, r.TransformSlot);
+    if (FrameCoverDrawn(WeatherFrameCoversIdx, space))
+    {
+        WeatherShelter shelter = (WeatherShelter)0;
+        [unroll] for (uint t = 0; t < LAMP_TAPS; t++)
+            v[t] *= FrameOpennessIn(WeatherFrameCoversIdx, shelter, LinearClamp, space, world + LampTaps[t], 0.1);
+    }
+
     [unroll] for (uint a = 0; a < 3; a++)    // sorted far enough that v[2] is the middle
     {
         [unroll] for (uint b = a + 1; b < LAMP_TAPS; b++)

@@ -268,6 +268,9 @@ namespace Freefall.Assets
 
         // ── What the causes look like ──
 
+        // EV a full storm (Thunder × Overcast 1) takes from the sun's and moons' light (EnvironmentPreset.LightDimming)
+        private const float StormGloom = 8f;
+
         private void Fill(in ClimateState s, EnvironmentPreset dest)
         {
             dest.CopyFrom(Look ?? Defaults);
@@ -294,7 +297,11 @@ namespace Freefall.Assets
             dest.FogDensity = Lerp(dest.FogDensity, 0.0016f, s.Overcast) + 0.01f * s.Mist;
             dest.FogHeight = Lerp(dest.FogHeight, 150f, s.Mist);
             dest.MieScale *= 1f + 0.5f * s.Mist + s.Thunder;
-            dest.ExposureCompensation -= 2.5f * s.Thunder * s.Overcast;
+            // A storm's gloom is light the sun and moons lose, not the camera's (EnvironmentPreset.LightDimming): lamps
+            // and fires show against it as at dusk. It was ExposureCompensation −2.5 × Thunder × Overcast until 2026-11-25,
+            // a dark picture over an overcast day's light (2-7k lux at noon) that no lantern could show in; −8 EV of
+            // light looks about as dark, the eye keeping a share of the fall (AutoExposure's dim light)
+            dest.LightDimming -= StormGloom * s.Thunder * s.Overcast;
 
             dest.FreezingLevel = s.FreezingLevel;
             dest.WindStrength = s.Wind;

@@ -35,6 +35,14 @@ namespace Freefall.Assets
         [Description("The sun's own tint. Its reddening at sunset comes from the air")]
         public Color3 SunDayColor = new Color3(1.0f, 0.95f, 0.85f);
 
+        [Description("EV the weather's gloom takes from the sun's and the moons' light before it lights anything: the sky, " +
+                     "the clouds, the ground and the air (Thunderstorm −8). Light, not exposure: lamps, fires and lightning " +
+                     "keep theirs and show against it as at dusk, and the eye's partial adaptation keeps the gloom " +
+                     "(−8 here looks about as dark as −2.5 of ExposureCompensation did). ExposureCompensation only changes how " +
+                     "the picture is shown")]
+        [ValueRange(-12f, 0f)]
+        public float LightDimming = 0f;
+
         // ── Atmosphere ──
 
         [Category("Atmosphere")]
@@ -186,6 +194,7 @@ namespace Freefall.Assets
 
             dest.SunIlluminance = L(a.SunIlluminance, b.SunIlluminance, t);
             dest.SunDayColor = L(a.SunDayColor, b.SunDayColor, t);
+            dest.LightDimming = L(a.LightDimming, b.LightDimming, t);
 
             dest.RayleighScale = L(a.RayleighScale, b.RayleighScale, t);
             dest.MieScale = L(a.MieScale, b.MieScale, t);

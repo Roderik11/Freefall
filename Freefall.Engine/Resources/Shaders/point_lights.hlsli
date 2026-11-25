@@ -8,8 +8,9 @@
 #define POINT_LIGHT_ENABLED     1u      // PointLightRecord.Flags
 #define POINT_LIGHT_WHEN_DARK   2u      // PointLight.OnlyWhenDark: intensity × the light's LampState.Lamp
 #define MAX_VISIBLE_LIGHTS      4096u   // PointLightBuffer.MaxVisible
-#define LAMPS_ON_BELOW_LUX      1.0     // Daylight.LampsOnBelowLux: a lamp lights when the daylight where it hangs
-#define LAMPS_OFF_ABOVE_LUX     2.0     // falls below this, goes out above Daylight.LampsOffAboveLux
+#define LAMPS_ON_BELOW_LUX      2000.0  // Daylight.LampsOnBelowLux: a lamp lights when the daylight where it hangs
+#define LAMPS_OFF_ABOVE_LUX     4000.0  // falls below this (the open ground as the sun sets, a storm), goes out above
+                                        // Daylight.LampsOffAboveLux
 #define POINT_LIGHT_NO_SHADOW   0xFFFFFFFFu
 
 // One per PointLight, at its registry slot. Must match C# PointLightBuffer.Record (48 bytes).

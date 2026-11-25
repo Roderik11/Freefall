@@ -42,90 +42,20 @@ cbuffer PushConstants : register(b3)
 #include "decals.hlsli"
 #include "decal_settings.hlsli"
 #include "weather_cover.hlsli"
+#include "weather_frames.hlsli"
 #include "water_hulls.hlsli"
 
 // ── The space the weather's patterns are laid in: the world's, or a moving thing's (Components/WeatherFrame.cs) ──
+// weather_frames.hlsli, read with this pass's push constants
 
-// Origin and unit axes in the world: a place's pattern coordinates are its offsets along them. The world's own by
-// default (origin 0, the world's axes), so a surface outside any frame gets exactly what it got before
-struct WeatherSpace
-{
-    float3 Origin;
-    float3 X, Y, Z;
-    uint Root;          // the frame's index in WeatherFrameCoversIdx; WEATHER_WORLD for the world or none
-};
-#define WEATHER_WORLD 0xFFFFFFFFu
-
-WeatherSpace WorldWeatherSpace()
-{
-    WeatherSpace w;
-    w.Origin = 0;
-    w.X = float3(1, 0, 0);
-    w.Y = float3(0, 1, 0);
-    w.Z = float3(0, 0, 1);
-    w.Root = WEATHER_WORLD;
-    return w;
-}
-
-// The space for a surface of a transform slot: its frame's rigid part (its scale taken out, so a scaled frame does not
-// stretch the snow) where the slot follows one, else the world's
 WeatherSpace WeatherSpaceOf(uint slot)
 {
-    WeatherSpace w = WorldWeatherSpace();
-    if (WeatherFramesIdx == 0)
-        return w;
-    StructuredBuffer<uint4> table = ResourceDescriptorHeap[WeatherFramesIdx];
-    uint key = slot + 1u;
-    uint at = (slot * 2654435761u) & WeatherFrameMask;     // WeatherFrames.Hash
-    [loop] for (uint probe = 0; probe < 32u; probe++)        // at most half full: a probe or two
-    {
-        uint4 e = table[at];
-        if (e.x == 0u)
-            return w;
-        if (e.x == key)
-        {
-            float4x4 m = DecalMatrix(TransformsIdx, e.y);    // row vectors: rows 0-2 the axes, row 3 the origin
-            w.Origin = m[3].xyz;
-            w.X = normalize(m[0].xyz);
-            w.Y = normalize(m[1].xyz);
-            w.Z = normalize(m[2].xyz);
-            w.Root = e.z;
-            return w;
-        }
-        at = (at + 1u) & WeatherFrameMask;
-    }
-    return w;
+    return WeatherSpaceIn(WeatherFramesIdx, WeatherFrameMask, TransformsIdx, slot);
 }
 
-// A world place's pattern coordinates in a weather space
-float3 WeatherPlace(WeatherSpace w, float3 world)
-{
-    float3 d = world - w.Origin;
-    return float3(dot(d, w.X), dot(d, w.Y), dot(d, w.Z));
-}
-
-// How much of the fall reaches a world place on a frame by the frame's own cover map (WeatherFrames, ShelterMap
-// RenderFrameCover: its meshes drawn straight down its own up, in its frame), 0..1; 1 while it has none (still in the sky
-// captures: the world's map holds it). Read as a level of the world's map is, in the frame's coordinates: its own castles
-// and decks over a place on it, whatever its heel or wherever it has sailed. `s` lends the lookups its sampler state only
 float FrameOpenness(WeatherShelter s, SamplerState linearClamp, WeatherSpace w, float3 world, float bias)
 {
-    if (w.Root == WEATHER_WORLD || WeatherFrameCoversIdx == 0)
-        return 1.0;
-    StructuredBuffer<float4> covers = ResourceDescriptorHeap[WeatherFrameCoversIdx];
-    float4 square = covers[w.Root * 2u], heights = covers[w.Root * 2u + 1u];
-    if (heights.z < 0.5)
-        return 1.0;
-    ShelterLevel l;
-    l.Left = square.x;
-    l.Top = square.y;
-    l.Size = square.z;
-    l.Map = asuint(square.w);
-    WeatherShelter own = s;
-    own.MinY = heights.x;
-    own.RangeY = heights.y;
-    float3 p = WeatherPlace(w, world);
-    return ShelterLevelOpenness(own, l, linearClamp, p.xz, p.y + bias, bias);
+    return FrameOpennessIn(WeatherFrameCoversIdx, s, linearClamp, w, world, bias);
 }
 
 // ── Ships' hulls wet where the water has reached up their sides (WaterHull.Wet, kept by the ships) ──

@@ -1,4 +1,3 @@
-using Freefall.Graphics;
 using System;
 
 namespace Freefall.Base
@@ -55,7 +54,6 @@ namespace Freefall.Base
         {
             if (!Running || (Engine.IsEditor && !RunsInEditor)) return;
             _hours += delta * GameSecondsPerSecond / 3600.0;
-            Daylight.Update(delta);
         }
     }
 }
