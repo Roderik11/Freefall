@@ -449,7 +449,7 @@ namespace Freefall.Components
             public uint NoiseSRV;
             public float InvViewportWidth;
             public float InvViewportHeight;
-            public float _shorePad;      // was ShoreFoamDepth (the clock-driven swash bands, gone with the surf 2026-10-19)
+            public uint ReflectionMips;  // WaterReflections: the nearest-depth pyramid's mips (bits 0-7), the scene colour's (8-15). Was padding
             public float ShoreFoam;
             public float ShoreSurge;
             public uint HiZSRV;          // the view's Hi-Z pyramid: hull shader skips hidden patches (0 = off)
@@ -481,7 +481,8 @@ namespace Freefall.Components
             public uint SurfInfoSRV;     // per slot two float4s: base lags, deep headings, ocean bands + 1
             public uint SurfPagesAcross; // level 0 pages a side
             public float SurfSamples;    // height samples a side (level 0 texel i lies on sample i)
-            public float _surfPad0, _surfPad1;
+            public uint NearestDepthSRV; // WaterReflections: the nearest 1 / view depth, half size and down (0 = no screen-space reflections). Was padding
+            public uint SceneColourSRV;  // WaterReflections: the composite snapshot averaged, half size and down. Was padding
         }
 
         protected override void Awake()
@@ -1140,6 +1141,13 @@ namespace Freefall.Components
                 sunIntensity = _sunLight.Intensity;
             }
 
+            WaterReflections? reflections = null;
+            if (Engine.Settings.ScreenSpaceReflections)
+            {
+                WaterReflections.Want();
+                reflections = DeferredRenderer.Current?.WaterReflections;
+            }
+
             var data = new OceanData
             {
                 WaveTime = _waveTime,
@@ -1212,6 +1220,11 @@ namespace Freefall.Components
                 SurfInfoSRV = _surfPages.InfoSrv,
                 SurfPagesAcross = (uint)_surfPages.PagesAcross,
                 SurfSamples = _surfPages.Samples,
+                // The scene in the sea (ocean.fx, water_screen_reflection.hlsli): the pyramids the renderer makes on frames
+                // a water asks; none on the first (they come with the next frame) or with the setting off
+                NearestDepthSRV = reflections?.NearestDepthSrv ?? 0u,
+                SceneColourSRV = reflections?.ColourSrv ?? 0u,
+                ReflectionMips = reflections != null ? (reflections.NearestDepthMips & 0xFF) | (reflections.ColourMipCount & 0xFF) << 8 : 0u,
             };
             _params.SetParameter("OceanData", data);
 

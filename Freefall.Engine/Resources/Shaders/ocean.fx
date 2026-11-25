@@ -3,6 +3,7 @@
 #include "underwater.hlsli"
 #include "water_ripples.hlsli"
 #include "water_hulls.hlsli"
+#include "water_screen_reflection.hlsli"
 // Both faces: from under the sea its surface is seen from below (PS, Snell's window). A back face seen from above is a
 // crest folded over itself and is dropped, as the culling did before
 // @RenderState(RenderTargets=1, CullMode=None)
@@ -173,7 +174,8 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
     // them. Until 2026-10-18 only the heights did, and over the shelf a nearly flat sea was shaded as the full open-sea chop
     float shoreAtten = input.UndisplacedXZ.z;
     float calm = WakeCalmAt(ocean, worldXZ);   // a hull's track (Graphics.WakeWaves): the short waves turned down
-    OceanBands bands = SampleOceanBands(ocean, worldXZ, shoreAtten, shoreDepth, calm);
+    // With the slopes for the scene reflection's look-up only where it runs (water_screen_reflection.hlsli): a sample a band
+    OceanBands bands = SampleOceanBands(ocean, worldXZ, shoreAtten, shoreDepth, calm, ocean.NearestDepthSRV != 0);
     WaterSlopes slopes = bands.slopes;
     float waveHeight = bands.waveHeight;
     SurfWave surfWave = bands.surf;
@@ -185,6 +187,8 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
         waveHeight = DepthLimit(waveHeight, shoreDepth, capSlope);
         slopes.mean *= capSlope;
         slopes.variance *= capSlope * capSlope;
+        bands.look.mean *= capSlope;
+        bands.look.variance *= capSlope * capSlope;
     }
 
     // What moves in the water round the camera ripples it (WaterRipples): rings, wakes, the steps of a wader
@@ -194,6 +198,8 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
     // The ships' waves (Graphics.WakeWaves): their slopes, and the white water they made (with the foam below)
     float4 wake = WakeAt(ocean, worldPos.xz);   // where the point is drawn, as the DS raised it (not the grid's worldXZ)
     slopes.mean += wake.yz;
+    // Both simulated on grids metres across, smooth over a few pixels: they bend the scene reflection's look-up too
+    bands.look.mean += ripple + wake.yz;
 
     float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));
     // In the surf the swell's slopes, steepened through the shore's warp, can face away from a low eye on water it sees
@@ -266,6 +272,27 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
     float F = WaterSpecularReflectance(NdotV, alpha);
     float3 reflectColor = WaterSkyReflection(V, N, alpha) * skyVisible;   // no sky to mirror under a cliff
     float3 specular = WaterSunSpecular(N, V, L, sunRadiance * 3.14159, alpha);
+
+    // What stands round the sea where it is on the screen, over the sky's reflection, as on lakes and rivers
+    // (water_screen_reflection.hlsli): coasts, cliffs, piers and ships. The trace starts at the wave along the mirror ray of
+    // the waves' slopes over ~4 × 4 pixels (and the ripples' and the ships' waves), so what it finds tears with the waves;
+    // what the snapshot shows under the still sea's level is the seabed, never mirrored. Blurred by the bands' finer slopes
+    // alone, as the lakes' (user, 2026-11-13: the shading's Cox-Munk share "overblurred WAY too much")
+    if (ocean.NearestDepthSRV != 0)
+    {
+        WaterScreenInputs screen;
+        screen.DepthSRV = ocean.DepthGBufferSRV;
+        screen.CompositeSRV = ocean.CompositeSRV;
+        screen.NearestDepthSRV = ocean.NearestDepthSRV;
+        screen.NearestDepthMips = ocean.ReflectionMips & 0xFF;
+        screen.SceneColourSRV = ocean.SceneColourSRV;
+        screen.SceneColourMips = (ocean.ReflectionMips >> 8) & 0xFF;
+        screen.InvViewportSize = ocean.InvViewportSize;
+        float3 look = normalize(float3(-bands.look.mean.x, 1.0, -bands.look.mean.y));
+        float4 scene = WaterScreenReflection(screen, worldPos - camPos, ocean.OceanPlaneY - camPos.y, V, look,
+                                             WaterAlpha(bands.look, WATER_STILL_VARIANCE));
+        reflectColor = lerp(reflectColor, scene.rgb, scene.a);
+    }
 
     // ── Water column: what is seen through the surface ──
     // pathLen  = distance the view ray travels under water before it hits the scene (depth buffer)
@@ -564,6 +591,9 @@ PSOutput PS(DSOutput input, bool front : SV_IsFrontFace)
     }
 
     output.Color = float4(color, 1.0);
+#if WATER_TRACE_DEBUG
+    output.Color = float4(WaterTraceDebug * 0.6, 1.0);
+#endif
 
     return output;
 }

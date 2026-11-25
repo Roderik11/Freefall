@@ -23,6 +23,8 @@ struct OceanBands
     // Slope moments of every band (water_common.fx WaterSlopes): the mean slope makes the normal, the variance of the
     // slopes under this pixel its roughness. NormalAtten scales the slopes (and so the variance by its square)
     WaterSlopes slopes;
+    WaterSlopes look;       // the same OCEAN_LOOKUP_BIAS mips coarser (a mean over ~4 × 4 pixels): the scene reflection's
+                            // look-up and its blur (water_screen_reflection.hlsli); only when asked for (lookUp)
     float2 carriedMean;     // the carried bands' share of slopes.mean: the lip's geometry is their wave already
     float resolvedTotal;
     float totalFoam;
@@ -38,8 +40,10 @@ struct OceanBands
 
 //   worldXZ: the water's undisplaced position. shoreAtten, shoreDepth: the shore's damping of the longest waves and the
 //   depth that sets each band's share of it (the DS's OceanShore). calm: the hulls' calm here (WakeCalmAt): the short
-//   bands' slopes, crests and foam shrink in a hull's track as their heights do in the DS (CalmShare)
-OceanBands SampleOceanBands(OceanData ocean, float2 worldXZ, float shoreAtten, float shoreDepth, float calm)
+//   bands' slopes, crests and foam shrink in a hull's track as their heights do in the DS (CalmShare). lookUp: also the
+//   slopes OCEAN_LOOKUP_BIAS mips coarser (b.look), one more sample a band (the sea's PS, not the lip)
+#define OCEAN_LOOKUP_BIAS 2.0   // as water_screen_reflection.hlsli WATER_LOOKUP_BIAS
+OceanBands SampleOceanBands(OceanData ocean, float2 worldXZ, float shoreAtten, float shoreDepth, float calm, bool lookUp)
 {
     OceanBands b = (OceanBands)0;
     Texture2DArray<float4> dispTex = ResourceDescriptorHeap[ocean.DisplacementSRV];
@@ -114,6 +118,13 @@ OceanBands SampleOceanBands(OceanData ocean, float2 worldXZ, float shoreAtten, f
         float s, c;
         sincos(-angle, s, c);
         float2 meanWorld = float2(moments.x * c - moments.y * s, moments.x * s + moments.y * c);
+        float4 lookMoments = 0;
+        float2 lookWorld = 0;
+        if (lookUp)
+        {
+            lookMoments = slopeTex.SampleBias(OceanSampler, float3(uv, i), OCEAN_LOOKUP_BIAS);
+            lookWorld = float2(lookMoments.x * c - lookMoments.y * s, lookMoments.x * s + lookMoments.y * c);
+        }
         if (slice != 0xFF)
         {
             // Through the warp the slopes are Jᵀ·(the open sea's): the crowded crests are steeper. The variance grows
@@ -125,10 +136,18 @@ OceanBands SampleOceanBands(OceanData ocean, float2 worldXZ, float shoreAtten, f
             b.carriedMean += carried;
             b.slopes.variance += max(moments.z + moments.w - dot(moments.xy, moments.xy), 0.0) * slopeScale * slopeScale * stretch2;
             b.resolvedTotal += WaterBandTotalVariance(slopeTex, OceanSampler, i, slopeScale) * stretch2;
+            if (lookUp)
+            {
+                b.look.mean += mul(lookWorld, J) * slopeScale;
+                b.look.variance += max(lookMoments.z + lookMoments.w - dot(lookMoments.xy, lookMoments.xy), 0.0)
+                                 * slopeScale * slopeScale * stretch2;
+            }
         }
         else
         {
             AddWaterBand(b.slopes, moments, meanWorld, ocean.NormalAtten * waveAtten);
+            if (lookUp)
+                AddWaterBand(b.look, lookMoments, lookWorld, ocean.NormalAtten * waveAtten);
             float bandVariance = WaterBandTotalVariance(slopeTex, OceanSampler, i, ocean.NormalAtten * waveAtten);
             b.resolvedTotal += bandVariance;
             if (((windBands >> i) & 1u) && i != capBand)
@@ -154,10 +173,15 @@ OceanBands SampleOceanBands(OceanData ocean, float2 worldXZ, float shoreAtten, f
     return b;
 }
 
+OceanBands SampleOceanBands(OceanData ocean, float2 worldXZ, float shoreAtten, float shoreDepth, float calm)
+{
+    return SampleOceanBands(ocean, worldXZ, shoreAtten, shoreDepth, calm, false);
+}
+
 // The full sea, with no hull's calm (the lip)
 OceanBands SampleOceanBands(OceanData ocean, float2 worldXZ, float shoreAtten, float shoreDepth)
 {
-    return SampleOceanBands(ocean, worldXZ, shoreAtten, shoreDepth, 0.0);
+    return SampleOceanBands(ocean, worldXZ, shoreAtten, shoreDepth, 0.0, false);
 }
 
 // ── The surf: foam from the waves themselves (C# ShoreWarp, SurfWave) ──

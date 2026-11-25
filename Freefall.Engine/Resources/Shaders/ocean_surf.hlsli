@@ -51,7 +51,7 @@ struct OceanData
     float RefractionStrength; // how much normal distorts terrain show-through
     uint NoiseSRV;              // bindless SRV for noise texture (Perlin+Worley)
     float2 InvViewportSize;     // 1.0 / viewport dimensions (replaces GetDimensions)
-    float _shorePad;            // was ShoreFoamDepth (the clock-driven swash bands, gone with the surf 2026-10-19)
+    uint ReflectionMips;        // Graphics.WaterReflections: the nearest-depth pyramid's mips (bits 0-7), the scene colour's (8-15). Was padding: an older build writes 0
     float ShoreFoam;            // shore foam amount (0 = none)
     float ShoreSurge;           // the most the swash runs up the beach (m over the still sea, SwashLevel)
     uint HiZSRV;                // this view's Hi-Z pyramid of the opaque depth (0 = no occlusion test)
@@ -82,8 +82,8 @@ struct OceanData
     uint SurfInfoSRV;           // StructuredBuffer<float4>, two per slot: (base lag 0, base lag 1, heading 0), (heading 1, band 0 + 1, band 1 + 1)
     uint SurfPagesAcross;       // level 0 pages a side
     float SurfSamples;          // height samples a side: level 0 texel i lies on sample i
-    float _surfPad0;
-    float _surfPad1;
+    uint NearestDepthSRV;       // Graphics.WaterReflections: the nearest 1 / view depth, half size and down; 0 = no screen-space reflections. Was padding: an older build writes 0
+    uint SceneColourSRV;        // Graphics.WaterReflections: the composite snapshot averaged, half size and down. Was padding
 };
 
 // The surf's pages (C# SurfPages, ShoreWarp.BakePage): 256 texels a side in slots of 264 (a border of 4)
